@@ -26,9 +26,14 @@ The script checks for `numpy`, `scipy`, `scikit-learn`, `requests`, `beautifulso
 
 Clone the repository and run:
 
+Open the folders
 ```bash
-cd Brutkit/src
-python3 src/brutKIT.py
+cd BrutKIT/src
+```
+
+Run and started
+```bash
+python3 src/brutkit.py
 ```
 
 At startup, the script checks dependencies and attempts to install missing packages with `pip`. Because this check runs every time the script starts, make sure the active Python environment is the one you intend to use.
