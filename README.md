@@ -112,12 +112,12 @@ Proxy files are read one line at a time. A common format is a proxy URL such as 
 
 ## Creator User
 
-1. `@AjaxCELL**` Indonesian
-2. `@CuteSnorlax**` American
+1. `AjaxCELL` Indonesian
+2. `CuteSnorlax` American
 
 ## Media Social
 
--
+~
 
 ## License
 
