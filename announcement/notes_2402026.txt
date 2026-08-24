@@ -1,1 +1,4 @@
 Alright, the brute-force script has finally surfaced stay tuned for further information.
+
+17.22 PM:
+Apologies, the documentation is in Indonesian, I have revised the code comments and the README to make them international-friendly :)

