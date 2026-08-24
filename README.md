@@ -28,7 +28,7 @@ Clone the repository and run:
 
 ```bash
 cd Brutkit/src
-python3 src/brutkit.py
+python3 src/brutKIT.py
 ```
 
 At startup, the script checks dependencies and attempts to install missing packages with `pip`. Because this check runs every time the script starts, make sure the active Python environment is the one you intend to use.
