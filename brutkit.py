@@ -6,6 +6,10 @@ ALL v5.0 + v6.0 features preserved + FIX:
 - httpx 0.28+ compatibility (proxies → proxy parameter)
 - Version-aware proxy argument builder
 - Ultimate fallback for any httpx version
+
+Script ini menyediakan pipeline interaktif untuk discovery endpoint, pembuatan
+payload, pengujian HTTP, analisis respons, pembelajaran feedback, dan pelaporan.
+Gunakan hanya pada sistem yang dimiliki atau telah diberi izin untuk diuji.
 """
 
 import os
@@ -216,6 +220,7 @@ STATUS_MEANINGS = {
 }
 
 def get_status_meaning(code: int) -> str:
+    """Mengubah kode status HTTP menjadi keterangan singkat untuk laporan."""
     return STATUS_MEANINGS.get(code, f"Unknown Status ({code})")
 
 
@@ -242,6 +247,7 @@ REQUIRED_DEPS = [
 
 
 def install_dependencies():
+    """Memeriksa lalu mencoba memasang dependency yang tercantum di daftar."""
     print("\n\033[36m" + "=" * 60)
     print("  BRUT v6.0.1: Dependency Manager")
     print("=" * 60 + "\033[0m\n")
@@ -401,6 +407,7 @@ except ImportError:
 # BANNER v6.0.1
 # ============================================================
 def print_banner():
+    """Menampilkan identitas dan informasi versi BRUT di terminal."""
     banner = f"""
 \033[1;36m                   
   __ )                |          |    _)  |   
@@ -425,6 +432,7 @@ def print_banner():
 # ============================================================
 @dataclass
 class ProxyInfo:
+    """Menyimpan status kesehatan, statistik, dan cooldown sebuah proxy."""
     url: str
     protocol: str = "http"       # http, https, socks4, socks5
     health_score: float = 1.0    # 0.0 (dead) to 1.0 (healthy)
@@ -444,6 +452,7 @@ class ProxyInfo:
 
 
 class ProxyPoolManager:
+    """Mengelola rotasi proxy, health check, cooldown, dan circuit breaker."""
     """
     Manages proxy pool with automatic circuit breaker.
     - Rotates proxies on 429/403/timeout
@@ -642,6 +651,7 @@ class ProxyPoolManager:
 # TLS FINGERPRINT ENGINE (v6.0 — JA3/JA4 Evasion)
 # ============================================================
 class TLSFingerprintEngine:
+    """Membuat client HTTP dengan variasi fingerprint TLS dan header."""
     IMPERSONATION_TARGETS = [
         "chrome120", "chrome119", "chrome116", "chrome110",
         "chrome107", "chrome104", "chrome101", "chrome99",
@@ -734,6 +744,7 @@ class TLSFingerprintEngine:
 # ADAPTIVE THROTTLER (v6.0 — Human-Like Delay + Backoff)
 # ============================================================
 class AdaptiveThrottler:
+    """Mengatur jeda request berdasarkan latensi dan indikasi rate limit."""
     def __init__(self, min_delay: float = 0.3, max_delay: float = 2.5,
                  burst_limit: int = 15, burst_window: float = 10.0):
         self.min_delay = min_delay
@@ -898,6 +909,7 @@ class AdaptiveThrottler:
 # RETRY ENGINE (v6.0 — Tenacity-Based Smart Retry)
 # ============================================================
 class RetryEngine:
+    """Menjalankan request ulang dengan backoff dan aturan retry adaptif."""
     RETRYABLE_STATUS_CODES = {429, 403, 408, 500, 502, 503, 504, 520, 521, 522, 523}
     MAX_RETRIES = 4
     BASE_WAIT = 2
@@ -1186,6 +1198,7 @@ class MutationType(Enum):
 # ============================================================
 @dataclass
 class EvolutionRecord:
+    """Mewakili satu catatan payload dan hasil evolusinya."""
     generation_id: str = ""
     parent_payload_id: str = ""
     generation_number: int = 0
@@ -1206,6 +1219,7 @@ class EvolutionRecord:
 
 
 class EvolutionSchema:
+    """Menyimpan riwayat generasi, feedback, fitness, dan directive evolusi."""
     def __init__(self):
         self.records: Dict[str, EvolutionRecord] = {}
         self.generation_counter = 0
@@ -1389,6 +1403,7 @@ class EvolutionSchema:
 # GRAMMAR VALIDATOR (preserved from v5.0)
 # ============================================================
 class GrammarValidator:
+    """Memeriksa struktur dasar payload berdasarkan kategori injeksinya."""
     SQL_KEYWORD_ORDER = [
         "SELECT", "FROM", "WHERE", "GROUP BY", "HAVING",
         "ORDER BY", "LIMIT", "UNION", "INSERT", "UPDATE",
@@ -1488,6 +1503,7 @@ class GrammarValidator:
 # CONTEXT DETECTOR (preserved from v5.0)
 # ============================================================
 class ContextDetector:
+    """Mendeteksi konteks refleksi parameter dari isi respons HTTP."""
     def __init__(self):
         self.context_patterns = {
             InjectionContext.SQL_STRING: [
@@ -1574,6 +1590,7 @@ class ContextDetector:
 # WAF BYPASS ENGINE (preserved from v5.0)
 # ============================================================
 class WAFBypassEngine:
+    """Menyediakan transformasi payload untuk menguji variasi parsing WAF."""
     CONTROL_CHARS = ["%00", "%01", "%02", "%03", "%04", "%05",
                      "%06", "%07", "%08", "%09", "%0b", "%0c",
                      "%0e", "%0f", "%10", "%11", "%12", "%13",
@@ -1710,6 +1727,7 @@ class WAFBypassEngine:
 # ADAPTIVE ENCODING ROTATION (preserved from v5.0)
 # ============================================================
 class AdaptiveEncodingRotation:
+    """Memutar rantai encoding berdasarkan hasil pengujian sebelumnya."""
     ENCODING_CHAINS = [
         ["raw"], ["url_encode"], ["double_url_encode"], ["hex_encode"],
         ["html_entity"], ["unicode_escape"],
@@ -1800,6 +1818,7 @@ class AdaptiveEncodingRotation:
 # MULTI-ARMED BANDIT MUTATION SELECTOR (v6.1 — UCB1 Algorithm)
 # ============================================================
 class MutationBanditSelector:
+    """Memilih mutasi memakai skor UCB1 dan feedback per tipe WAF."""
     """
     Implements Upper Confidence Bound (UCB1) algorithm for adaptive mutation selection.
     Each mutation type is treated as an "arm" of a multi-armed bandit.
@@ -1915,6 +1934,7 @@ class MutationBanditSelector:
 # THOMPSON SAMPLING BANDIT (v7.0 — Bayesian Mutation Selector)
 # ============================================================
 class ThompsonSamplingBandit:
+    """Memilih mutasi memakai sampling Bayesian Thompson Sampling."""
     """
     Thompson Sampling menggunakan distribusi Beta untuk seleksi mutasi.
     Lebih agresif mengeksploitasi mutasi yang sedang efektif,
@@ -1989,6 +2009,7 @@ class ThompsonSamplingBandit:
 # HYBRID BANDIT SELECTOR (v7.0 — Auto-Switch UCB1 ↔ Thompson)
 # ============================================================
 class HybridBanditSelector:
+    """Menggabungkan selector UCB1 dan Thompson untuk pemilihan mutasi."""
     """
     Wrapper yang menggabungkan UCB1 dan Thompson Sampling.
     Otomatis beralih berdasarkan fase serangan:
@@ -2171,6 +2192,7 @@ from sklearn.cluster import DBSCAN
 import numpy as np
 
 class SemanticPayloadClusterer:
+    """Mengelompokkan payload serupa untuk mengurangi pengujian berulang."""
     """
     Groups payloads into semantic clusters using TF-IDF embeddings and DBSCAN.
     Enables bulk blacklisting of entire clusters when any member is blocked.
@@ -2275,6 +2297,7 @@ from sklearn.preprocessing import LabelEncoder
 import re
 
 class WAFFingerprinter:
+    """Mengidentifikasi WAF dari status, header, dan isi respons."""
     """
     Classifies WAF types in real-time based on HTTP response characteristics.
     Uses headers, status codes, and body patterns to predict WAF vendor.
@@ -2480,6 +2503,7 @@ class WAFFingerprinter:
 # WAF SIGNATURE INFERENCE ENGINE (v6.2 — Adaptive Bypass)
 # ============================================================
 class WAFSignatureInference:
+    """Menyimpulkan pola signature WAF dari payload yang diblokir."""
     """
     Learns which substrings/patterns trigger WAF blocking by comparing
     blocked vs unblocked payloads. Then generates targeted mutations
@@ -2650,6 +2674,7 @@ class WAFSignatureInference:
 # ============================================================
 
 class GranularRewardEngine:
+    """Menghitung reward terperinci dari status dan karakteristik respons."""
     """
     Computes fine-grained rewards based on multiple response signals.
     Includes progressive penalties for rate-limiting (429) and IP blocking.
@@ -2757,6 +2782,7 @@ class GranularRewardEngine:
 # STATISTICAL ANOMALY DETECTOR (v7.0 — scipy_stats + cosine + KMeans)
 # ============================================================
 class StatisticalAnomalyDetector:
+    """Mendeteksi anomali waktu dan kemiripan body pada respons HTTP."""
     """
     Deteksi anomali berbasis statistik:
     - scipy_stats.zscore     → timing anomaly (Blind SQLi SLEEP)
@@ -2853,6 +2879,7 @@ class StatisticalAnomalyDetector:
 # DOMAIN SCOPE VALIDATOR (v7.0 — tldextract)
 # ============================================================
 class DomainScopeValidator:
+    """Memastikan URL yang ditemukan masih berada dalam scope domain target."""
     """
     Memastikan semua request tetap dalam scope domain target.
     Menggunakan tldextract untuk parsing domain yang akurat
@@ -2897,6 +2924,7 @@ class DomainScopeValidator:
 # FAST HTML PARSER (v7.0 — SelectolaxParser fallback)
 # ============================================================
 class FastHTMLParser:
+    """Mengekstrak form, link, dan sumber script dari HTML secara ringan."""
     """
     Parser HTML cepat menggunakan selectolax (jika tersedia).
     Fallback ke regex jika selectolax tidak terinstall.
@@ -2971,6 +2999,7 @@ class FastHTMLParser:
 # CONCURRENT ENDPOINT SCANNER (v7.0 — ThreadPoolExecutor + HTTPAdapter/Retry)
 # ============================================================
 class ConcurrentEndpointScanner:
+    """Memindai daftar path secara paralel menggunakan thread worker."""
     """
     Parallel endpoint discovery.
     - ThreadPoolExecutor  → probing concurrent
@@ -3068,6 +3097,7 @@ class ConcurrentEndpointScanner:
 # ASYNC ENDPOINT SCANNER (v7.0 — aiohttp)
 # ============================================================
 class AsyncEndpointScanner:
+    """Memindai daftar path secara asynchronous dengan batas concurrency."""
     """
     Async endpoint discovery menggunakan aiohttp.
     Lebih cepat dari ConcurrentEndpointScanner untuk target
@@ -3141,6 +3171,7 @@ class AsyncEndpointScanner:
 # PAYLOAD DIVERSITY ENGINE (v7.0 — string + itertools + quote_plus)
 # ============================================================
 class PayloadDiversityEngine:
+    """Membuat variasi payload melalui padding dan kombinasi encoding."""
     """
     Menghasilkan variasi payload tambahan menggunakan:
     - string.ascii_letters/digits/punctuation untuk junk injection
@@ -3237,6 +3268,7 @@ class PayloadDiversityEngine:
 # POLYGLOT GENERATOR (preserved from v5.0)
 # ============================================================
 class PolyglotGenerator:
+    """Menghasilkan payload gabungan untuk beberapa konteks parser."""
     def generate_sql_xss_polyglot(self) -> List[str]:
         return [
             "';alert(1);//", "';</script><script>alert(1)</script>;//",
@@ -3295,6 +3327,7 @@ class PolyglotGenerator:
 # GENETIC EVOLVER (preserved from v5.0)
 # ============================================================
 class GeneticEvolver:
+    """Mengembangkan populasi payload melalui seleksi, crossover, dan mutasi."""
     def __init__(self, schema: EvolutionSchema, grammar: GrammarValidator,
                  encoder: AdaptiveEncodingRotation, waf_bypass: WAFBypassEngine, waf_inference: WAFSignatureInference = None):
         self.schema = schema
@@ -3625,6 +3658,7 @@ class GeneticEvolver:
 # ============================================================
 @dataclass
 class Parameter:
+    """Mewakili parameter target beserta lokasi dan kategori yang ditemukan."""
     name: str
     location: str
     method: str = "GET"
@@ -3641,6 +3675,7 @@ class Parameter:
 
 
 class ParameterDiscovery:
+    """Menemukan parameter dari URL, form, JavaScript, dan endpoint target."""
     COMMON_PARAMS = [
         "id", "page", "p", "pid", "cid", "uid", "cat", "category",
         "post", "article", "news", "item", "product", "order",
@@ -4047,6 +4082,7 @@ class ParameterDiscovery:
 # FEEDBACK LEARNER (preserved from v5.0 + v6.0 rate limit tracking)
 # ============================================================
 class FeedbackLearner:
+    """Memperbarui bobot generator berdasarkan hasil respons sebelumnya."""
     def __init__(self):
         self.category_scores = defaultdict(lambda: {"success": 0, "fail": 0, "raw_html": 0, "blocked": 0})
         self.encoding_scores = defaultdict(lambda: {"success": 0, "fail": 0})
@@ -4207,6 +4243,7 @@ class FeedbackLearner:
 # ML PAYLOAD GENERATOR (preserved from v5.0)
 # ============================================================
 class MLPayloadGenerator:
+    """Membangun payload berbasis atom, encoding, dan strategi mutasi."""
     ATOMS = {
         "sql_string_break": ["'",'"',"`","''",'""',"\\'","\\\"","%27","%22"],
         "sql_logic": ["OR","AND","XOR","NOT","&&","||","DIV"],
@@ -4764,6 +4801,7 @@ class MLPayloadGenerator:
 # ============================================================
 @dataclass
 class InjectionResult:
+    """Menyimpan metadata lengkap dari satu percobaan injection HTTP."""
     payload_id: str
     payload: str
     category: str
@@ -4790,6 +4828,7 @@ class InjectionResult:
 
 
 class ResponseAnalyzer:
+    """Mengklasifikasikan respons menjadi output server, HTML biasa, atau blocked."""
     SERVER_ERROR_PATTERNS = [
         r"sql\s*syntax",r"mysql",r"oracle",r"postgresql",r"sqlite",
         r"unclosed\s*quotation",r"syntax\s*error.*?(near|at)",
@@ -4880,6 +4919,7 @@ class ResponseAnalyzer:
 # INJECTOR v6.0.1 (Enhanced with Proxy + TLS + Throttle + Retry + httpx fix)
 # ============================================================
 class Injector:
+    """Mengirim payload ke parameter target dan menganalisis responsnya."""
     def __init__(self, target, proxy_manager: ProxyPoolManager = None,
                  tls_engine: TLSFingerprintEngine = None,
                  throttler: AdaptiveThrottler = None,
@@ -5148,6 +5188,7 @@ class Injector:
 # REPORT SAVER (v6.0 enhanced)
 # ============================================================
 class ReportSaver:
+    """Menyimpan hasil pengujian dalam laporan teks dan JSON."""
     def __init__(self, target, output_dir="./brut_results"):
         self.target = target
         self.parsed = urlparse(target)
@@ -5264,6 +5305,7 @@ class ReportSaver:
 # DETAILED LOGGER (v6.0 enhanced with proxy/TLS info)
 # ============================================================
 class DetailedLogger:
+    """Menampilkan hasil setiap request dengan status dan metadata ringkas."""
     @staticmethod
     def log_result(index, total, result):
         if result.success:
@@ -5435,6 +5477,7 @@ class SecondOrderConfirmer:
 # MAIN PIPELINE v6.0.1
 # ============================================================
 class BRUTPipeline:
+    """Mengorkestrasi discovery, pembuatan payload, injection, dan pelaporan."""
     def __init__(self, target, proxy_file: str = None):
         self.target = target
         self.parameters: List[Parameter] = []
@@ -5520,11 +5563,13 @@ class BRUTPipeline:
         self.logger = DetailedLogger()
 
     def phase1_discover(self):
+        """Menemukan parameter dan endpoint yang berada dalam scope target."""
         discovery = ParameterDiscovery(self.target)
         self.parameters = discovery.run()
         return self.parameters
 
     def phase2_generate(self, count):
+        """Membuat sejumlah payload tervalidasi dan menginisialisasi populasinya."""
         if count <= 0: return []
         self.payloads = self.generator.generate(count)
         self.evolver.initialize_population(self.payloads)
@@ -5534,6 +5579,7 @@ class BRUTPipeline:
         return self.payloads
 
     def phase3_inject(self, max_mode=False):
+        """Menguji kombinasi payload-parameter dengan kontrol adaptif dan retry."""
         self.results = []
         total = len(self.payloads) * len(self.parameters)
         tested = 0
@@ -6083,6 +6129,7 @@ class BRUTPipeline:
         return self.results
 
     def phase3_advanced_retry(self):
+        """Menguji varian lanjutan dari hasil blocked atau respons biasa."""
         failed = [r for r in self.results if r.response_type in ["raw_html", "blocked"]]
         if not failed: return []
 
@@ -6111,12 +6158,14 @@ class BRUTPipeline:
         return adv_results
 
     def phase4_save(self, confirmer=None):
+        """Menyimpan seluruh hasil pipeline dan metadata analisis ke disk."""
         return self.saver.save(self.results, self.payloads,
                               self.learner, self.schema, self.evolver,
                               self.proxy_manager, self.throttler,
                               confirmer=confirmer or self.confirmer)
 
     def print_summary(self):
+        """Menampilkan ringkasan hasil, pembelajaran, proxy, dan throttling."""
         server = [r for r in self.results if r.response_type == "server_output"]
         raw = [r for r in self.results if r.response_type == "raw_html"]
         blocked = [r for r in self.results if r.response_type == "blocked"]
@@ -6166,6 +6215,7 @@ class BRUTPipeline:
 # INTERACTIVE MAIN LOOP v6.0.1
 # ============================================================
 def interactive_main():
+    """Menjalankan lobby interaktif untuk memilih target dan mengendalikan pipeline."""
     # v7.0 NEW: Inisialisasi database (auto-create jika belum ada)
     global DB
     DB = init_database()
