@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
 """
-BRUT v6.0.1 — Genetic ML Payload Injection + Anti-Rate-Limit Framework
-=======================================================================
-ALL v5.0 + v6.0 features preserved + FIX:
-- httpx 0.28+ compatibility (proxies → proxy parameter)
-- Version-aware proxy argument builder
-- Ultimate fallback for any httpx version
-
 Script ini menyediakan pipeline interaktif untuk discovery endpoint, pembuatan
 payload, pengujian HTTP, analisis respons, pembelajaran feedback, dan pelaporan.
 Gunakan hanya pada sistem yang dimiliki atau telah diberi izin untuk diuji.
@@ -149,7 +142,7 @@ def _draw_welcome_line(content: str):
     sys.stdout.flush()
 
 
-def animate_welcome(text: str = "  ★ Welcome to BRUT v7.0 — Type target or /help to begin ★",
+def animate_welcome(text: str = "  ★ Welcome to BRUTKIT tools v1.0 — The creator team by AjaxCELL... ★",
                     delay: float = 0.05, pause: float = 1.2):
     """Animasi ketik karakter per karakter, berulang tanpa henti, berhenti via WELCOME_ANIM_STOP."""
     while not WELCOME_ANIM_STOP.is_set():
