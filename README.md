@@ -26,12 +26,12 @@ The script checks for `numpy`, `scipy`, `scikit-learn`, `requests`, `beautifulso
 
 Clone the repository and run:
 
-Open the folders
+1. Open the folders:
 ```bash
 cd BrutKIT/src
 ```
 
-Run and started
+2. Run and started:
 ```bash
 python3 src/brutkit.py
 ```
