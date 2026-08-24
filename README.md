@@ -102,7 +102,7 @@ Hasil `server_output` adalah indikasi yang perlu diverifikasi secara manual. Sta
 - **Tidak ada parameter ditemukan:** pastikan URL dapat diakses, endpoint memang memiliki input, dan target termasuk scope yang diizinkan.
 - **Playwright tidak tersedia:** fitur browser akan dilewati; pasang package dan Chromium bila fitur tersebut dibutuhkan.
 - **Banyak status 429:** hentikan pengujian atau kurangi beban sesuai kebijakan target; jangan mencoba mengakali batas layanan tanpa izin.
-- **`/help` tidak dikenali:** teks animasi menyebut `/help`, tetapi handler saat ini belum menyediakan perintah tersebut. Gunakan daftar perintah di atas.
+- **Dependency berat:** disarankan menggunakan lingkungan terminal yang suport seperti linux, tidak disarankan dilingkungan terminal termux, kecuali root.
 
 ## Lisensi
 
