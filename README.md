@@ -110,10 +110,9 @@ Proxy files are read one line at a time. A common format is a proxy URL such as 
 - **Many 429 responses:** stop or reduce the test load according to the target policy; do not bypass service limits without permission.
 - **Heavy dependencies:** Linux is recommended. Termux is not recommended unless its environment is properly configured.
 
-## Creator User
+## Team Framework
 
-1. `AjaxCELL` Indonesian
-2. `CuteSnorlax` American
+`AjaxUnity`
 
 ## Media Social
 
