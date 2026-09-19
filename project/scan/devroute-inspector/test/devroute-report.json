@@ -1,9 +1,0 @@
-{
-  "target": "https://juice-shop.herokuapp.com",
-  "started_at": "2026-09-19T09:50:45Z",
-  "finished_at": "2026-09-19T09:51:05Z",
-  "assets_scanned": 0,
-  "sourcemaps_parsed": 0,
-  "findings": null,
-  "summary": {}
-}
