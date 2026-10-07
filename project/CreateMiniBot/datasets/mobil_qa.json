@@ -1,0 +1,50 @@
+[
+  {
+    "text": "apa itu mobil"
+  },
+  {
+    "text": "mobil adalah kendaraan"
+  },
+  {
+    "text": "mobil adalah kendaraan beroda"
+  },
+  {
+    "text": "mobil memiliki mesin"
+  },
+  {
+    "text": "mobil memakai bahan bakar"
+  },
+  {
+    "text": "mesin mobil menghasilkan tenaga"
+  },
+  {
+    "text": "bahan bakar memberi energi pada mesin"
+  },
+  {
+    "text": "performa mobil tergantung mesin"
+  },
+  {
+    "question": "apa itu mobil",
+    "answer": "mobil adalah kendaraan"
+  },
+  {
+    "question": "mesin mobil",
+    "answer": "mesin mobil menghasilkan tenaga"
+  },
+  {
+    "question": "bahan bakar mobil",
+    "answer": "bahan bakar memberi energi pada mesin"
+  },
+  {
+    "question": "performa mobil",
+    "answer": "performa mobil tergantung mesin"
+  },
+  {
+    "question": "kecepatan mobil",
+    "answer": "kecepatan mobil tergantung mesin"
+  },
+  {
+    "question": "perawatan mobil",
+    "answer": "perawatan mesin mobil penting"
+  }
+]
