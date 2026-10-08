@@ -1,0 +1,78 @@
+mobil adalah kendaraan
+mobil adalah transportasi
+mobil adalah mesin bergerak
+mobil memiliki mesin
+mobil memiliki roda
+mobil memiliki rem
+mobil memiliki lampu
+mobil memiliki setir
+mobil memiliki pintu
+mobil memiliki kursi
+mobil memakai bahan bakar
+mobil memakai bensin
+mobil memakai oli
+mobil memakai baterai
+mesin mobil menghasilkan tenaga
+mesin mobil memakai bahan bakar
+mesin mobil memakai oli
+mesin mobil perlu dirawat
+roda mobil berputar
+roda mobil menyentuh jalan
+rem mobil menghentikan laju
+lampu mobil menerangi jalan
+setir mobil mengarahkan roda
+kursi mobil diduduki penumpang
+pintu mobil dibuka dan ditutup
+bahan bakar memberi energi
+energi menggerakkan mesin
+mesin menggerakkan roda
+roda menggerakkan mobil
+mobil melaju di jalan
+mobil berhenti dengan rem
+mobil bergerak dengan mesin
+mobil dirawat secara rutin
+perawatan mobil penting
+perawatan mesin penting
+oli melumasi mesin
+bensin menjadi bahan bakar
+baterai menyimpan listrik
+lampu memakai listrik
+rem menjaga keselamatan
+jalan digunakan mobil
+mobil lewat di jalan
+mobil cepat karena mesin
+mobil lambat karena rem
+mobil aman karena rem
+mobil nyaman karena kursi
+mobil terang karena lampu
+mobil adalah kendaraan yang memiliki mesin
+mobil adalah kendaraan yang memiliki roda
+mobil adalah kendaraan yang memakai bahan bakar
+mesin mobil adalah bagian yang menghasilkan tenaga
+roda mobil adalah bagian yang berputar
+rem mobil adalah bagian yang menghentikan laju
+lampu mobil adalah bagian yang menerangi jalan
+setir mobil adalah bagian yang mengarahkan roda
+bahan bakar adalah sumber energi untuk mesin
+oli adalah pelumas untuk mesin
+perawatan adalah cara menjaga mesin
+tanya apa itu mobil
+jawab mobil adalah kendaraan
+tanya apa mesin mobil
+jawab mesin mobil menghasilkan tenaga
+tanya apa roda mobil
+jawab roda mobil berputar
+tanya apa rem mobil
+jawab rem mobil menghentikan laju
+tanya apa lampu mobil
+jawab lampu mobil menerangi jalan
+tanya apa bahan bakar mobil
+jawab bahan bakar memberi energi
+tanya bagaimana mobil bergerak
+jawab mesin menggerakkan roda
+tanya bagaimana mobil berhenti
+jawab rem menghentikan laju
+tanya bagaimana mobil melaju
+jawab mesin menghasilkan tenaga
+tanya bagaimana mobil dirawat
+jawab perawatan mesin penting

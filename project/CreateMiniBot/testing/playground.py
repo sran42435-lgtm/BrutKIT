@@ -6,9 +6,11 @@
 # 1. Menerima prompt teks.
 # 2. Encode prompt menjadi token ID.
 # 3. Jalankan inference ke model.
-# 4. Sampling token berikutnya dengan temperature, top-k, dan top-p.
-# 5. Decode token ID menjadi teks jawaban.
-# 6. Menyediakan CLI interaktif.
+# 4. Sampling token berikutnya dengan temperature, top-k, top-p.
+# 5. Mendukung repetition penalty.
+# 6. Mendukung min_new_tokens agar model tidak langsung berhenti dengan EOS.
+# 7. Decode token ID menjadi teks jawaban.
+# 8. Menyediakan CLI interaktif.
 #
 # Keterhubungan:
 # - config.py            : konfigurasi global
@@ -64,10 +66,20 @@ class Playground:
         playground.interactive()
     """
 
-    DEFAULT_MAX_NEW_TOKENS = 32
-    DEFAULT_TEMPERATURE = 0.8
-    DEFAULT_TOP_K = 40
-    DEFAULT_TOP_P = 0.9
+    DEFAULT_MAX_NEW_TOKENS = 48
+    DEFAULT_TEMPERATURE = 0.75
+    DEFAULT_TOP_K = 30
+    DEFAULT_TOP_P = 0.92
+
+    # Repetition penalty: > 1.0 mengurangi pengulangan token.
+    DEFAULT_REPETITION_PENALTY = 1.25
+    DEFAULT_REPETITION_WINDOW = 64
+
+    # Memaksa model menghasilkan minimal beberapa token sebelum boleh EOS.
+    # Ini membantu mencegah jawaban kosong seperti:
+    #   prompt> mobil
+    #   Jawaban : (kosong)
+    DEFAULT_MIN_NEW_TOKENS = 8
 
     def __init__(self, model, tokenizer, config: Config = CONFIG):
         self.model = model
@@ -95,6 +107,9 @@ class Playground:
         temperature: float = DEFAULT_TEMPERATURE,
         top_k: int = DEFAULT_TOP_K,
         top_p: float = DEFAULT_TOP_P,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+        repetition_window: int = DEFAULT_REPETITION_WINDOW,
+        min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
         verbose: bool = True,
     ) -> str:
         """
@@ -106,6 +121,9 @@ class Playground:
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            repetition_window=repetition_window,
+            min_new_tokens=min_new_tokens,
         )
 
         if verbose:
@@ -124,12 +142,15 @@ class Playground:
         temperature: float = DEFAULT_TEMPERATURE,
         top_k: int = DEFAULT_TOP_K,
         top_p: float = DEFAULT_TOP_P,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+        repetition_window: int = DEFAULT_REPETITION_WINDOW,
+        min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
     ) -> tuple[str, List[int]]:
         """
         Membuat jawaban/lanjutan teks dari prompt.
 
         Return:
-        - answer_text  : teks hasil generation
+        - answer_text   : teks hasil generation
         - generated_ids : daftar token ID yang dihasilkan (tanpa prompt awal)
         """
         self._ensure_tokenizer_ready()
@@ -147,8 +168,9 @@ class Playground:
         forbidden_ids = self._get_forbidden_ids()
 
         max_new_tokens = max(0, int(max_new_tokens))
+        min_new_tokens = max(0, int(min_new_tokens))
 
-        for _ in range(max_new_tokens):
+        for step in range(max_new_tokens):
             # Jaga konteks agar tidak melebihi max_position_embeddings
             context = current_ids[-self.max_context :]
 
@@ -159,12 +181,33 @@ class Playground:
             # Ambil logits dari token terakhir
             next_logits = np.asarray(logits[0, -1, :], dtype=np.float32)
 
+            # Jika belum mencapai min_new_tokens, EOS dilarang terlebih dahulu.
+            step_forbidden = forbidden_ids
+
+            if step < min_new_tokens:
+                step_forbidden = list(forbidden_ids)
+
+                if self.eos_id not in step_forbidden:
+                    step_forbidden.append(self.eos_id)
+
+            # Repetition penalty hanya diterapkan pada token yang sudah
+            # dihasilkan, bukan prompt awal, agar model tetap boleh memakai
+            # kata penting dari prompt bila diperlukan.
+            generated_so_far = current_ids[len(prompt_ids) :]
+
+            if repetition_window is not None and int(repetition_window) > 0:
+                previous_ids = generated_so_far[-int(repetition_window) :]
+            else:
+                previous_ids = generated_so_far
+
             next_token = self._sample(
                 logits=next_logits,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
-                forbidden_ids=forbidden_ids,
+                forbidden_ids=step_forbidden,
+                previous_ids=previous_ids,
+                repetition_penalty=repetition_penalty,
             )
 
             if next_token == self.eos_id:
@@ -187,6 +230,9 @@ class Playground:
         temperature: float = DEFAULT_TEMPERATURE,
         top_k: int = DEFAULT_TOP_K,
         top_p: float = DEFAULT_TOP_P,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+        repetition_window: int = DEFAULT_REPETITION_WINDOW,
+        min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
     ) -> None:
         """
         Mode CLI interaktif.
@@ -195,6 +241,13 @@ class Playground:
         print("Testing Playground - Inference Engine")
         print("Ketik prompt lalu tekan Enter.")
         print("Ketik 'exit', 'quit', atau 'keluar' untuk berhenti.")
+        print("=" * 60)
+        print(f"temperature        : {temperature}")
+        print(f"top_k              : {top_k}")
+        print(f"top_p              : {top_p}")
+        print(f"repetition_penalty : {repetition_penalty}")
+        print(f"min_new_tokens     : {min_new_tokens}")
+        print(f"max_new_tokens     : {max_new_tokens}")
         print("=" * 60)
 
         while True:
@@ -218,6 +271,9 @@ class Playground:
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                repetition_window=repetition_window,
+                min_new_tokens=min_new_tokens,
             )
 
             print("Jawaban :", answer if answer else "(kosong)")
@@ -240,7 +296,8 @@ class Playground:
         - [BOS]
         - token [UNUSED_*]
 
-        [EOS] tetap diperbolehkan sebagai tanda berhenti.
+        [EOS] tetap diperbolehkan sebagai tanda berhenti, kecuali saat
+        min_new_tokens belum tercapai.
         """
         if self._forbidden_cache is not None:
             return self._forbidden_cache
@@ -266,17 +323,20 @@ class Playground:
         top_k: int,
         top_p: float,
         forbidden_ids: Optional[List[int]] = None,
+        previous_ids: Optional[List[int]] = None,
+        repetition_penalty: float = 1.0,
     ) -> int:
         """
         Sampling token berikutnya.
 
         Urutan:
         1. Bersihkan logits.
-        2. Blokir token terlarang.
-        3. Terapkan temperature.
-        4. Terapkan top-k.
-        5. Terapkan top-p.
-        6. Sample dari distribusi probabilitas.
+        2. Terapkan repetition penalty.
+        3. Blokir token terlarang.
+        4. Terapkan temperature.
+        5. Terapkan top-k.
+        6. Terapkan top-p.
+        7. Sample dari distribusi probabilitas.
         """
         logits = np.asarray(logits, dtype=np.float32).copy()
 
@@ -294,7 +354,38 @@ class Playground:
 
         raw_argmax = int(np.argmax(raw_logits))
 
+        work_logits = raw_logits.copy()
+
+        # --------------------------------------------------------------------
+        # Repetition penalty
+        # --------------------------------------------------------------------
+        if repetition_penalty is not None:
+            penalty = float(repetition_penalty)
+
+            if penalty > 0.0 and penalty != 1.0 and previous_ids:
+                prev_tokens = sorted(set(int(t) for t in previous_ids))
+                prev_arr = np.array(prev_tokens, dtype=np.int64)
+
+                prev_arr = prev_arr[
+                    (prev_arr >= 0) & (prev_arr < work_logits.size)
+                ]
+
+                if prev_arr.size > 0:
+                    selected_logits = work_logits[prev_arr]
+
+                    # Jika logit positif, kecilkan dengan pembagian.
+                    # Jika logit negatif, buat semakin negatif dengan perkalian.
+                    work_logits[prev_arr] = np.where(
+                        selected_logits > 0,
+                        selected_logits / penalty,
+                        selected_logits * penalty,
+                    )
+
+        # --------------------------------------------------------------------
+        # Forbidden tokens
+        # --------------------------------------------------------------------
         valid_mask = np.ones(raw_logits.size, dtype=bool)
+        valid_forbidden: List[int] = []
 
         if forbidden_ids:
             valid_forbidden = [
@@ -305,11 +396,18 @@ class Playground:
             if valid_forbidden:
                 valid_mask[valid_forbidden] = False
 
-        # Jika semua token terblokir, buka fallback ke token dengan logit tertinggi.
+        # Jika semua token terblokir, coba buka kembali token yang tidak
+        # termasuk forbidden. Jika tetap tidak ada, pakai fallback raw_argmax.
         if not np.any(valid_mask):
-            valid_mask[raw_argmax] = True
+            fallback_mask = np.ones(raw_logits.size, dtype=bool)
 
-        work_logits = raw_logits.copy()
+            if valid_forbidden:
+                fallback_mask[valid_forbidden] = False
+
+            if np.any(fallback_mask):
+                valid_mask = fallback_mask
+            else:
+                valid_mask[raw_argmax] = True
 
         # --------------------------------------------------------------------
         # Greedy jika temperature sangat kecil / nol
@@ -433,6 +531,7 @@ if __name__ == "__main__":
     from core.architecture import CustomTransformerLM
 
     parser = argparse.ArgumentParser()
+
     parser.add_argument(
         "--interactive",
         action="store_true",
@@ -441,15 +540,46 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompt",
         type=str,
-        default="Apa itu mobil?",
+        default="mobil adalah",
         help="Prompt untuk mode non-interaktif.",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=12,
+        default=16,
         help="Jumlah token maksimum yang dihasilkan.",
     )
+    parser.add_argument(
+        "--min-new-tokens",
+        type=int,
+        default=4,
+        help="Jumlah token minimum sebelum EOS diperbolehkan.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.75,
+        help="Temperature sampling.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=30,
+        help="Top-K sampling.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.92,
+        help="Top-P sampling.",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.25,
+        help="Repetition penalty. Nilai > 1 mengurangi pengulangan.",
+    )
+
     args = parser.parse_args()
 
     # ========================================================================
@@ -472,11 +602,16 @@ if __name__ == "__main__":
         sample_file.write_text(
             "\n".join(
                 [
+                    "mobil adalah kendaraan",
+                    "mobil adalah kendaraan yang memiliki mesin",
                     "mobil memiliki mesin",
+                    "mobil memiliki roda",
                     "mobil memakai bahan bakar",
-                    "kecepatan mobil tergantung mesin",
-                    "apa itu mobil",
-                    "mesin mobil perlu dirawat",
+                    "mesin mobil menghasilkan tenaga",
+                    "roda mobil berputar",
+                    "rem mobil menghentikan laju",
+                    "lampu mobil menerangi jalan",
+                    "bahan bakar memberi energi",
                 ]
             ),
             encoding="utf-8",
@@ -497,20 +632,20 @@ if __name__ == "__main__":
                 learning_rate=3e-4,
                 batch_size=2,
                 epochs=1,
-                sequence_length=8,
+                sequence_length=12,
                 weight_decay=0.01,
                 grad_clip_norm=1.0,
                 seed=1337,
             ),
             model=ModelConfig(
-                vocab_size=64,
-                embedding_dim=16,
+                vocab_size=96,
+                embedding_dim=32,
                 num_attention_heads=2,
                 num_layers=1,
                 dropout_rate=0.0,
-                max_position_embeddings=32,
+                max_position_embeddings=64,
                 layer_norm_eps=1e-5,
-                ffn_hidden_dim=32,
+                ffn_hidden_dim=64,
                 train_dtype="float32",
                 export_dtype="float32",
             ),
@@ -530,14 +665,21 @@ if __name__ == "__main__":
         if args.interactive:
             playground.interactive(
                 max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                min_new_tokens=args.min_new_tokens,
             )
         else:
             playground.test_prompt(
                 prompt=args.prompt,
                 max_new_tokens=args.max_new_tokens,
-                temperature=0.8,
-                top_k=20,
-                top_p=0.9,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                min_new_tokens=args.min_new_tokens,
                 verbose=True,
             )
 

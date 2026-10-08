@@ -153,8 +153,8 @@ class TrainingConfig:
 
     learning_rate: float = 3e-4
     batch_size: int = 2
-    epochs: int = 250
-    sequence_length: int = 16
+    epochs: int = 101
+    sequence_length: int = 24
 
     # Regularization
     weight_decay: float = 0.01
@@ -187,21 +187,21 @@ class ModelConfig:
     - testing/playground.py
     """
 
-    vocab_size: int = 256
-    embedding_dim: int = 64
+    vocab_size: int = 512
+    embedding_dim: int = 96
     num_attention_heads: int = 4
-    num_layers: int = 2
+    num_layers: int = 3
     dropout_rate: float = 0.0
 
     # Context length maksimal
-    max_position_embeddings: int = 64
+    max_position_embeddings: int = 96
 
     # Epsilon untuk LayerNorm / RMSNorm
     layer_norm_eps: float = 1e-5
 
     # Dimensi Feed-Forward Network
     # Contoh pada spesifikasi menggunakan 2048 -> 5632
-    ffn_hidden_dim: int = 128
+    ffn_hidden_dim: int = 192
 
     # Presisi saat training dan export
     train_dtype: str = "float32"
