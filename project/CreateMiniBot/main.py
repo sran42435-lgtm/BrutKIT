@@ -13,6 +13,7 @@
 # Catatan:
 # - Weight update sudah terjadi di dalam Trainer melalui Evaluator + WeightManager.
 # - main.py tetap menyediakan audit terpisah setelah training.
+# - Resume sekarang benar-benar melanjutkan dari epoch/global step terakhir.
 
 from __future__ import annotations
 
@@ -70,18 +71,26 @@ def print_config_summary(config: Config) -> None:
     print(f"  num_layers              : {config.model.num_layers}")
     print(f"  ffn_hidden_dim          : {config.model.ffn_hidden_dim}")
     print(f"  max_position_embeddings : {config.model.max_position_embeddings}")
-    print(f"  dropout_rate            : {config.model.dropout_rate}")
+    print(f"  dropout_rate (model)    : {config.model.dropout_rate}")
     print(f"  train_dtype             : {config.model.train_dtype}")
     print(f"  export_dtype            : {config.model.export_dtype}")
 
     print()
     print("Training:")
-    print(f"  learning_rate     : {config.training.learning_rate}")
-    print(f"  batch_size        : {config.training.batch_size}")
-    print(f"  epochs            : {config.training.epochs}")
-    print(f"  sequence_length   : {config.training.sequence_length}")
-    print(f"  weight_decay      : {config.training.weight_decay}")
-    print(f"  grad_clip_norm    : {config.training.grad_clip_norm}")
+    print(f"  learning_rate                : {config.training.learning_rate}")
+    print(f"  batch_size                   : {config.training.batch_size}")
+    print(f"  epochs                       : {config.training.epochs}")
+    print(f"  sequence_length              : {config.training.sequence_length}")
+    print(f"  dropout_rate                 : {config.training.dropout_rate}")
+    print(f"  weight_decay                 : {config.training.weight_decay}")
+    print(f"  grad_clip_norm               : {config.training.grad_clip_norm}")
+    print(f"  lr_warmup_steps              : {config.training.lr_warmup_steps}")
+    print(f"  lr_decay_steps               : {config.training.lr_decay_steps}")
+    print(f"  lr_decay_factor              : {config.training.lr_decay_factor}")
+    print(f"  lr_min                       : {config.training.lr_min}")
+    print(f"  gradient_accumulation_steps  : {config.training.gradient_accumulation_steps}")
+    print(f"  early_stopping_patience      : {config.training.early_stopping_patience}")
+    print(f"  inline_training_steps        : {config.training.inline_training_steps}")
 
 
 # ============================================================================
@@ -243,14 +252,6 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     print("[main] Evaluator siap.")
     print("[main] WeightManager siap.")
 
-    if args.resume:
-        try:
-            ckpt_path = weight_manager.load_checkpoint()
-            print(f"[main] Checkpoint dimuat dari: {ckpt_path}")
-            print(f"[main] Optimizer step: {weight_manager.step_count}")
-        except FileNotFoundError:
-            print("[main] Checkpoint tidak ditemukan. Training dari awal.")
-
     # ------------------------------------------------------------------------
     # 4. TRAINER
     # ------------------------------------------------------------------------
@@ -264,6 +265,48 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
         config=config,
     )
 
+    # ------------------------------------------------------------------------
+    # 5. RESUME CHECKPOINT
+    # ------------------------------------------------------------------------
+    # Variabel untuk resume training dari epoch tertentu
+    start_epoch = 0
+    global_step = 0
+    resumed = False
+
+    if args.resume:
+        try:
+            ckpt_path = weight_manager.load_checkpoint()
+            print(f"[main] Checkpoint dimuat dari: {ckpt_path}")
+            print(f"[main] Optimizer step: {weight_manager.step_count}")
+
+            # Coba baca metadata epoch dan global step dari weight_manager
+            last_epoch = getattr(weight_manager, "last_epoch", 0)
+            global_step = getattr(weight_manager, "global_step", weight_manager.step_count)
+
+            start_epoch = last_epoch
+            resumed = True
+
+            print(f"[main] Last epoch: {last_epoch}")
+            print(f"[main] Global step: {global_step}")
+            print(f"[main] Training akan dilanjutkan dari epoch {last_epoch + 1}")
+        except FileNotFoundError:
+            print("[main] Checkpoint tidak ditemukan. Training dari awal.")
+            resumed = False
+        except Exception as exc:
+            print(f"[main] Gagal memuat checkpoint: {exc}")
+            print("[main] Training dari awal.")
+            resumed = False
+
+    # Informasikan trainer tentang state resume
+    # Trainer nanti akan menggunakan start_epoch dan global_step ini
+    if resumed:
+        trainer.set_resume_state(start_epoch=start_epoch, global_step=global_step)
+
+    # ------------------------------------------------------------------------
+    # 6. TRAINING
+    # ------------------------------------------------------------------------
+    print_section("TAHAP 5: TRAINING")
+
     report: dict | None = None
 
     if not args.skip_training:
@@ -271,6 +314,8 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
             max_steps=args.max_steps,
             save_checkpoints=True,
             verbose=True,
+            start_epoch=start_epoch,
+            global_step=global_step,
         )
 
         if history:
@@ -287,9 +332,9 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
         print("[main] Training dilewati karena --skip-training.")
 
     # ------------------------------------------------------------------------
-    # 5. EVALUATION / AUDIT
+    # 7. EVALUATION / AUDIT
     # ------------------------------------------------------------------------
-    print_section("TAHAP 5: EVALUATOR AUDIT")
+    print_section("TAHAP 6: EVALUATOR AUDIT")
 
     if not args.skip_eval:
         eval_report = evaluate_model(
@@ -315,17 +360,19 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
         print("[main] Evaluasi dilewati karena --skip-eval.")
 
     # ------------------------------------------------------------------------
-    # 6. PLAYGROUND / TESTING
+    # 8. PLAYGROUND / TESTING
     # ------------------------------------------------------------------------
-    print_section("TAHAP 6: PLAYGROUND TESTING")
+    print_section("TAHAP 7: PLAYGROUND TESTING")
 
     run_testing = (not args.skip_test) or args.interactive
 
     if run_testing:
+        # Trainer diteruskan ke playground agar perintah 'training' bisa dipakai
         playground = Playground(
             model=model,
             tokenizer=tokenizer,
             config=config,
+            trainer=trainer,
         )
 
         if args.interactive:
@@ -334,6 +381,8 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
                 temperature=args.temperature,
                 top_k=args.top_k,
                 top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                min_new_tokens=args.min_new_tokens,
             )
         else:
             playground.test_prompt(
@@ -342,13 +391,15 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
                 temperature=args.temperature,
                 top_k=args.top_k,
                 top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                min_new_tokens=args.min_new_tokens,
                 verbose=True,
             )
     else:
         print("[main] Testing dilewati karena --skip-test.")
 
     # ------------------------------------------------------------------------
-    # 7. EXPORT MODEL
+    # 9. EXPORT MODEL
     # ------------------------------------------------------------------------
     if not args.skip_export:
         export_model(
@@ -485,7 +536,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Muat checkpoint optimizer/model jika tersedia.",
+        help="Muat checkpoint optimizer/model dan lanjutkan dari epoch terakhir.",
     )
 
     parser.add_argument(
@@ -525,6 +576,7 @@ def parse_args() -> argparse.Namespace:
         help="Prompt untuk testing non-interaktif.",
     )
 
+    # ---- PLAYGROUND PARAMETERS ----
     parser.add_argument(
         "--max-new-tokens",
         type=int,
@@ -533,26 +585,41 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--min-new-tokens",
+        type=int,
+        default=8,
+        help="Jumlah minimum token sebelum EOS diperbolehkan.",
+    )
+
+    parser.add_argument(
         "--temperature",
         type=float,
-        default=0.8,
+        default=0.75,
         help="Temperature sampling untuk playground.",
     )
 
     parser.add_argument(
         "--top-k",
         type=int,
-        default=40,
+        default=30,
         help="Top-K sampling untuk playground.",
     )
 
     parser.add_argument(
         "--top-p",
         type=float,
-        default=0.9,
+        default=0.92,
         help="Top-P sampling untuk playground.",
     )
 
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.25,
+        help="Repetition penalty. Nilai > 1 mengurangi pengulangan.",
+    )
+
+    # ---- TRAINING CONTROL ----
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -567,6 +634,7 @@ def parse_args() -> argparse.Namespace:
         help="Jumlah batch maksimum untuk audit evaluasi. 0 berarti semua.",
     )
 
+    # ---- EXPORT THRESHOLDS ----
     parser.add_argument(
         "--max-export-loss",
         type=float,
