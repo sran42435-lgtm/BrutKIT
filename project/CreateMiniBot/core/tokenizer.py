@@ -20,9 +20,18 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
+
+# ============================================================================
+# FIX IMPORT PATH
+# ============================================================================
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config import CONFIG, Config
 
@@ -97,6 +106,9 @@ class Tokenizer:
         self._validate_target_vocab()
 
         word_freq, char_freq = self._build_corpus_statistics()
+        
+        # Jika dataset kosong, char_freq akan kosong.
+        # Kita tetap bangun vocab dengan special tokens dan padding.
         token_to_id = self._build_initial_vocab(char_freq)
 
         # Proyeksikan korpus ke vocab awal. Karakter langka menjadi [UNK].
@@ -210,10 +222,6 @@ class Tokenizer:
     ) -> List[int]:
         """
         Mengubah teks menjadi daftar token ID.
-
-        Parameter:
-        - add_bos: tambahkan [BOS] di awal
-        - add_eos: tambahkan [EOS] di akhir
         """
         self._ensure_ready()
 
@@ -233,7 +241,6 @@ class Tokenizer:
     def encode_to_tokens(self, text: str) -> List[str]:
         """
         Mengubah teks menjadi daftar token string sebelum dikonversi ke ID.
-        Berguna untuk debugging.
         """
         self._ensure_ready()
 
@@ -247,8 +254,6 @@ class Tokenizer:
         for idx, word in enumerate(words):
             base_tokens: List[str] = []
 
-            # Kata selain pertama diberi marker spasi agar decode bisa
-            # mengembalikan pemisahan kata secara alami.
             if idx > 0:
                 base_tokens.append(self.SPACE_MARKER)
 
@@ -256,11 +261,9 @@ class Tokenizer:
                 if self._is_valid_char(ch):
                     base_tokens.append(ch)
 
-            # Jika hanya berisi marker spasi tanpa karakter valid, lewati.
             if not base_tokens or base_tokens == [self.SPACE_MARKER]:
                 continue
 
-            # Token dasar yang tidak ada di vocab dipetakan ke [UNK].
             base_tokens = [
                 token if token in self.token_to_id else self.unk_token
                 for token in base_tokens
@@ -302,8 +305,6 @@ class Tokenizer:
 
         text = "".join(pieces)
         text = text.replace(self.SPACE_MARKER, " ")
-
-        # Bersihkan spasi berlebih akibat proses generation.
         text = re.sub(r"\s+", " ", text).strip()
 
         return text
@@ -313,7 +314,7 @@ class Tokenizer:
     # ======================================================================
 
     def _validate_target_vocab(self) -> None:
-        minimum = len(self.special_ordered) + 2  # special + marker + 1 token
+        minimum = len(self.special_ordered) + 2
         if self.target_vocab_size < minimum:
             raise ValueError(
                 "config.model.vocab_size terlalu kecil. "
@@ -329,7 +330,6 @@ class Tokenizer:
                 )
 
         if self.SPACE_MARKER not in self.token_to_id:
-            # Jika space marker tidak ada, tambahkan sebagai token baru.
             self.token_to_id[self.SPACE_MARKER] = len(self.token_to_id)
             self.id_to_token = {v: k for k, v in self.token_to_id.items()}
 
@@ -351,15 +351,6 @@ class Tokenizer:
     # ======================================================================
 
     def _iter_corpus_texts(self) -> Iterable[str]:
-        """
-        Membaca file dataset dari folder datasets/.
-
-        Format yang didukung:
-        - .txt
-        - .json
-
-        Untuk .json, seluruh string di dalam struktur JSON akan diambil.
-        """
         if not self.datasets_dir.exists():
             self.datasets_dir.mkdir(parents=True, exist_ok=True)
             return
@@ -376,41 +367,30 @@ class Tokenizer:
                         yield line
 
             elif suffix == ".json":
-                # Coba baca sebagai JSON utuh. Jika gagal, coba sebagai
-                # JSON Lines untuk fleksibilitas dataset mentah.
                 try:
                     with open(path, "r", encoding="utf-8", errors="ignore") as f:
                         data = json.load(f)
-
                     for text in self._extract_json_strings(data):
                         yield text
-
                 except json.JSONDecodeError:
                     with open(path, "r", encoding="utf-8", errors="ignore") as f:
                         for line in f:
                             line = line.strip()
                             if not line:
                                 continue
-
                             try:
                                 obj = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
-
                             for text in self._extract_json_strings(obj):
                                 yield text
 
     def _extract_json_strings(self, node) -> Iterable[str]:
-        """
-        Mengambil semua string dari struktur JSON secara rekursif.
-        """
         if isinstance(node, str):
             yield node
-
         elif isinstance(node, dict):
             for value in node.values():
                 yield from self._extract_json_strings(value)
-
         elif isinstance(node, list):
             for value in node:
                 yield from self._extract_json_strings(value)
@@ -420,12 +400,6 @@ class Tokenizer:
     # ======================================================================
 
     def _normalize_text(self, text: str) -> str:
-        """
-        Normalisasi teks sebelum tokenisasi:
-        - ganti newline/tab menjadi spasi
-        - rapatkan whitespace berulang
-        - hapus spasi di awal/akhir
-        """
         text = text.replace("\r", " ")
         text = text.replace("\n", " ")
         text = text.replace("\t", " ")
@@ -433,11 +407,6 @@ class Tokenizer:
         return text.strip()
 
     def _is_valid_char(self, ch: str) -> bool:
-        """
-        Karakter valid untuk token dasar:
-        - bukan whitespace
-        - printable
-        """
         if ch in (" ", "\n", "\r", "\t"):
             return False
         return ch.isprintable()
@@ -449,11 +418,6 @@ class Tokenizer:
     def _build_corpus_statistics(
         self,
     ) -> Tuple[Dict[Tuple[str, ...], int], Counter]:
-        """
-        Membangun:
-        - word_freq: frekuensi urutan token dasar per kata
-        - char_freq: frekuensi karakter dasar untuk initial vocab
-        """
         word_freq: Dict[Tuple[str, ...], int] = {}
         char_freq: Counter = Counter()
 
@@ -475,7 +439,6 @@ class Tokenizer:
                         base_tokens.append(ch)
                         char_freq[ch] += 1
 
-                # Lewati kata yang tidak memiliki karakter valid.
                 if not base_tokens or base_tokens == [self.SPACE_MARKER]:
                     continue
 
@@ -489,40 +452,27 @@ class Tokenizer:
     # ======================================================================
 
     def _build_initial_vocab(self, char_freq: Counter) -> Dict[str, int]:
-        """
-        Membangun vocab awal:
-        1. special tokens
-        2. space marker
-        3. karakter paling sering muncul sampai batas vocab_size
-        """
         token_to_id: Dict[str, int] = {}
 
-        # 1. Special tokens dengan ID tetap.
         for token in self.special_ordered:
             token_to_id[token] = len(token_to_id)
 
-        # 2. Space marker.
         if len(token_to_id) >= self.target_vocab_size:
             raise ValueError("vocab_size terlalu kecil untuk space marker.")
 
         token_to_id[self.SPACE_MARKER] = len(token_to_id)
 
-        # 3. Karakter dasar berdasarkan frekuensi.
         sorted_chars = sorted(char_freq.items(), key=lambda item: (-item[1], item[0]))
 
         for ch, _freq in sorted_chars:
             if len(token_to_id) >= self.target_vocab_size:
                 break
-
             if ch == self.SPACE_MARKER:
                 continue
-
             if ch in token_to_id:
                 continue
-
             if not self._is_valid_char(ch):
                 continue
-
             token_to_id[ch] = len(token_to_id)
 
         return token_to_id
@@ -532,10 +482,6 @@ class Tokenizer:
         word_freq: Dict[Tuple[str, ...], int],
         token_to_id: Dict[str, int],
     ) -> Dict[Tuple[str, ...], int]:
-        """
-        Mengubah token dasar pada word_freq agar sesuai vocab awal.
-        Token yang tidak dikenal diganti [UNK].
-        """
         projected: Dict[Tuple[str, ...], int] = {}
 
         for tokens, freq in word_freq.items():
@@ -567,15 +513,6 @@ class Tokenizer:
         token_to_id: Dict[str, int],
         merges: List[Tuple[str, str]],
     ) -> None:
-        """
-        Mempelajari merge BPE secara iteratif.
-
-        Setiap iterasi:
-        1. Hitung frekuensi pasangan token.
-        2. Pilih pasangan dengan frekuensi tertinggi.
-        3. Gabungkan menjadi token baru.
-        4. Perbarui representasi kata.
-        """
         while len(token_to_id) < self.target_vocab_size:
             pair_counts: Dict[Tuple[str, str], int] = {}
             existing_tokens = set(token_to_id.keys())
@@ -588,11 +525,9 @@ class Tokenizer:
                     a = tokens[i]
                     b = tokens[i + 1]
 
-                    # Jangan libatkan special tokens dalam merge.
                     if a in self._special_set or b in self._special_set:
                         continue
 
-                    # Hindari membuat token yang sudah ada, termasuk special.
                     candidate = a + b
                     if candidate in existing_tokens:
                         continue
@@ -603,9 +538,6 @@ class Tokenizer:
             if not pair_counts:
                 break
 
-            # Deterministik:
-            # - frekuensi tertinggi
-            # - jika sama, pilih pasangan lexicographically terkecil
             best_pair = min(
                 pair_counts.items(),
                 key=lambda item: (-item[1], item[0]),
@@ -621,7 +553,6 @@ class Tokenizer:
 
             merges.append(best_pair)
 
-            # Update seluruh representasi kata dengan merge terbaik.
             a, b = best_pair
             updated_word_freq: Dict[Tuple[str, ...], int] = {}
 
@@ -653,10 +584,6 @@ class Tokenizer:
     # ======================================================================
 
     def _pad_vocab(self, token_to_id: Dict[str, int]) -> Dict[str, int]:
-        """
-        Menambahkan token [UNUSED_x] agar jumlah vocab sesuai
-        config.model.vocab_size.
-        """
         token_to_id = dict(token_to_id)
 
         while len(token_to_id) < self.target_vocab_size:
@@ -677,9 +604,6 @@ class Tokenizer:
     # ======================================================================
 
     def _apply_bpe(self, tokens: List[str]) -> List[str]:
-        """
-        Menerapkan merge BPE pada daftar token dasar.
-        """
         if len(tokens) <= 1:
             return tokens
 
@@ -696,7 +620,6 @@ class Tokenizer:
                 a = current_tokens[i]
                 b = current_tokens[i + 1]
 
-                # Jangan merge special tokens.
                 if a in self._special_set or b in self._special_set:
                     continue
 
@@ -739,9 +662,6 @@ class Tokenizer:
 # ==========================================================================
 
 if __name__ == "__main__":
-    # Jika file ini dijalankan langsung, lakukan training tokenizer
-    # lalu uji encode-decode sederhana.
-
     tokenizer = Tokenizer()
     tokenizer.train()
 

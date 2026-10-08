@@ -8,6 +8,7 @@
 # 3. Menghasilkan gradient terhadap logits untuk training.
 # 4. Menyediakan fungsi audit() untuk mengevaluasi model pada batch data.
 # 5. Menyediakan should_export() untuk membantu keputusan export model.
+# 6. Sanitasi logits dari NaN/Inf untuk mencegah loss beku.
 #
 # Implementasi:
 # - Tidak memakai framework ML siap pakai.
@@ -54,6 +55,11 @@ except ImportError as exc:
 from config import CONFIG, Config
 
 
+# Batas clipping logits untuk mencegah overflow softmax.
+# Nilai 50 cukup besar untuk membedakan kelas tapi tidak menyebabkan overflow.
+LOGIT_CLIP_VALUE = 50.0
+
+
 class Evaluator:
     """
     Auditor jawaban model.
@@ -64,6 +70,7 @@ class Evaluator:
     - menghitung accuracy
     - menghasilkan gradient logits saat training
     - mengevaluasi model terhadap batch data
+    - sanitasi logits dari NaN/Inf
     """
 
     def __init__(self, config: Config = CONFIG):
@@ -244,6 +251,10 @@ class Evaluator:
 
         Rumus:
             L = -1/N * Σ log(softmax(logits)[target])
+
+        Fitur tambahan:
+        - Sanitasi logits dari NaN/Inf
+        - Clipping logits untuk mencegah overflow
         """
         logits = np.asarray(logits, dtype=np.float32)
         targets = np.asarray(targets, dtype=np.int64)
@@ -260,6 +271,21 @@ class Evaluator:
             )
 
         B, T, V = logits.shape
+
+        # --------------------------------------------------------------------
+        # Sanitasi logits: ganti NaN/Inf dengan nilai aman
+        # --------------------------------------------------------------------
+        logits = np.nan_to_num(
+            logits,
+            nan=0.0,
+            posinf=LOGIT_CLIP_VALUE,
+            neginf=-LOGIT_CLIP_VALUE,
+        ).astype(np.float32, copy=False)
+
+        # --------------------------------------------------------------------
+        # Clipping logits untuk mencegah overflow softmax
+        # --------------------------------------------------------------------
+        logits = np.clip(logits, -LOGIT_CLIP_VALUE, LOGIT_CLIP_VALUE)
 
         # --------------------------------------------------------------------
         # Tentukan ignore index
@@ -315,10 +341,22 @@ class Evaluator:
 
         loss = float(np.sum(nll) / num_valid_tokens)
 
+        # Sanitasi loss jika ternyata masih NaN/Inf
+        if not np.isfinite(loss):
+            loss = 0.0
+
         # --------------------------------------------------------------------
         # Probability untuk gradient dan metrik
         # --------------------------------------------------------------------
         probs = np.exp(log_probs)
+
+        # Sanitasi probs dari NaN/Inf
+        probs = np.nan_to_num(
+            probs,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).astype(np.float32, copy=False)
 
         preds = np.argmax(logits, axis=-1)
         correct_mask = (preds == targets) & valid_mask
@@ -353,6 +391,14 @@ class Evaluator:
             # Normalisasi terhadap jumlah token valid
             grad_logits = grad_logits / float(num_valid_tokens)
 
+            # Sanitasi gradient dari NaN/Inf
+            grad_logits = np.nan_to_num(
+                grad_logits,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).astype(np.float32, copy=False)
+
         return loss, grad_logits, metrics
 
     @staticmethod
@@ -362,10 +408,35 @@ class Evaluator:
 
         Rumus:
             log_softmax(x) = x - max(x) - log(sum(exp(x - max(x))))
+
+        Implementasi ini aman terhadap:
+        - Overflow: pakai max-shift sebelum exp
+        - Underflow: exp dari nilai sangat negatif jadi 0, tidak masalah
+        - NaN/Inf: sudah disanitasi sebelum masuk ke sini
         """
         max_logits = np.max(logits, axis=-1, keepdims=True)
+
+        # Jika max_logits adalah inf atau -inf, ganti dengan 0
+        max_logits = np.nan_to_num(
+            max_logits,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
         shifted = logits - max_logits
-        log_sum_exp = np.log(np.sum(np.exp(shifted), axis=-1, keepdims=True))
+
+        # Clip shifted untuk mencegah overflow exp
+        shifted = np.clip(shifted, -LOGIT_CLIP_VALUE, LOGIT_CLIP_VALUE)
+
+        exp_shifted = np.exp(shifted)
+        sum_exp = np.sum(exp_shifted, axis=-1, keepdims=True)
+
+        # Hindari divide by zero
+        sum_exp = np.maximum(sum_exp, 1e-10)
+
+        log_sum_exp = np.log(sum_exp)
+
         return shifted - log_sum_exp
 
 
@@ -403,3 +474,21 @@ if __name__ == "__main__":
     print(f"Valid tokens   : {metrics['num_valid_tokens']}")
     print(f"Correct tokens : {metrics['num_correct']}")
     print(f"Grad shape     : {grad_logits.shape}")
+
+    # Test dengan logits ekstrem (simulasi gradient explosion)
+    print("\nTest dengan logits ekstrem...")
+    extreme_logits = np.array([[[1000.0, -1000.0, 0.0]]], dtype=np.float32)
+    extreme_targets = np.array([[0]], dtype=np.int64)
+
+    loss2, grad2, metrics2 = evaluator.compute_loss_and_grad(extreme_logits, extreme_targets)
+    print(f"Loss dengan logits ekstrem : {loss2:.6f}")
+    print(f"Grad finite: {np.all(np.isfinite(grad2))}")
+
+    # Test dengan logits NaN
+    print("\nTest dengan logits NaN...")
+    nan_logits = np.array([[[np.nan, 0.0, 0.0]]], dtype=np.float32)
+    nan_targets = np.array([[1]], dtype=np.int64)
+
+    loss3, grad3, metrics3 = evaluator.compute_loss_and_grad(nan_logits, nan_targets)
+    print(f"Loss dengan logits NaN : {loss3:.6f}")
+    print(f"Grad finite: {np.all(np.isfinite(grad3))}")

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Final, Optional, Tuple
+from typing import Dict, Final, Tuple
 
 
 # ==============================================================================
@@ -74,7 +74,7 @@ class PathsConfig:
         default_factory=lambda: ROOT_DIR / "output_models" / "otak_model.safetensors"
     )
     checkpoint_path: Path = field(
-        default_factory=lambda: ROOT_DIR / "output_models" / "training_checkpoint.npz"
+        default_factory=lambda: ROOT_DIR / "output_models" / "training_checkpoint.json"
     )
 
     def ensure_dirs(self) -> None:
@@ -151,15 +151,12 @@ class TrainingConfig:
     - pipeline/evaluator.py
     """
 
-    # Learning rate: diturunkan dari 3e-4 ke 1e-4 untuk stabilitas
-    learning_rate: float = 1e-4
-    
+    learning_rate: float = 3e-4
     batch_size: int = 2
-    epochs: int = 20
+    epochs: int = 101
     sequence_length: int = 24
 
-    # Regularization: dinaikkan dari 0.0 ke 0.1 untuk mencegah overfit
-    dropout_rate: float = 0.1
+    # Regularization
     weight_decay: float = 0.01
 
     # Gradient clipping untuk mencegah exploding gradient
@@ -169,40 +166,6 @@ class TrainingConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_epsilon: float = 1e-8
-
-    # Learning rate scheduling
-    # Warmup: LR naik perlahan di awal training
-    lr_warmup_steps: int = 100
-    
-    # Decay: LR turun setelah step tertentu
-    # 0 = tidak ada decay, > 0 = decay setiap N step
-    lr_decay_steps: int = 0
-    
-    # Faktor decay (misal 0.5 = LR dibagi 2 setiap lr_decay_steps)
-    lr_decay_factor: float = 0.5
-    
-    # Minimum learning rate (LR tidak akan turun di bawah ini)
-    lr_min: float = 1e-6
-
-    # Gradient accumulation untuk effective batch size lebih besar
-    # effective_batch_size = batch_size * gradient_accumulation_steps
-    # 1 = tidak ada accumulation
-    gradient_accumulation_steps: int = 1
-
-    # Early stopping
-    # 0 = tidak ada early stopping
-    # > 0 = stop jika loss tidak turun selama N epoch
-    early_stopping_patience: int = 0
-
-    # Evaluasi dan checkpoint
-    # 0 = hanya di akhir epoch
-    # > 0 = evaluasi/checkpoint setiap N step
-    eval_every_n_steps: int = 0
-    save_checkpoint_every_n_steps: int = 0
-
-    # Inline training dari playground
-    # Jumlah step default saat user mengetik "training" di interactive mode
-    inline_training_steps: int = 10
 
     # Reproducibility
     seed: int = 1337
@@ -228,6 +191,7 @@ class ModelConfig:
     embedding_dim: int = 96
     num_attention_heads: int = 4
     num_layers: int = 3
+    dropout_rate: float = 0.0
 
     # Context length maksimal
     max_position_embeddings: int = 96
@@ -236,6 +200,7 @@ class ModelConfig:
     layer_norm_eps: float = 1e-5
 
     # Dimensi Feed-Forward Network
+    # Contoh pada spesifikasi menggunakan 2048 -> 5632
     ffn_hidden_dim: int = 192
 
     # Presisi saat training dan export
@@ -311,8 +276,8 @@ class Config:
         if m.num_layers < 0:
             raise ValueError("model.num_layers tidak boleh negatif.")
 
-        if not (0.0 <= t.dropout_rate < 1.0):
-            raise ValueError("training.dropout_rate harus berada pada rentang [0, 1).")
+        if not (0.0 <= m.dropout_rate < 1.0):
+            raise ValueError("model.dropout_rate harus berada pada rentang [0, 1).")
 
         if m.max_position_embeddings <= 0:
             raise ValueError("model.max_position_embeddings harus lebih besar dari 0.")
@@ -369,41 +334,6 @@ class Config:
         if t.adam_epsilon <= 0.0:
             raise ValueError("training.adam_epsilon harus lebih besar dari 0.")
 
-        # Validasi learning rate scheduling
-        if t.lr_warmup_steps < 0:
-            raise ValueError("training.lr_warmup_steps tidak boleh negatif.")
-
-        if t.lr_decay_steps < 0:
-            raise ValueError("training.lr_decay_steps tidak boleh negatif.")
-
-        if not (0.0 < t.lr_decay_factor <= 1.0):
-            raise ValueError("training.lr_decay_factor harus berada pada rentang (0, 1].")
-
-        if t.lr_min < 0.0:
-            raise ValueError("training.lr_min tidak boleh negatif.")
-
-        if t.lr_min > t.learning_rate:
-            raise ValueError("training.lr_min tidak boleh lebih besar dari learning_rate.")
-
-        # Validasi gradient accumulation
-        if t.gradient_accumulation_steps < 1:
-            raise ValueError("training.gradient_accumulation_steps harus >= 1.")
-
-        # Validasi early stopping
-        if t.early_stopping_patience < 0:
-            raise ValueError("training.early_stopping_patience tidak boleh negatif.")
-
-        # Validasi eval/checkpoint
-        if t.eval_every_n_steps < 0:
-            raise ValueError("training.eval_every_n_steps tidak boleh negatif.")
-
-        if t.save_checkpoint_every_n_steps < 0:
-            raise ValueError("training.save_checkpoint_every_n_steps tidak boleh negatif.")
-
-        # Validasi inline training
-        if t.inline_training_steps < 1:
-            raise ValueError("training.inline_training_steps harus >= 1.")
-
 
 # ==============================================================================
 # INSTANCE GLOBAL
@@ -434,28 +364,19 @@ if __name__ == "__main__":
     print(f"Checkpoint path     : {CONFIG.paths.checkpoint_path}")
     print()
     print("Training config:")
-    print(f"  learning_rate                : {CONFIG.training.learning_rate}")
-    print(f"  batch_size                   : {CONFIG.training.batch_size}")
-    print(f"  epochs                       : {CONFIG.training.epochs}")
-    print(f"  sequence_length              : {CONFIG.training.sequence_length}")
-    print(f"  dropout_rate                 : {CONFIG.training.dropout_rate}")
-    print(f"  weight_decay                 : {CONFIG.training.weight_decay}")
-    print(f"  grad_clip_norm               : {CONFIG.training.grad_clip_norm}")
-    print(f"  lr_warmup_steps              : {CONFIG.training.lr_warmup_steps}")
-    print(f"  lr_decay_steps               : {CONFIG.training.lr_decay_steps}")
-    print(f"  lr_decay_factor              : {CONFIG.training.lr_decay_factor}")
-    print(f"  lr_min                       : {CONFIG.training.lr_min}")
-    print(f"  gradient_accumulation_steps  : {CONFIG.training.gradient_accumulation_steps}")
-    print(f"  early_stopping_patience      : {CONFIG.training.early_stopping_patience}")
-    print(f"  eval_every_n_steps           : {CONFIG.training.eval_every_n_steps}")
-    print(f"  save_checkpoint_every_n_steps: {CONFIG.training.save_checkpoint_every_n_steps}")
-    print(f"  inline_training_steps        : {CONFIG.training.inline_training_steps}")
+    print(f"  learning_rate     : {CONFIG.training.learning_rate}")
+    print(f"  batch_size        : {CONFIG.training.batch_size}")
+    print(f"  epochs            : {CONFIG.training.epochs}")
+    print(f"  sequence_length   : {CONFIG.training.sequence_length}")
+    print(f"  weight_decay      : {CONFIG.training.weight_decay}")
+    print(f"  grad_clip_norm    : {CONFIG.training.grad_clip_norm}")
     print()
     print("Model config:")
     print(f"  vocab_size        : {CONFIG.model.vocab_size}")
     print(f"  embedding_dim     : {CONFIG.model.embedding_dim}")
     print(f"  num_heads         : {CONFIG.model.num_attention_heads}")
     print(f"  num_layers        : {CONFIG.model.num_layers}")
+    print(f"  dropout_rate      : {CONFIG.model.dropout_rate}")
     print(f"  max_position      : {CONFIG.model.max_position_embeddings}")
     print(f"  ffn_hidden_dim    : {CONFIG.model.ffn_hidden_dim}")
     print(f"  head_dim          : {CONFIG.model.head_dim}")

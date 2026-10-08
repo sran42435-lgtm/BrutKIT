@@ -81,10 +81,11 @@ class Playground:
     #   Jawaban : (kosong)
     DEFAULT_MIN_NEW_TOKENS = 8
 
-    def __init__(self, model, tokenizer, config: Config = CONFIG):
+    def __init__(self, model, tokenizer, config: Config = CONFIG, trainer=None):
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
+        self.trainer = trainer
 
         self.rng = np.random.default_rng(int(config.training.seed))
 

@@ -6,6 +6,7 @@
 # - Tidak memakai framework ML siap pakai seperti PyTorch/TensorFlow.
 # - Memakai NumPy hanya sebagai pustaka primitif numerik.
 # - Menulis forward pass dan backward pass secara manual.
+# - Sanitasi NaN/Inf di setiap tahap untuk stabilitas training.
 #
 # Komponen:
 # - Embedding
@@ -34,12 +35,6 @@ from typing import Dict, Optional
 # ============================================================================
 # FIX IMPORT PATH
 # ============================================================================
-# Memastikan project root ada di sys.path, sehingga file di dalam folder core/
-# tetap bisa meng-import config.py meskipun dijalankan langsung:
-#   python core/architecture.py
-# atau:
-#   cd core && python architecture.py
-
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if str(_PROJECT_ROOT) not in sys.path:
@@ -60,6 +55,11 @@ except ImportError as exc:
 from config import CONFIG, Config
 
 
+# Batas clipping untuk mencegah overflow
+ATTENTION_SCORE_CLIP = 50.0
+ACTIVATION_CLIP = 50.0
+
+
 # ============================================================================
 # NUMERIC HELPERS
 # ============================================================================
@@ -67,9 +67,6 @@ from config import CONFIG, Config
 def _init_weight(rng: np.random.Generator, shape: tuple) -> np.ndarray:
     """
     Inisialisasi bobot dengan distribusi normal kecil.
-
-    Standar inisialisasi:
-    - std = min(0.02, 1 / sqrt(fan_in))
     """
     if len(shape) == 1:
         fan_in = shape[0]
@@ -82,11 +79,36 @@ def _init_weight(rng: np.random.Generator, shape: tuple) -> np.ndarray:
 
 def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     """
-    Softmax numerik stabil.
+    Softmax numerik stabil dengan sanitasi NaN/Inf.
     """
+    # Sanitasi input
+    x = np.nan_to_num(x, nan=0.0, posinf=ATTENTION_SCORE_CLIP, neginf=-ATTENTION_SCORE_CLIP)
+    
     x_max = np.max(x, axis=axis, keepdims=True)
-    exp_x = np.exp(x - x_max)
-    return exp_x / np.sum(exp_x, axis=axis, keepdims=True)
+    
+    # Sanitasi max (jika ada NaN di input, max bisa NaN)
+    x_max = np.nan_to_num(x_max, nan=0.0, posinf=ATTENTION_SCORE_CLIP, neginf=-ATTENTION_SCORE_CLIP)
+    
+    # Clip shifted untuk mencegah overflow exp
+    shifted = np.clip(x - x_max, -ATTENTION_SCORE_CLIP, ATTENTION_SCORE_CLIP)
+    exp_x = np.exp(shifted)
+    
+    sum_exp = np.sum(exp_x, axis=axis, keepdims=True)
+    sum_exp = np.maximum(sum_exp, 1e-10)  # Hindari divide by zero
+    
+    return exp_x / sum_exp
+
+
+def _sanitize(x: np.ndarray) -> np.ndarray:
+    """
+    Sanitasi array dari NaN/Inf.
+    """
+    return np.nan_to_num(
+        x,
+        nan=0.0,
+        posinf=ACTIVATION_CLIP,
+        neginf=-ACTIVATION_CLIP,
+    ).astype(np.float32, copy=False)
 
 
 def _dropout(
@@ -97,10 +119,6 @@ def _dropout(
 ) -> tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Inverted dropout.
-
-    Return:
-    - output
-    - mask (berisi scaling 1 / keep_prob) atau None jika dropout tidak aktif
     """
     p = float(p)
 
@@ -157,9 +175,6 @@ class Parameter:
 class RMSNorm:
     """
     RMSNorm sederhana.
-
-    Rumus:
-        y = x / sqrt(mean(x^2) + eps) * weight
     """
 
     def __init__(self, dim: int, eps: float = 1e-5):
@@ -168,10 +183,12 @@ class RMSNorm:
         self.cache: Optional[tuple] = None
 
     def forward(self, x: np.ndarray) -> np.ndarray:
+        x = _sanitize(x)
         ms = np.mean(x * x, axis=-1, keepdims=True)
         inv_rms = 1.0 / np.sqrt(ms + self.eps)
 
         y = x * inv_rms * self.weight.data
+        y = _sanitize(y)
         self.cache = (x, inv_rms)
         return y
 
@@ -182,9 +199,12 @@ class RMSNorm:
         x, inv_rms = self.cache
         D = x.shape[-1]
 
+        dout = _sanitize(dout)
+
         # Gradient untuk weight
         axes = tuple(range(dout.ndim - 1))
         self.weight.grad += np.sum(dout * x * inv_rms, axis=axes)
+        self.weight.grad = _sanitize(self.weight.grad)
 
         # Gradient untuk input
         dot = np.sum(dout * self.weight.data * x, axis=-1, keepdims=True)
@@ -193,6 +213,7 @@ class RMSNorm:
             - x * dot * (inv_rms ** 3) / D
         )
 
+        dx = _sanitize(dx)
         self.cache = None
         return dx
 
@@ -209,9 +230,6 @@ class RMSNorm:
 class MultiHeadSelfAttention:
     """
     Multi-head self-attention dengan causal mask.
-
-    Rumus inti:
-        Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) V
     """
 
     def __init__(self, config: Config, rng: np.random.Generator):
@@ -219,7 +237,13 @@ class MultiHeadSelfAttention:
         self.num_heads = int(config.model.num_attention_heads)
         self.head_dim = self.hidden_size // self.num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.dropout_p = float(config.model.dropout_rate)
+        
+        # Dropout rate dari training config (jika ada), fallback ke model config
+        dropout_rate = getattr(config.training, 'dropout_rate', None)
+        if dropout_rate is None:
+            dropout_rate = config.model.dropout_rate
+        self.dropout_p = float(dropout_rate)
+        
         self.rng = rng
 
         if self.hidden_size % self.num_heads != 0:
@@ -235,11 +259,16 @@ class MultiHeadSelfAttention:
         self.cache: Optional[tuple] = None
 
     def forward(self, x: np.ndarray, training: bool) -> np.ndarray:
+        x = _sanitize(x)
         B, T, D = x.shape
 
         Q = x @ self.q_proj.data.T
         K = x @ self.k_proj.data.T
         V = x @ self.v_proj.data.T
+
+        Q = _sanitize(Q)
+        K = _sanitize(K)
+        V = _sanitize(V)
 
         Qh = Q.reshape(B, T, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         Kh = K.reshape(B, T, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
@@ -249,11 +278,15 @@ class MultiHeadSelfAttention:
         scores = Qh @ Kh.transpose(0, 1, 3, 2)
         scores = scores * self.scale
 
+        # Clip scores untuk mencegah overflow
+        scores = np.clip(scores, -ATTENTION_SCORE_CLIP, ATTENTION_SCORE_CLIP)
+
         # Causal mask: token tidak boleh melihat masa depan
         causal_mask = np.triu(np.ones((T, T), dtype=bool), k=1)
         scores = np.where(causal_mask[None, None, :, :], -1e9, scores)
 
         probs = _softmax(scores, axis=-1)
+        probs = _sanitize(probs)
 
         probs_drop, attn_dropout_mask = _dropout(
             probs,
@@ -264,8 +297,10 @@ class MultiHeadSelfAttention:
 
         context = probs_drop @ Vh
         context = context.transpose(0, 2, 1, 3).reshape(B, T, D)
+        context = _sanitize(context)
 
         output = context @ self.o_proj.data.T
+        output = _sanitize(output)
 
         self.cache = (
             x,
@@ -297,6 +332,7 @@ class MultiHeadSelfAttention:
             context,
         ) = self.cache
 
+        dout = _sanitize(dout)
         B, T, D = x.shape
 
         # ------------------------------------------------------------
@@ -306,7 +342,9 @@ class MultiHeadSelfAttention:
         context_2d = context.reshape(-1, D)
 
         self.o_proj.grad += dout_2d.T @ context_2d
+        self.o_proj.grad = _sanitize(self.o_proj.grad)
         dcontext = dout @ self.o_proj.data
+        dcontext = _sanitize(dcontext)
 
         dcontext_heads = dcontext.reshape(
             B, T, self.num_heads, self.head_dim
@@ -328,13 +366,12 @@ class MultiHeadSelfAttention:
         # ------------------------------------------------------------
         sum_dp = np.sum(dprobs * probs, axis=-1, keepdims=True)
         dscores = probs * (dprobs - sum_dp)
-
-        # Forward memakai scale, maka gradient ke raw scores juga diskalakan
         dscores = dscores * self.scale
 
         # Masked position tidak boleh mengirim gradient
         causal_mask = np.triu(np.ones((T, T), dtype=bool), k=1)
         dscores = np.where(causal_mask[None, None, :, :], 0.0, dscores)
+        dscores = _sanitize(dscores)
 
         # ------------------------------------------------------------
         # Gradient terhadap Q, K
@@ -346,6 +383,10 @@ class MultiHeadSelfAttention:
         dK = dKh.transpose(0, 2, 1, 3).reshape(B, T, D)
         dV = dVh.transpose(0, 2, 1, 3).reshape(B, T, D)
 
+        dQ = _sanitize(dQ)
+        dK = _sanitize(dK)
+        dV = _sanitize(dV)
+
         # ------------------------------------------------------------
         # Projection backward untuk Q, K, V
         # ------------------------------------------------------------
@@ -355,11 +396,16 @@ class MultiHeadSelfAttention:
         self.k_proj.grad += dK.reshape(-1, D).T @ x_2d
         self.v_proj.grad += dV.reshape(-1, D).T @ x_2d
 
+        self.q_proj.grad = _sanitize(self.q_proj.grad)
+        self.k_proj.grad = _sanitize(self.k_proj.grad)
+        self.v_proj.grad = _sanitize(self.v_proj.grad)
+
         dx_q = dQ @ self.q_proj.data
         dx_k = dK @ self.k_proj.data
         dx_v = dV @ self.v_proj.data
 
         dx = dx_q + dx_k + dx_v
+        dx = _sanitize(dx)
 
         self.cache = None
         return dx
@@ -380,18 +426,18 @@ class MultiHeadSelfAttention:
 class SwiGLUFFN:
     """
     Feed-forward network dengan SwiGLU.
-
-    Struktur:
-        gate = x @ W_gate.T
-        up   = x @ W_up.T
-        h    = silu(gate) * up
-        out  = h @ W_down.T
     """
 
     def __init__(self, config: Config, rng: np.random.Generator):
         self.hidden_size = int(config.model.embedding_dim)
         self.ffn_hidden_dim = int(config.model.ffn_hidden_dim)
-        self.dropout_p = float(config.model.dropout_rate)
+        
+        # Dropout rate dari training config (jika ada), fallback ke model config
+        dropout_rate = getattr(config.training, 'dropout_rate', None)
+        if dropout_rate is None:
+            dropout_rate = config.model.dropout_rate
+        self.dropout_p = float(dropout_rate)
+        
         self.rng = rng
 
         self.gate_proj = Parameter(
@@ -407,13 +453,21 @@ class SwiGLUFFN:
         self.cache: Optional[tuple] = None
 
     def forward(self, x: np.ndarray, training: bool) -> np.ndarray:
+        x = _sanitize(x)
+        
         gate = x @ self.gate_proj.data.T
         up = x @ self.up_proj.data.T
 
+        # Clip gate dan up untuk mencegah overflow
+        gate = np.clip(gate, -ACTIVATION_CLIP, ACTIVATION_CLIP)
+        up = np.clip(up, -ACTIVATION_CLIP, ACTIVATION_CLIP)
+
         sig = 1.0 / (1.0 + np.exp(-gate))
         silu = gate * sig
+        silu = _sanitize(silu)
 
         h = silu * up
+        h = _sanitize(h)
 
         h_drop, dropout_mask = _dropout(
             h,
@@ -423,6 +477,7 @@ class SwiGLUFFN:
         )
 
         out = h_drop @ self.down_proj.data.T
+        out = _sanitize(out)
 
         self.cache = (
             x,
@@ -450,6 +505,7 @@ class SwiGLUFFN:
             dropout_mask,
         ) = self.cache
 
+        dout = _sanitize(dout)
         D = x.shape[-1]
         F = gate.shape[-1]
 
@@ -460,7 +516,9 @@ class SwiGLUFFN:
         h_2d = h_drop.reshape(-1, F)
 
         self.down_proj.grad += dout_2d.T @ h_2d
+        self.down_proj.grad = _sanitize(self.down_proj.grad)
         dh_drop = dout @ self.down_proj.data
+        dh_drop = _sanitize(dh_drop)
 
         # ------------------------------------------------------------
         # Dropout backward
@@ -475,6 +533,8 @@ class SwiGLUFFN:
 
         # d/dx silu(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
         dgate = dsilu * sig * (1.0 + gate * (1.0 - sig))
+        dgate = _sanitize(dgate)
+        dup = _sanitize(dup)
 
         # ------------------------------------------------------------
         # Gate dan Up projection
@@ -484,10 +544,14 @@ class SwiGLUFFN:
         self.gate_proj.grad += dgate.reshape(-1, F).T @ x_2d
         self.up_proj.grad += dup.reshape(-1, F).T @ x_2d
 
+        self.gate_proj.grad = _sanitize(self.gate_proj.grad)
+        self.up_proj.grad = _sanitize(self.up_proj.grad)
+
         dx_gate = dgate @ self.gate_proj.data
         dx_up = dup @ self.up_proj.data
 
         dx = dx_gate + dx_up
+        dx = _sanitize(dx)
 
         self.cache = None
         return dx
@@ -506,15 +570,18 @@ class SwiGLUFFN:
 
 class TransformerBlock:
     """
-    Satu blok Transformer:
-
-        x = x + Dropout(Attention(RMSNorm(x)))
-        x = x + Dropout(FFN(RMSNorm(x)))
+    Satu blok Transformer.
     """
 
     def __init__(self, config: Config, rng: np.random.Generator):
         self.config = config
-        self.dropout_p = float(config.model.dropout_rate)
+        
+        # Dropout rate dari training config (jika ada), fallback ke model config
+        dropout_rate = getattr(config.training, 'dropout_rate', None)
+        if dropout_rate is None:
+            dropout_rate = config.model.dropout_rate
+        self.dropout_p = float(dropout_rate)
+        
         self.rng = rng
 
         self.input_norm = RMSNorm(
@@ -536,16 +603,20 @@ class TransformerBlock:
         h = self.input_norm.forward(x)
         h = self.attn.forward(h, training)
         h, attn_dropout_mask = _dropout(h, self.dropout_p, training, self.rng)
+        h = _sanitize(h)
 
         x_1 = residual_1 + h
+        x_1 = _sanitize(x_1)
 
         residual_2 = x_1
 
         h = self.post_attention_norm.forward(x_1)
         h = self.ffn.forward(h, training)
         h, ffn_dropout_mask = _dropout(h, self.dropout_p, training, self.rng)
+        h = _sanitize(h)
 
         out = residual_2 + h
+        out = _sanitize(out)
 
         self.cache = (
             attn_dropout_mask,
@@ -560,6 +631,8 @@ class TransformerBlock:
 
         attn_dropout_mask, ffn_dropout_mask = self.cache
 
+        dout = _sanitize(dout)
+
         # ------------------------------------------------------------
         # Branch FFN + residual kedua
         # ------------------------------------------------------------
@@ -567,8 +640,8 @@ class TransformerBlock:
         d_ffn_in = self.ffn.backward(d_ffn_out)
         d_post_norm = self.post_attention_norm.backward(d_ffn_in)
 
-        # Gradient terhadap x_1 datang dari residual langsung + branch FFN
         d_x_1 = dout + d_post_norm
+        d_x_1 = _sanitize(d_x_1)
 
         # ------------------------------------------------------------
         # Branch Attention + residual pertama
@@ -577,9 +650,8 @@ class TransformerBlock:
         d_attn_in = self.attn.backward(d_attn_out)
         d_input_norm = self.input_norm.backward(d_attn_in)
 
-        # Gradient terhadap residual pertama datang dari residual langsung
-        # + branch attention
         dx = d_x_1 + d_input_norm
+        dx = _sanitize(dx)
 
         self.cache = None
         return dx
@@ -606,24 +678,8 @@ class TransformerBlock:
 class CustomTransformerLM:
     """
     Model Transformer custom untuk language modeling.
-
-    Struktur state_dict:
-    - embed_tokens.weight
-    - layers.{i}.input_layernorm.weight
-    - layers.{i}.self_attn.q_proj.weight
-    - layers.{i}.self_attn.k_proj.weight
-    - layers.{i}.self_attn.v_proj.weight
-    - layers.{i}.self_attn.o_proj.weight
-    - layers.{i}.post_attention_layernorm.weight
-    - layers.{i}.mlp.gate_proj.weight
-    - layers.{i}.mlp.up_proj.weight
-    - layers.{i}.mlp.down_proj.weight
-    - norm.weight
-    - lm_head.weight
     """
 
-    # Batas aman untuk implementasi pure-custom berbasis NumPy.
-    # Set None jika ingin menonaktifkan pemeriksaan ini.
     MAX_PARAMS: Optional[int] = 50_000_000
 
     def __init__(self, config: Config = CONFIG):
@@ -664,16 +720,7 @@ class CustomTransformerLM:
         self._parameters = self._collect_parameters()
         self._forward_cache: Optional[tuple] = None
 
-    # ========================================================================
-    # INIT / VALIDATION
-    # ========================================================================
-
     def _validate_practical_size(self) -> None:
-        """
-        Implementasi custom ini ditujukan untuk eksperimen dan pembelajaran.
-        Untuk konfigurasi sangat besar, sebaiknya gunakan backend GPU/framework
-        numerik yang lebih serius.
-        """
         if self.MAX_PARAMS is None:
             return
 
@@ -700,8 +747,7 @@ class CustomTransformerLM:
                 f"Estimasi: {estimated_params:,} parameter. "
                 f"Batas aman: {self.MAX_PARAMS:,} parameter. "
                 "Kurangi vocab_size, embedding_dim, num_layers, atau ffn_hidden_dim "
-                "di config.py, atau set CustomTransformerLM.MAX_PARAMS = None "
-                "untuk menonaktifkan pemeriksaan ini."
+                "di config.py, atau set CustomTransformerLM.MAX_PARAMS = None."
             )
 
     def _build_sinusoidal_positional_encoding(
@@ -709,13 +755,6 @@ class CustomTransformerLM:
         max_position: int,
         dim: int,
     ) -> np.ndarray:
-        """
-        Positional Encoding sinusoidal.
-
-        Rumus:
-            PE(pos, 2i)   = sin(pos / 10000^(2i/d))
-            PE(pos, 2i+1) = cos(pos / 10000^(2i/d))
-        """
         pe = np.zeros((max_position, dim), dtype=np.float32)
         position = np.arange(max_position, dtype=np.float32)[:, None]
 
@@ -726,10 +765,6 @@ class CustomTransformerLM:
         pe[:, 1::2] = np.cos(position * div_term[: dim // 2])
 
         return pe
-
-    # ========================================================================
-    # PARAMETER MANAGEMENT
-    # ========================================================================
 
     def _collect_parameters(self) -> Dict[str, Parameter]:
         params: Dict[str, Parameter] = {}
@@ -746,39 +781,22 @@ class CustomTransformerLM:
         return params
 
     def parameters(self) -> Dict[str, Parameter]:
-        """
-        Mengembalikan dictionary nama parameter -> objek Parameter.
-        """
         return dict(self._parameters)
 
     def parameter_count(self) -> int:
-        """
-        Menghitung jumlah total parameter.
-        """
         return sum(p.data.size for p in self._parameters.values())
 
     def zero_grad(self) -> None:
-        """
-        Mengosongkan seluruh gradient.
-        Dipanggil sebelum satu langkah training.
-        """
         for param in self._parameters.values():
             param.zero_grad()
 
     def state_dict(self) -> Dict[str, np.ndarray]:
-        """
-        Mengembalikan salinan seluruh bobot model.
-        Dipakai oleh model_exporter.py dan weight_manager.py.
-        """
         return {
             name: param.data.copy()
             for name, param in self._parameters.items()
         }
 
     def load_state_dict(self, state_dict: Dict[str, np.ndarray]) -> None:
-        """
-        Memuat bobot dari state_dict.
-        """
         for name, array in state_dict.items():
             if name not in self._parameters:
                 raise KeyError(f"Parameter tidak dikenal: {name}")
@@ -795,24 +813,11 @@ class CustomTransformerLM:
             param.data = arr
             param.grad = np.zeros_like(arr, dtype=np.float32)
 
-    # ========================================================================
-    # FORWARD
-    # ========================================================================
-
     def forward(
         self,
         input_ids: np.ndarray,
         training: bool = False,
     ) -> np.ndarray:
-        """
-        Forward pass.
-
-        Input:
-        - input_ids: [B, T] atau [T]
-
-        Output:
-        - logits: [B, T, vocab_size]
-        """
         ids = np.asarray(input_ids, dtype=np.int64)
 
         if ids.ndim == 1:
@@ -832,33 +837,34 @@ class CustomTransformerLM:
                 f"{self.max_position_embeddings}."
             )
 
-        # Token ID di luar vocab dipetakan ke [UNK]
         unk_id = int(self.config.special_tokens.unk_id)
         ids = np.where((ids < 0) | (ids >= self.vocab_size), unk_id, ids)
 
-        # Embedding
-        x = self.embed_tokens.data[ids]  # [B, T, D]
+        x = self.embed_tokens.data[ids]
+        x = _sanitize(x)
 
-        # Positional encoding
         x = x + self.pos_encoding[:T][None, :, :]
+        x = _sanitize(x)
 
-        # Dropout embedding
+        # Dropout rate dari training config (jika ada), fallback ke model config
+        dropout_rate = getattr(self.config.training, 'dropout_rate', None)
+        if dropout_rate is None:
+            dropout_rate = self.config.model.dropout_rate
+
         x, embed_dropout_mask = _dropout(
             x,
-            float(self.config.model.dropout_rate),
+            float(dropout_rate),
             training,
             self.rng,
         )
 
-        # Transformer blocks
         for layer in self.layers:
             x = layer.forward(x, training)
 
-        # Final norm
         final_hidden = self.final_norm.forward(x)
 
-        # LM head
         logits = final_hidden @ self.lm_head.data.T
+        logits = _sanitize(logits)
 
         self._forward_cache = (
             ids,
@@ -868,19 +874,7 @@ class CustomTransformerLM:
 
         return logits
 
-    # ========================================================================
-    # BACKWARD
-    # ========================================================================
-
     def backward(self, grad_logits: np.ndarray) -> None:
-        """
-        Backward pass dari gradient logits.
-
-        Input:
-        - grad_logits: [B, T, vocab_size]
-
-        Method ini mengisi .grad pada seluruh Parameter.
-        """
         if self._forward_cache is None:
             raise RuntimeError(
                 "CustomTransformerLM.backward dipanggil sebelum forward."
@@ -889,44 +883,34 @@ class CustomTransformerLM:
         ids, embed_dropout_mask, final_hidden = self._forward_cache
 
         grad_logits = np.asarray(grad_logits, dtype=np.float32)
+        grad_logits = _sanitize(grad_logits)
 
         B, T, V = grad_logits.shape
         D = final_hidden.shape[-1]
 
-        # ------------------------------------------------------------
-        # LM head backward
-        # ------------------------------------------------------------
         grad_logits_2d = grad_logits.reshape(-1, V)
         final_hidden_2d = final_hidden.reshape(-1, D)
 
         self.lm_head.grad += grad_logits_2d.T @ final_hidden_2d
+        self.lm_head.grad = _sanitize(self.lm_head.grad)
         d_hidden = grad_logits @ self.lm_head.data
+        d_hidden = _sanitize(d_hidden)
 
-        # ------------------------------------------------------------
-        # Final norm backward
-        # ------------------------------------------------------------
         d_hidden = self.final_norm.backward(d_hidden)
 
-        # ------------------------------------------------------------
-        # Transformer blocks backward
-        # ------------------------------------------------------------
         for layer in reversed(self.layers):
             d_hidden = layer.backward(d_hidden)
 
-        # ------------------------------------------------------------
-        # Embedding dropout backward
-        # ------------------------------------------------------------
         d_hidden = _dropout_backward(d_hidden, embed_dropout_mask)
+        d_hidden = _sanitize(d_hidden)
 
-        # ------------------------------------------------------------
-        # Embedding backward
-        # ------------------------------------------------------------
         d_embed = d_hidden
         np.add.at(
             self.embed_tokens.grad,
             ids.reshape(-1),
             d_embed.reshape(-1, D),
         )
+        self.embed_tokens.grad = _sanitize(self.embed_tokens.grad)
 
         self._forward_cache = None
 
@@ -936,9 +920,6 @@ class CustomTransformerLM:
 # ============================================================================
 
 if __name__ == "__main__":
-    # Uji arsitektur dengan konfigurasi kecil agar cepat dijalankan.
-    # Ini tidak mengubah config.py utama.
-
     from config import (
         Config,
         ModelConfig,
@@ -955,6 +936,7 @@ if __name__ == "__main__":
             batch_size=2,
             epochs=1,
             sequence_length=8,
+            dropout_rate=0.0,
             weight_decay=0.01,
             grad_clip_norm=1.0,
             seed=1337,
@@ -987,8 +969,6 @@ if __name__ == "__main__":
 
     logits = model.forward(batch_ids, training=True)
 
-    # Gradient dummy untuk menguji backward pass.
-    # Nantinya gradient asli berasal dari evaluator.py (Cross-Entropy Loss).
     grad_logits = np.ones_like(logits, dtype=np.float32)
 
     model.backward(grad_logits)
@@ -997,3 +977,9 @@ if __name__ == "__main__":
     print(f"Parameter count : {model.parameter_count():,}")
     print(f"Logits shape    : {logits.shape}")
     print(f"Sample logits   : {logits[0, 0, :8]}")
+    
+    # Test sanitasi dengan input ekstrem
+    print("\nTest sanitasi dengan input ekstrem...")
+    extreme_ids = np.array([[2, 5, 7]], dtype=np.int64)
+    extreme_logits = model.forward(extreme_ids, training=True)
+    print(f"Logits finite: {np.all(np.isfinite(extreme_logits))}")

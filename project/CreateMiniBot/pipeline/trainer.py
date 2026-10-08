@@ -10,6 +10,10 @@
 # 5. Menghitung loss & gradient memakai evaluator
 # 6. Menjalankan backward pass
 # 7. Memperbarui bobot memakai weight_manager
+# 8. Mendukung resume dari epoch terakhir
+# 9. Mendukung early stopping
+# 10. Mendukung periodic checkpoint & eval
+# 11. Mendukung inline training dari playground
 #
 # Keterhubungan:
 # - config.py              : hyperparameter training
@@ -63,6 +67,12 @@ class Trainer:
     - model sebagai arsitektur neural network
     - evaluator sebagai penghitung loss & gradient
     - weight_manager sebagai optimizer AdamW
+
+    Fitur:
+    - Resume dari epoch terakhir
+    - Early stopping
+    - Periodic checkpoint
+    - Inline training dari playground
     """
 
     LOG_EVERY_STEPS = 10
@@ -89,6 +99,21 @@ class Trainer:
         self.sequence_length = int(config.training.sequence_length)
         self.seed = int(config.training.seed)
 
+        # Early stopping
+        self.early_stopping_patience = int(config.training.early_stopping_patience)
+
+        # Periodic checkpoint
+        self.save_checkpoint_every_n_steps = int(config.training.save_checkpoint_every_n_steps)
+
+        # Inline training
+        self.inline_training_steps = int(config.training.inline_training_steps)
+
+        # State untuk resume training
+        # start_epoch: epoch untuk mulai training (0-indexed, biasanya dari checkpoint)
+        # start_global_step: global step untuk mulai training
+        self.start_epoch = 0
+        self.start_global_step = 0
+
         if self.batch_size <= 0:
             raise ValueError("batch_size harus lebih besar dari 0.")
 
@@ -96,7 +121,24 @@ class Trainer:
             raise ValueError("sequence_length harus lebih besar dari 0.")
 
     # ========================================================================
-    # PUBLIC API
+    # RESUME STATE
+    # ========================================================================
+
+    def set_resume_state(self, start_epoch: int = 0, global_step: int = 0) -> None:
+        """
+        Set state untuk resume training.
+
+        Dipanggil oleh main.py setelah checkpoint dimuat.
+
+        Parameter:
+        - start_epoch: epoch untuk mulai (0-indexed)
+        - global_step: global step terakhir
+        """
+        self.start_epoch = max(0, int(start_epoch))
+        self.start_global_step = max(0, int(global_step))
+
+    # ========================================================================
+    # PUBLIC API: FULL TRAINING
     # ========================================================================
 
     def run_epochs(
@@ -104,6 +146,8 @@ class Trainer:
         max_steps: Optional[int] = None,
         save_checkpoints: bool = False,
         verbose: bool = True,
+        start_epoch: Optional[int] = None,
+        global_step: Optional[int] = None,
     ) -> List[dict]:
         """
         Menjalankan seluruh epoch training.
@@ -112,6 +156,8 @@ class Trainer:
         - max_steps: batasi jumlah step global (berguna untuk testing)
         - save_checkpoints: simpan checkpoint setiap akhir epoch
         - verbose: cetak log training
+        - start_epoch: epoch untuk mulai (jika None, pakai self.start_epoch)
+        - global_step: global step awal (jika None, pakai self.start_global_step)
 
         Return:
         - history list report epoch
@@ -119,11 +165,21 @@ class Trainer:
         if not self.tokenizer.is_ready:
             self.tokenizer.load()
 
+        # Tentukan epoch awal dan global step awal
+        if start_epoch is None:
+            start_epoch = self.start_epoch
+
+        if global_step is None:
+            global_step = self.start_global_step
+
         history: List[dict] = []
-        global_step = 0
         stop_training = False
 
-        for epoch in range(self.epochs):
+        # Early stopping state
+        best_loss = float("inf")
+        patience_counter = 0
+
+        for epoch in range(start_epoch, self.epochs):
             epoch_loss = 0.0
             epoch_tokens = 0
             epoch_correct = 0
@@ -181,8 +237,18 @@ class Trainer:
                             f"loss={loss:.6f} "
                             f"ppl={metrics['perplexity']:.4f} "
                             f"acc={metrics['accuracy']:.4f} "
-                            f"grad_norm={step_info['grad_norm']:.6f}"
+                            f"lr={step_info['learning_rate']:.2e}"
                         )
+
+                    # Periodic checkpoint
+                    if (
+                        self.save_checkpoint_every_n_steps > 0
+                        and global_step > 0
+                        and global_step % self.save_checkpoint_every_n_steps == 0
+                    ):
+                        ckpt_path = self.weight_manager.save_checkpoint()
+                        if verbose:
+                            print(f"[Trainer] Periodic checkpoint disimpan: {ckpt_path}")
                 else:
                     # Tidak ada token valid, misalnya semua target adalah [PAD].
                     self.model.zero_grad()
@@ -235,17 +301,166 @@ class Trainer:
 
             history.append(epoch_report)
 
+            # Simpan last_epoch dan global_step di weight_manager
+            self.weight_manager.last_epoch = epoch + 1
+            self.weight_manager.global_step = global_step
+
             if save_checkpoints:
                 ckpt_path = self.weight_manager.save_checkpoint()
                 if verbose:
                     print(f"[Trainer] Checkpoint disimpan: {ckpt_path}")
 
+            # ----------------------------------------------------------------
+            # Early stopping check
+            # ----------------------------------------------------------------
+            if self.early_stopping_patience > 0 and steps_done > 0:
+                current_loss = epoch_report.get("loss", float("inf"))
+
+                if current_loss < best_loss:
+                    best_loss = current_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= self.early_stopping_patience:
+                    if verbose:
+                        print(
+                            f"[Trainer] Early stopping: loss tidak turun selama "
+                            f"{self.early_stopping_patience} epoch."
+                        )
+                    stop_training = True
+
             if stop_training:
                 if verbose:
-                    print("[Trainer] Training dihentikan karena mencapai max_steps.")
+                    if max_steps is not None and global_step >= int(max_steps):
+                        print("[Trainer] Training dihentikan karena mencapai max_steps.")
+                    else:
+                        print("[Trainer] Training dihentikan.")
                 break
 
         return history
+
+    # ========================================================================
+    # PUBLIC API: INLINE TRAINING (dari playground)
+    # ========================================================================
+
+    def train_steps(
+        self,
+        steps: int,
+        save_checkpoint: bool = True,
+        verbose: bool = True,
+    ) -> List[dict]:
+        """
+        Menjalankan training sebanyak N step tanpa terikat jumlah epoch.
+
+        Ini dipakai oleh playground saat user mengetik:
+            training
+        atau:
+            training 20
+
+        Parameter:
+        - steps: jumlah step training
+        - save_checkpoint: simpan checkpoint setelah selesai
+        - verbose: cetak log training
+
+        Return:
+        - list berisi satu report training
+        """
+        if not self.tokenizer.is_ready:
+            self.tokenizer.load()
+
+        steps = max(1, int(steps))
+
+        # Gunakan global step dari weight_manager untuk seed agar berbeda tiap kali
+        current_global_step = getattr(self.weight_manager, "global_step", 0)
+        rng = np.random.default_rng(self.seed + current_global_step + 1)
+
+        total_loss = 0.0
+        total_tokens = 0
+        total_correct = 0
+        steps_done = 0
+
+        if verbose:
+            print(f"[Trainer] Inline training dimulai: {steps} step")
+
+        batch_iterator = self.iter_batches(shuffle=True, rng=rng)
+
+        for inputs, targets in batch_iterator:
+            if steps_done >= steps:
+                break
+
+            self.model.zero_grad()
+
+            logits = self.model.forward(inputs, training=True)
+
+            loss, grad_logits, metrics = self.evaluator.compute_loss_and_grad(
+                logits,
+                targets,
+            )
+
+            num_valid_tokens = int(metrics["num_valid_tokens"])
+
+            if num_valid_tokens > 0:
+                self.model.backward(grad_logits)
+
+                step_info = self.weight_manager.step(zero_grad=True)
+
+                total_loss += float(loss) * num_valid_tokens
+                total_tokens += num_valid_tokens
+                total_correct += int(metrics["num_correct"])
+
+                if verbose:
+                    print(
+                        f"[Trainer] inline step={steps_done} "
+                        f"loss={loss:.6f} "
+                        f"ppl={metrics['perplexity']:.4f} "
+                        f"acc={metrics['accuracy']:.4f} "
+                        f"lr={step_info['learning_rate']:.2e}"
+                    )
+            else:
+                self.model.zero_grad()
+
+            steps_done += 1
+
+            # Update global step di weight_manager
+            self.weight_manager.global_step = getattr(
+                self.weight_manager, "global_step", 0
+            ) + 1
+
+        if steps_done == 0:
+            if verbose:
+                print("[Trainer] Tidak ada batch untuk inline training.")
+            return []
+
+        avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
+        accuracy = total_correct / total_tokens if total_tokens > 0 else 0.0
+        perplexity = float(np.exp(avg_loss)) if avg_loss < 100 else float("inf")
+
+        report = {
+            "epoch": getattr(self.weight_manager, "last_epoch", 0),
+            "loss": float(avg_loss),
+            "perplexity": float(perplexity),
+            "accuracy": float(accuracy),
+            "num_valid_tokens": int(total_tokens),
+            "num_correct": int(total_correct),
+            "steps": int(steps_done),
+        }
+
+        if verbose:
+            print(
+                f"[Trainer] Inline training selesai | "
+                f"steps={steps_done} | "
+                f"loss={avg_loss:.6f} | "
+                f"ppl={perplexity:.4f} | "
+                f"acc={accuracy:.4f}"
+            )
+
+        if save_checkpoint:
+            ckpt_path = self.weight_manager.save_checkpoint()
+            if verbose:
+                print(f"[Trainer] Checkpoint disimpan: {ckpt_path}")
+
+        return [report]
 
     # ========================================================================
     # BATCHING
@@ -519,3 +734,8 @@ if __name__ == "__main__":
 
         print("pipeline/trainer.py test OK")
         print(f"History: {history}")
+
+        # Test train_steps (inline training)
+        print("\nTesting train_steps...")
+        inline_history = trainer.train_steps(steps=2, verbose=True)
+        print(f"Inline history: {inline_history}")

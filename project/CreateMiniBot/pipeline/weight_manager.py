@@ -5,9 +5,10 @@
 # Tugas utama:
 # 1. Menginisialisasi optimizer AdamW.
 # 2. Menyimpan state optimizer (m, v, step).
-# 3. Melakukan gradient clipping.
+# 3. Melakukan gradient clipping dengan sanitasi NaN/Inf.
 # 4. Memperbarui bobot model setelah backward pass.
-# 5. Menyimpan dan memuat checkpoint training.
+# 5. Menyimpan dan memuat checkpoint training (termasuk epoch & global step).
+# 6. Mendukung learning rate scheduling (warmup & decay).
 #
 # Implementasi:
 # - Tidak memakai optimizer dari framework ML eksternal.
@@ -61,6 +62,11 @@ class WeightManager:
     WeightManager menerima model yang sudah memiliki gradient pada setiap
     parameter, lalu menerapkan AdamW + gradient clipping.
 
+    Fitur tambahan:
+    - Sanitasi gradient NaN/Inf
+    - Learning rate scheduling (warmup & decay)
+    - Penyimpanan epoch & global step di checkpoint
+
     Alur pemakaian normal:
 
         model.zero_grad()
@@ -79,16 +85,29 @@ class WeightManager:
         self.params = model.parameters()
 
         # Hyperparameter optimizer
-        self.learning_rate = float(config.training.learning_rate)
+        self.base_learning_rate = float(config.training.learning_rate)
+        self.learning_rate = self.base_learning_rate  # LR aktif (bisa berubah karena scheduling)
         self.beta1 = float(config.training.adam_beta1)
         self.beta2 = float(config.training.adam_beta2)
         self.epsilon = float(config.training.adam_epsilon)
         self.weight_decay = float(config.training.weight_decay)
         self.grad_clip_norm = float(config.training.grad_clip_norm)
 
+        # Learning rate scheduling
+        self.lr_warmup_steps = int(config.training.lr_warmup_steps)
+        self.lr_decay_steps = int(config.training.lr_decay_steps)
+        self.lr_decay_factor = float(config.training.lr_decay_factor)
+        self.lr_min = float(config.training.lr_min)
+
         # Step optimizer dimulai dari 0.
         # Akan bertambah menjadi 1 pada pemanggilan step() pertama.
         self.step_count = 0
+
+        # State untuk resume training
+        # last_epoch: epoch terakhir yang selesai (0-indexed)
+        # global_step: total step training yang sudah dijalankan
+        self.last_epoch = 0
+        self.global_step = 0
 
         # State AdamW
         self.m: Dict[str, np.ndarray] = {}
@@ -113,44 +132,106 @@ class WeightManager:
         """
         self.model.zero_grad()
 
+    def set_learning_rate(self, lr: float) -> None:
+        """
+        Set learning rate secara manual (override scheduling).
+        """
+        self.learning_rate = max(self.lr_min, float(lr))
+
+    def update_learning_rate(self) -> float:
+        """
+        Update learning rate berdasarkan scheduling.
+
+        1. Warmup: LR naik linear dari lr_min ke base_learning_rate
+        2. Decay: LR turun setiap lr_decay_steps
+        3. Clamp ke lr_min
+
+        Return:
+        - learning rate yang sedang aktif
+        """
+        if self.step_count < self.lr_warmup_steps and self.lr_warmup_steps > 0:
+            # Warmup: linear dari lr_min ke base_learning_rate
+            progress = self.step_count / self.lr_warmup_steps
+            self.learning_rate = self.lr_min + (self.base_learning_rate - self.lr_min) * progress
+        else:
+            # Setelah warmup, cek apakah perlu decay
+            self.learning_rate = self.base_learning_rate
+
+            if self.lr_decay_steps > 0:
+                # Hitung berapa kali decay sudah terjadi
+                steps_after_warmup = max(0, self.step_count - self.lr_warmup_steps)
+                num_decays = steps_after_warmup // self.lr_decay_steps
+
+                if num_decays > 0:
+                    self.learning_rate = self.base_learning_rate * (self.lr_decay_factor ** num_decays)
+
+        # Clamp ke minimum
+        self.learning_rate = max(self.lr_min, self.learning_rate)
+
+        return self.learning_rate
+
     def step(self, zero_grad: bool = True) -> Dict[str, float]:
         """
         Melakukan satu langkah pembaruan bobot.
 
         Tahapan:
-        1. Gradient clipping.
-        2. Update momentum AdamW.
-        3. Terapkan weight decay.
-        4. Update parameter.
-        5. Opsional zero gradient.
+        1. Sanitasi gradient NaN/Inf.
+        2. Gradient clipping.
+        3. Update learning rate (scheduling).
+        4. Update momentum AdamW.
+        5. Terapkan weight decay.
+        6. Update parameter.
+        7. Sanitasi bobot dari NaN/Inf.
+        8. Increment counters.
+        9. Opsional zero gradient.
         """
+        # Sanitasi gradient sebelum clipping
+        self._sanitize_gradients()
+
+        # Gradient clipping
         grad_norm = self.clip_gradients()
 
-        # Jika gradient tidak valid, jangan update bobot.
-        if not np.isfinite(grad_norm):
+        # Jika gradient tidak valid setelah sanitasi, jangan update bobot
+        if not np.isfinite(grad_norm) or grad_norm == 0.0:
             if zero_grad:
                 self.zero_grad()
 
+            # Tetap increment global_step agar scheduling berjalan
+            self.global_step += 1
+            self.step_count += 1
+
             return {
                 "step": float(self.step_count),
-                "grad_norm": float(grad_norm),
+                "global_step": float(self.global_step),
+                "grad_norm": float(grad_norm) if np.isfinite(grad_norm) else 0.0,
                 "update_applied": 0.0,
                 "learning_rate": float(self.learning_rate),
             }
 
+        # Update learning rate berdasarkan scheduling
+        current_lr = self.update_learning_rate()
+
         self.step_count += 1
+        self.global_step += 1
 
         beta1 = self.beta1
         beta2 = self.beta2
         epsilon = self.epsilon
         weight_decay = self.weight_decay
-        lr = self.learning_rate
 
         bias_correction1 = 1.0 - (beta1 ** self.step_count)
         bias_correction2 = 1.0 - (beta2 ** self.step_count)
 
         for name, param in self.params.items():
-            grad = param.grad
+            # Pastikan gradient bersih
+            grad = np.nan_to_num(
+                param.grad,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).astype(np.float32, copy=False)
+
+            param.grad = grad
 
             m = self.m[name]
             v = self.v[name]
@@ -175,17 +256,38 @@ class WeightManager:
                 update = update + weight_decay * param.data
 
             # Update bobot
-            param.data -= lr * update
+            param.data -= current_lr * update
+
+            # Sanitasi bobot agar tidak ada NaN/Inf yang menetap
+            param.data = np.nan_to_num(
+                param.data,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).astype(np.float32, copy=False)
 
         if zero_grad:
             self.zero_grad()
 
         return {
             "step": float(self.step_count),
+            "global_step": float(self.global_step),
             "grad_norm": float(grad_norm),
             "update_applied": 1.0,
-            "learning_rate": float(lr),
+            "learning_rate": float(current_lr),
         }
+
+    def _sanitize_gradients(self) -> None:
+        """
+        Membersihkan gradient dari NaN/Inf sebelum clipping.
+        """
+        for param in self.params.values():
+            param.grad = np.nan_to_num(
+                param.grad,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).astype(np.float32, copy=False)
 
     def clip_gradients(self) -> float:
         """
@@ -201,6 +303,12 @@ class WeightManager:
         for param in self.params.values():
             total_sq += float(np.sum(param.grad * param.grad))
 
+        if not np.isfinite(total_sq):
+            # Gradient tidak valid, reset semua
+            for param in self.params.values():
+                param.grad.fill(0.0)
+            return 0.0
+
         total_norm = float(np.sqrt(total_sq))
 
         if max_norm > 0.0 and total_norm > max_norm:
@@ -208,6 +316,14 @@ class WeightManager:
 
             for param in self.params.values():
                 param.grad *= scale
+
+                # Sanitasi lagi setelah scaling (inf * 0 bisa jadi NaN)
+                param.grad = np.nan_to_num(
+                    param.grad,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).astype(np.float32, copy=False)
 
         return total_norm
 
@@ -221,7 +337,10 @@ class WeightManager:
         """
         return {
             "step": self.step_count,
+            "global_step": self.global_step,
+            "last_epoch": self.last_epoch,
             "learning_rate": self.learning_rate,
+            "base_learning_rate": self.base_learning_rate,
             "m": {
                 name: state.copy()
                 for name, state in self.m.items()
@@ -240,9 +359,14 @@ class WeightManager:
             raise ValueError("state_dict WeightManager tidak memiliki 'step'.")
 
         self.step_count = int(state["step"])
+        self.global_step = int(state.get("global_step", self.step_count))
+        self.last_epoch = int(state.get("last_epoch", 0))
 
         if "learning_rate" in state:
             self.learning_rate = float(state["learning_rate"])
+
+        if "base_learning_rate" in state:
+            self.base_learning_rate = float(state["base_learning_rate"])
 
         if "m" in state:
             for name, param in self.params.items():
@@ -297,7 +421,10 @@ class WeightManager:
 
         payload = {
             "step": np.array(self.step_count, dtype=np.int64),
+            "global_step": np.array(self.global_step, dtype=np.int64),
+            "last_epoch": np.array(self.last_epoch, dtype=np.int64),
             "learning_rate": np.array(self.learning_rate, dtype=np.float32),
+            "base_learning_rate": np.array(self.base_learning_rate, dtype=np.float32),
         }
 
         for name, param in self.params.items():
@@ -314,6 +441,11 @@ class WeightManager:
     def load_checkpoint(self, path: Optional[Path] = None) -> Path:
         """
         Memuat checkpoint model + optimizer dari file .npz.
+
+        Setelah load, attribute berikut tersedia:
+        - self.last_epoch: epoch terakhir yang selesai
+        - self.global_step: total step training
+        - self.step_count: optimizer step
         """
         if path is None:
             path = self.checkpoint_path
@@ -332,9 +464,17 @@ class WeightManager:
             raise ValueError("File checkpoint tidak valid: tidak memiliki 'step'.")
 
         self.step_count = int(data["step"])
+        self.global_step = int(data.get("global_step", self.step_count))
+        self.last_epoch = int(data.get("last_epoch", 0))
 
         if "learning_rate" in data:
             self.learning_rate = float(data["learning_rate"])
+
+        if "base_learning_rate" in data:
+            self.base_learning_rate = float(data["base_learning_rate"])
+        else:
+            # Fallback untuk checkpoint lama
+            self.base_learning_rate = self.learning_rate
 
         for name, param in self.params.items():
             safe_name = name.replace(".", "__")

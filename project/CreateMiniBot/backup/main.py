@@ -71,6 +71,7 @@ def print_config_summary(config: Config) -> None:
     print(f"  num_layers              : {config.model.num_layers}")
     print(f"  ffn_hidden_dim          : {config.model.ffn_hidden_dim}")
     print(f"  max_position_embeddings : {config.model.max_position_embeddings}")
+    print(f"  dropout_rate (model)    : {config.model.dropout_rate}")
     print(f"  train_dtype             : {config.model.train_dtype}")
     print(f"  export_dtype            : {config.model.export_dtype}")
 
