@@ -2,36 +2,27 @@
 #
 # Playground / Inference Testing Engine.
 #
-# Tugas utama:
-# 1. Menerima prompt teks.
-# 2. Encode prompt menjadi token ID.
-# 3. Jalankan inference ke model.
-# 4. Sampling token berikutnya dengan temperature, top-k, top-p.
-# 5. Mendukung repetition penalty.
-# 6. Mendukung min_new_tokens agar model tidak langsung berhenti dengan EOS.
-# 7. Decode token ID menjadi teks jawaban.
-# 8. Menyediakan CLI interaktif.
+# Perintah interactive (slash commands):
+#   /help                  : tampilkan bantuan
+#   /training              : latih model (step default dari config)
+#   /training 100          : latih model 100 step
+#   /training --steps 100  : latih model 100 step
+#   /training --epochs 10  : latih model 10 epoch
+#   /training --epochs 10 --steps 50 : latih 10 epoch, minimal 50 step
+#   /status                : tampilkan status model
+#   /exit                  : keluar
 #
-# Keterhubungan:
-# - config.py            : konfigurasi global
-# - core/tokenizer.py    : encode/decode teks
-# - core/architecture.py : model inference
+# Semua input tanpa prefix / dianggap sebagai prompt inference.
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # ============================================================================
 # FIX IMPORT PATH
 # ============================================================================
-# Memastikan project root ada di sys.path, sehingga file di dalam folder
-# testing/ tetap bisa meng-import config.py meskipun dijalankan langsung:
-#   python testing/playground.py
-# atau:
-#   cd testing && python playground.py
-
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if str(_PROJECT_ROOT) not in sys.path:
@@ -56,14 +47,15 @@ class Playground:
     """
     Tempat testing pertanyaan / inference.
 
-    Contoh pemakaian:
-
-        playground = Playground(model, tokenizer, CONFIG)
-        playground.test_prompt("Apa itu mobil?")
-
-    Atau mode interaktif:
-
-        playground.interactive()
+    Perintah interactive (slash commands):
+        /help                  : tampilkan bantuan
+        /training              : latih model (step default)
+        /training 100          : latih model 100 step
+        /training --steps 100  : latih model 100 step
+        /training --epochs 10  : latih model 10 epoch
+        /training --epochs 10 --steps 50 : latih 10 epoch, minimal 50 step
+        /status                : tampilkan status model
+        /exit                  : keluar
     """
 
     DEFAULT_MAX_NEW_TOKENS = 48
@@ -71,15 +63,13 @@ class Playground:
     DEFAULT_TOP_K = 30
     DEFAULT_TOP_P = 0.92
 
-    # Repetition penalty: > 1.0 mengurangi pengulangan token.
     DEFAULT_REPETITION_PENALTY = 1.25
     DEFAULT_REPETITION_WINDOW = 64
 
-    # Memaksa model menghasilkan minimal beberapa token sebelum boleh EOS.
-    # Ini membantu mencegah jawaban kosong seperti:
-    #   prompt> mobil
-    #   Jawaban : (kosong)
     DEFAULT_MIN_NEW_TOKENS = 8
+
+    # Default step untuk /training tanpa argumen
+    DEFAULT_INLINE_TRAINING_STEPS = 10
 
     def __init__(self, model, tokenizer, config: Config = CONFIG, trainer=None):
         self.model = model
@@ -149,10 +139,6 @@ class Playground:
     ) -> tuple[str, List[int]]:
         """
         Membuat jawaban/lanjutan teks dari prompt.
-
-        Return:
-        - answer_text   : teks hasil generation
-        - generated_ids : daftar token ID yang dihasilkan (tanpa prompt awal)
         """
         self._ensure_tokenizer_ready()
 
@@ -172,28 +158,19 @@ class Playground:
         min_new_tokens = max(0, int(min_new_tokens))
 
         for step in range(max_new_tokens):
-            # Jaga konteks agar tidak melebihi max_position_embeddings
             context = current_ids[-self.max_context :]
-
             input_ids = np.array([context], dtype=np.int64)
 
             logits = self.model.forward(input_ids, training=False)
-
-            # Ambil logits dari token terakhir
             next_logits = np.asarray(logits[0, -1, :], dtype=np.float32)
 
-            # Jika belum mencapai min_new_tokens, EOS dilarang terlebih dahulu.
             step_forbidden = forbidden_ids
 
             if step < min_new_tokens:
                 step_forbidden = list(forbidden_ids)
-
                 if self.eos_id not in step_forbidden:
                     step_forbidden.append(self.eos_id)
 
-            # Repetition penalty hanya diterapkan pada token yang sudah
-            # dihasilkan, bukan prompt awal, agar model tetap boleh memakai
-            # kata penting dari prompt bila diperlukan.
             generated_so_far = current_ids[len(prompt_ids) :]
 
             if repetition_window is not None and int(repetition_window) > 0:
@@ -237,11 +214,22 @@ class Playground:
     ) -> None:
         """
         Mode CLI interaktif.
+
+        Perintah (slash commands):
+            /help                  : tampilkan bantuan
+            /training              : latih model (step default)
+            /training 100          : latih model 100 step
+            /training --steps 100  : latih model 100 step
+            /training --epochs 10  : latih model 10 epoch
+            /training --epochs 10 --steps 50 : 10 epoch, minimal 50 step
+            /status                : tampilkan status model
+            /exit                  : keluar
         """
         print("=" * 60)
         print("Testing Playground - Inference Engine")
-        print("Ketik prompt lalu tekan Enter.")
-        print("Ketik 'exit', 'quit', atau 'keluar' untuk berhenti.")
+        print("=" * 60)
+        print("Ketik prompt untuk inference.")
+        print("Ketik /help untuk daftar perintah.")
         print("=" * 60)
         print(f"temperature        : {temperature}")
         print(f"top_k              : {top_k}")
@@ -253,21 +241,41 @@ class Playground:
 
         while True:
             try:
-                prompt = input("prompt> ")
+                user_input = input("prompt> ")
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
 
-            prompt_stripped = prompt.strip()
+            stripped = user_input.strip()
 
-            if not prompt_stripped:
+            if not stripped:
                 continue
 
-            if prompt_stripped.lower() in {"exit", "quit", "keluar"}:
-                break
+            # ================================================================
+            # SLASH COMMANDS
+            # ================================================================
+            if stripped.startswith("/"):
+                should_exit = self._handle_command(
+                    command=stripped,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                    repetition_window=repetition_window,
+                    min_new_tokens=min_new_tokens,
+                )
 
+                if should_exit:
+                    break
+
+                continue
+
+            # ================================================================
+            # PROMPT INFERENCE
+            # ================================================================
             answer, generated_ids = self.generate(
-                prompt=prompt_stripped,
+                prompt=stripped,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_k=top_k,
@@ -282,6 +290,277 @@ class Playground:
             print("-" * 60)
 
     # ========================================================================
+    # COMMAND HANDLER
+    # ========================================================================
+
+    def _handle_command(
+        self,
+        command: str,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        temperature: float = DEFAULT_TEMPERATURE,
+        top_k: int = DEFAULT_TOP_K,
+        top_p: float = DEFAULT_TOP_P,
+        repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+        repetition_window: int = DEFAULT_REPETITION_WINDOW,
+        min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
+    ) -> bool:
+        """
+        Memproses slash command.
+
+        Return:
+        - True jika harus exit, False jika lanjut
+        """
+        parts = command.strip().split()
+        cmd = parts[0].lower()
+
+        # ----------------------------------------------------------------
+        # /exit, /quit, /keluar
+        # ----------------------------------------------------------------
+        if cmd in {"/exit", "/quit", "/keluar"}:
+            print("[playground] Keluar dari playground.")
+            return True
+
+        # ----------------------------------------------------------------
+        # /help
+        # ----------------------------------------------------------------
+        if cmd in {"/help", "/bantuan", "/h", "/?"}:
+            self._print_help()
+            return False
+
+        # ----------------------------------------------------------------
+        # /training, /train, /latih
+        # ----------------------------------------------------------------
+        if cmd in {"/training", "/train", "/latih"}:
+            self._handle_training_command(parts)
+            return False
+
+        # ----------------------------------------------------------------
+        # /status
+        # ----------------------------------------------------------------
+        if cmd in {"/status", "/info"}:
+            self._print_status()
+            return False
+
+        # ----------------------------------------------------------------
+        # Perintah tidak dikenal
+        # ----------------------------------------------------------------
+        print(f"[playground] Perintah tidak dikenal: {cmd}")
+        print("[playground] Ketik /help untuk daftar perintah.")
+        return False
+
+    # ========================================================================
+    # TRAINING COMMAND HANDLER
+    # ========================================================================
+
+    def _handle_training_command(self, parts: List[str]) -> None:
+        """
+        Memproses perintah /training dengan berbagai format argumen.
+
+        Format yang didukung:
+            /training                          → step default dari config
+            /training 100                      → 100 step
+            /training --steps 100              → 100 step
+            /training --s 100                  → 100 step
+            /training --epochs 10              → 10 epoch
+            /training --e 10                   → 10 epoch
+            /training --epochs 10 --steps 50   → 10 epoch, minimal 50 step
+            /training --e 10 --s 50            → 10 epoch, minimal 50 step
+        """
+        if self.trainer is None:
+            print("[playground] Trainer tidak tersedia.")
+            print("[playground] Pastikan playground dipanggil dengan parameter trainer.")
+            return
+
+        parsed = self._parse_training_args(parts)
+
+        steps = parsed.get("steps")
+        epochs = parsed.get("epochs")
+
+        print("-" * 60)
+
+        if epochs is not None:
+            # MODE EPOCH
+            min_steps = steps if steps is not None else 0
+
+            print(
+                f"[playground] Training mode EPOCH: {epochs} epoch"
+                + (f", minimal {min_steps} step" if min_steps > 0 else "")
+            )
+            print("-" * 60)
+
+            try:
+                if hasattr(self.trainer, "train_epochs_inline"):
+                    history = self.trainer.train_epochs_inline(
+                        epochs=epochs,
+                        min_steps=min_steps,
+                        save_checkpoint=True,
+                        verbose=True,
+                    )
+                else:
+                    # Fallback: gunakan run_epochs
+                    history = self.trainer.run_epochs(
+                        max_steps=None,
+                        save_checkpoints=True,
+                        verbose=True,
+                    )
+
+                if history:
+                    last = history[-1]
+                    print("-" * 60)
+                    print("[playground] Training epoch selesai.")
+                    print(f"[playground] Epoch terakhir : {last.get('epoch', 0)}")
+                    print(f"[playground] Loss           : {last.get('loss', 0.0):.6f}")
+                    print(f"[playground] Perplexity     : {last.get('perplexity', 0.0):.4f}")
+                    print(f"[playground] Accuracy       : {last.get('accuracy', 0.0):.4f}")
+                    print("-" * 60)
+                else:
+                    print("[playground] Training tidak menghasilkan history.")
+                    print("[playground] Pastikan folder datasets/ berisi data.")
+
+            except Exception as exc:
+                print(f"[playground] Training gagal: {exc}")
+
+        else:
+            # MODE STEP
+            if steps is None:
+                steps = self.DEFAULT_INLINE_TRAINING_STEPS
+
+            print(f"[playground] Training mode STEP: {steps} step")
+            print("-" * 60)
+
+            try:
+                if hasattr(self.trainer, "train_steps"):
+                    history = self.trainer.train_steps(
+                        steps=steps,
+                        save_checkpoint=True,
+                        verbose=True,
+                    )
+                else:
+                    history = self.trainer.run_epochs(
+                        max_steps=steps,
+                        save_checkpoints=True,
+                        verbose=True,
+                    )
+
+                if history:
+                    report = history[-1]
+                    print("-" * 60)
+                    print("[playground] Training step selesai.")
+                    print(f"[playground] Steps          : {report.get('steps', 0)}")
+                    print(f"[playground] Loss           : {report.get('loss', 0.0):.6f}")
+                    print(f"[playground] Perplexity     : {report.get('perplexity', 0.0):.4f}")
+                    print(f"[playground] Accuracy       : {report.get('accuracy', 0.0):.4f}")
+                    epochs_trav = report.get("epochs_traversed", 0)
+                    if epochs_trav:
+                        print(f"[playground] Epochs traversed : {epochs_trav}")
+                    print("-" * 60)
+                else:
+                    print("[playground] Training tidak menghasilkan update.")
+                    print("[playground] Pastikan folder datasets/ berisi data.")
+
+            except Exception as exc:
+                print(f"[playground] Training gagal: {exc}")
+
+    def _parse_training_args(self, parts: List[str]) -> Dict[str, Optional[int]]:
+        """
+        Parse argumen perintah /training.
+
+        Return:
+            {"steps": int|None, "epochs": int|None}
+        """
+        result: Dict[str, Optional[int]] = {"steps": None, "epochs": None}
+
+        i = 1  # skip /training
+        while i < len(parts):
+            arg = parts[i].lower()
+
+            # --steps, --s, -s
+            if arg in {"--steps", "--s", "-s"}:
+                if i + 1 < len(parts) and parts[i + 1].isdigit():
+                    result["steps"] = int(parts[i + 1])
+                    i += 2
+                else:
+                    i += 1
+
+            # --epochs, --e, -e
+            elif arg in {"--epochs", "--e", "-e"}:
+                if i + 1 < len(parts) and parts[i + 1].isdigit():
+                    result["epochs"] = int(parts[i + 1])
+                    i += 2
+                else:
+                    i += 1
+
+            # Angka langsung = step (backward compatible)
+            elif arg.isdigit():
+                result["steps"] = int(arg)
+                i += 1
+
+            else:
+                i += 1
+
+        return result
+
+    # ========================================================================
+    # STATUS
+    # ========================================================================
+
+    def _print_status(self) -> None:
+        """
+        Tampilkan status model.
+        """
+        print("=" * 60)
+        print("Status Model")
+        print("=" * 60)
+
+        print(f"  Parameter count : {self.model.parameter_count():,}")
+        print(f"  Vocab size      : {self.tokenizer.vocab_size}")
+        print(f"  Max context     : {self.max_context}")
+        print(f"  Trainer         : {'Tersedia' if self.trainer is not None else 'Tidak tersedia'}")
+
+        if self.trainer is not None and hasattr(self.trainer, "weight_manager"):
+            wm = self.trainer.weight_manager
+            print(f"  Optimizer step  : {wm.step_count}")
+            print(f"  Global step     : {getattr(wm, 'global_step', 0)}")
+            print(f"  Last epoch      : {getattr(wm, 'last_epoch', 0)}")
+            print(f"  Learning rate   : {wm.learning_rate:.2e}")
+
+        print("=" * 60)
+
+    # ========================================================================
+    # HELP
+    # ========================================================================
+
+    def _print_help(self) -> None:
+        """
+        Tampilkan bantuan perintah interactive.
+        """
+        print("=" * 60)
+        print("Bantuan Playground")
+        print("=" * 60)
+        print()
+        print("Ketik prompt apa saja untuk inference.")
+        print("Contoh: apa itu mobil")
+        print()
+        print("Perintah (slash commands):")
+        print()
+        print("  /help                  : tampilkan bantuan ini")
+        print()
+        print("  /training              : latih model (step default)")
+        print("  /training 100          : latih model 100 step")
+        print("  /training --steps 100  : latih model 100 step")
+        print("  /training --epochs 10  : latih model 10 epoch")
+        print("  /training --epochs 10 --steps 50")
+        print("                         : latih 10 epoch, minimal 50 step")
+        print()
+        print("  /status                : tampilkan status model")
+        print("  /exit                  : keluar dari playground")
+        print("  /quit                  : keluar dari playground")
+        print("  /keluar                : keluar dari playground")
+        print()
+        print("Semua input tanpa prefix / dianggap sebagai prompt inference.")
+        print("=" * 60)
+
+    # ========================================================================
     # INTERNAL HELPERS
     # ========================================================================
 
@@ -291,14 +570,7 @@ class Playground:
 
     def _get_forbidden_ids(self) -> List[int]:
         """
-        Token yang tidak boleh dihasilkan saat sampling:
-        - [PAD]
-        - [UNK]
-        - [BOS]
-        - token [UNUSED_*]
-
-        [EOS] tetap diperbolehkan sebagai tanda berhenti, kecuali saat
-        min_new_tokens belum tercapai.
+        Token yang tidak boleh dihasilkan saat sampling.
         """
         if self._forbidden_cache is not None:
             return self._forbidden_cache
@@ -329,15 +601,6 @@ class Playground:
     ) -> int:
         """
         Sampling token berikutnya.
-
-        Urutan:
-        1. Bersihkan logits.
-        2. Terapkan repetition penalty.
-        3. Blokir token terlarang.
-        4. Terapkan temperature.
-        5. Terapkan top-k.
-        6. Terapkan top-p.
-        7. Sample dari distribusi probabilitas.
         """
         logits = np.asarray(logits, dtype=np.float32).copy()
 
@@ -357,9 +620,7 @@ class Playground:
 
         work_logits = raw_logits.copy()
 
-        # --------------------------------------------------------------------
         # Repetition penalty
-        # --------------------------------------------------------------------
         if repetition_penalty is not None:
             penalty = float(repetition_penalty)
 
@@ -374,17 +635,13 @@ class Playground:
                 if prev_arr.size > 0:
                     selected_logits = work_logits[prev_arr]
 
-                    # Jika logit positif, kecilkan dengan pembagian.
-                    # Jika logit negatif, buat semakin negatif dengan perkalian.
                     work_logits[prev_arr] = np.where(
                         selected_logits > 0,
                         selected_logits / penalty,
                         selected_logits * penalty,
                     )
 
-        # --------------------------------------------------------------------
         # Forbidden tokens
-        # --------------------------------------------------------------------
         valid_mask = np.ones(raw_logits.size, dtype=bool)
         valid_forbidden: List[int] = []
 
@@ -397,8 +654,6 @@ class Playground:
             if valid_forbidden:
                 valid_mask[valid_forbidden] = False
 
-        # Jika semua token terblokir, coba buka kembali token yang tidak
-        # termasuk forbidden. Jika tetap tidak ada, pakai fallback raw_argmax.
         if not np.any(valid_mask):
             fallback_mask = np.ones(raw_logits.size, dtype=bool)
 
@@ -410,21 +665,15 @@ class Playground:
             else:
                 valid_mask[raw_argmax] = True
 
-        # --------------------------------------------------------------------
-        # Greedy jika temperature sangat kecil / nol
-        # --------------------------------------------------------------------
+        # Greedy jika temperature sangat kecil
         if temperature is None or float(temperature) <= 1e-8:
             greedy_logits = np.where(valid_mask, work_logits, -np.inf)
             return int(np.argmax(greedy_logits))
 
-        # --------------------------------------------------------------------
         # Temperature scaling
-        # --------------------------------------------------------------------
         work_logits = work_logits / float(temperature)
 
-        # --------------------------------------------------------------------
         # Top-K
-        # --------------------------------------------------------------------
         if top_k is not None and int(top_k) > 0:
             top_k_value = int(top_k)
 
@@ -439,9 +688,7 @@ class Playground:
                 threshold = np.partition(masked_logits, -top_k_value)[-top_k_value]
                 valid_mask = valid_mask & (work_logits >= threshold)
 
-        # --------------------------------------------------------------------
         # Top-P / Nucleus Sampling
-        # --------------------------------------------------------------------
         if top_p is not None and 0.0 < float(top_p) < 1.0:
             masked_logits = np.where(valid_mask, work_logits, -np.inf)
             probs = self._softmax(masked_logits)
@@ -461,14 +708,10 @@ class Playground:
 
                 valid_mask = valid_mask & nucleus_mask
 
-                # Jika tidak ada token valid setelah top-p, paksa ambil
-                # token teratas dari nucleus.
                 if not np.any(valid_mask) and len(allowed_idx) > 0:
                     valid_mask[allowed_idx[0]] = True
 
-        # --------------------------------------------------------------------
         # Sampling akhir
-        # --------------------------------------------------------------------
         final_logits = np.where(valid_mask, work_logits, -np.inf)
         probs = self._softmax(final_logits)
 
@@ -556,39 +799,8 @@ if __name__ == "__main__":
         default=4,
         help="Jumlah token minimum sebelum EOS diperbolehkan.",
     )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.75,
-        help="Temperature sampling.",
-    )
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=30,
-        help="Top-K sampling.",
-    )
-    parser.add_argument(
-        "--top-p",
-        type=float,
-        default=0.92,
-        help="Top-P sampling.",
-    )
-    parser.add_argument(
-        "--repetition-penalty",
-        type=float,
-        default=1.25,
-        help="Repetition penalty. Nilai > 1 mengurangi pengulangan.",
-    )
 
     args = parser.parse_args()
-
-    # ========================================================================
-    # Demo kecil untuk menguji playground.
-    #
-    # Ini memakai folder sementara dan model kecil, sehingga tidak mengganggu
-    # dataset utama atau konfigurasi utama.
-    # ========================================================================
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -604,15 +816,9 @@ if __name__ == "__main__":
             "\n".join(
                 [
                     "mobil adalah kendaraan",
-                    "mobil adalah kendaraan yang memiliki mesin",
                     "mobil memiliki mesin",
-                    "mobil memiliki roda",
                     "mobil memakai bahan bakar",
                     "mesin mobil menghasilkan tenaga",
-                    "roda mobil berputar",
-                    "rem mobil menghentikan laju",
-                    "lampu mobil menerangi jalan",
-                    "bahan bakar memberi energi",
                 ]
             ),
             encoding="utf-8",
@@ -634,6 +840,7 @@ if __name__ == "__main__":
                 batch_size=2,
                 epochs=1,
                 sequence_length=12,
+                dropout_rate=0.0,
                 weight_decay=0.01,
                 grad_clip_norm=1.0,
                 seed=1337,
@@ -661,27 +868,17 @@ if __name__ == "__main__":
             model=model,
             tokenizer=tokenizer,
             config=small_config,
+            trainer=None,
         )
 
         if args.interactive:
             playground.interactive(
                 max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                repetition_penalty=args.repetition_penalty,
-                min_new_tokens=args.min_new_tokens,
             )
         else:
             playground.test_prompt(
                 prompt=args.prompt,
                 max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                repetition_penalty=args.repetition_penalty,
-                min_new_tokens=args.min_new_tokens,
-                verbose=True,
             )
 
         print("testing/playground.py test OK")

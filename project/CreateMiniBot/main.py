@@ -3,17 +3,21 @@
 #
 # Entry point utama dan orkestrator pipeline.
 #
-# Alur utama:
-# 1. Tokenizer.train()
-# 2. Trainer.run_epochs()
-# 3. Evaluator.audit()
-# 4. Playground.test_prompt() atau interactive
-# 5. ModelExporter.save()
+# Mode operasi:
+# 1. MODE PIPELINE (default):
+#    Tokenizer -> Training -> Eval -> Test -> Export
 #
-# Catatan:
-# - Weight update sudah terjadi di dalam Trainer melalui Evaluator + WeightManager.
-# - main.py tetap menyediakan audit terpisah setelah training.
-# - Resume sekarang benar-benar melanjutkan dari epoch/global step terakhir.
+# 2. MODE INTERACTIVE (--interactive):
+#    Tokenizer -> Load Model -> Playground
+#    Training dilakukan via perintah 'training' di playground.
+#
+# Flag penting:
+# --resume        : muat checkpoint dan lanjutkan dari epoch terakhir
+# --interactive   : langsung masuk playground, training via perintah di dalam
+# --skip-training : lewati training (mode pipeline)
+# --skip-eval     : lewati evaluasi
+# --skip-test     : lewati test prompt
+# --skip-export   : lewati export model
 
 from __future__ import annotations
 
@@ -99,9 +103,6 @@ def print_config_summary(config: Config) -> None:
 def limited_batches(trainer: Trainer, limit: int | None):
     """
     Generator untuk membatasi jumlah batch evaluasi.
-
-    Jika limit None, seluruh batch dipakai.
-    Jika limit 0, juga dianggap seluruh batch.
     """
     if limit is not None and limit <= 0:
         limit = None
@@ -208,15 +209,21 @@ def export_model(
 
 def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     """
-    Menjalankan pipeline penuh:
-    Tokenizer -> Trainer -> Evaluator -> Playground -> Exporter
+    Menjalankan pipeline.
+
+    MODE INTERACTIVE (--interactive):
+        Tokenizer -> Load Model -> Playground
+        Training dilakukan via perintah 'training' di playground.
+
+    MODE PIPELINE (default):
+        Tokenizer -> Training -> Eval -> Test -> Export
     """
     config.ensure_dirs()
     print_config_summary(config)
 
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------
     # 1. TOKENIZER
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------
     print_section("TAHAP 1: TOKENIZER")
 
     tokenizer = Tokenizer(config)
@@ -230,9 +237,9 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
         print(f"[main] Vocab disimpan di: {config.paths.vocab_path}")
         print(f"[main] Vocab size: {tokenizer.vocab_size}")
 
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------
     # 2. MODEL
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------
     print_section("TAHAP 2: ARSITEKTUR MODEL")
 
     model = CustomTransformerLM(config)
@@ -240,9 +247,9 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     print(f"[main] Model dibuat.")
     print(f"[main] Parameter count: {model.parameter_count():,}")
 
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------
     # 3. EVALUATOR & WEIGHT MANAGER
-    # ------------------------------------------------------------------------
+    # --------------------------------------------------------------------
     print_section("TAHAP 3: EVALUATOR & WEIGHT MANAGER")
 
     evaluator = Evaluator(config)
@@ -251,11 +258,8 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     print("[main] Evaluator siap.")
     print("[main] WeightManager siap.")
 
-    # ------------------------------------------------------------------------
-    # 4. TRAINER
-    # ------------------------------------------------------------------------
-    print_section("TAHAP 4: TRAINER")
-
+    # Trainer dibuat tanpa print section terpisah.
+    # Trainer dibutuhkan oleh playground untuk inline training.
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
@@ -264,10 +268,9 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
         config=config,
     )
 
-    # ------------------------------------------------------------------------
-    # 5. RESUME CHECKPOINT
-    # ------------------------------------------------------------------------
-    # Variabel untuk resume training dari epoch tertentu
+    # --------------------------------------------------------------------
+    # 4. RESUME CHECKPOINT
+    # --------------------------------------------------------------------
     start_epoch = 0
     global_step = 0
     resumed = False
@@ -278,7 +281,6 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
             print(f"[main] Checkpoint dimuat dari: {ckpt_path}")
             print(f"[main] Optimizer step: {weight_manager.step_count}")
 
-            # Coba baca metadata epoch dan global step dari weight_manager
             last_epoch = getattr(weight_manager, "last_epoch", 0)
             global_step = getattr(weight_manager, "global_step", weight_manager.step_count)
 
@@ -287,86 +289,42 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
 
             print(f"[main] Last epoch: {last_epoch}")
             print(f"[main] Global step: {global_step}")
-            print(f"[main] Training akan dilanjutkan dari epoch {last_epoch + 1}")
         except FileNotFoundError:
-            print("[main] Checkpoint tidak ditemukan. Training dari awal.")
+            print("[main] Checkpoint tidak ditemukan. Mulai dari awal.")
             resumed = False
         except Exception as exc:
             print(f"[main] Gagal memuat checkpoint: {exc}")
-            print("[main] Training dari awal.")
+            print("[main] Mulai dari awal.")
             resumed = False
 
-    # Informasikan trainer tentang state resume
-    # Trainer nanti akan menggunakan start_epoch dan global_step ini
     if resumed:
         trainer.set_resume_state(start_epoch=start_epoch, global_step=global_step)
 
-    # ------------------------------------------------------------------------
-    # 6. TRAINING
-    # ------------------------------------------------------------------------
-    print_section("TAHAP 5: TRAINING")
-
+    # Variabel report untuk export
     report: dict | None = None
 
-    if not args.skip_training:
-        history = trainer.run_epochs(
-            max_steps=args.max_steps,
-            save_checkpoints=True,
-            verbose=True,
-            start_epoch=start_epoch,
-            global_step=global_step,
-        )
+    # ====================================================================
+    # MODE INTERACTIVE vs MODE PIPELINE
+    # ====================================================================
 
-        if history:
-            report = history[-1]
+    if args.interactive:
+        # ----------------------------------------------------------------
+        # MODE INTERACTIVE
+        # Langsung masuk playground.
+        # Training dilakukan via perintah 'training' di playground.
+        # Tidak ada segment TRAINER / TRAINING / EVAL.
+        # ----------------------------------------------------------------
+        print_section("PLAYGROUND INTERACTIVE")
 
-            print()
-            print("[main] Training selesai.")
-            print(f"[main] Epoch terakhir : {report.get('epoch')}")
-            print(f"[main] Loss           : {report.get('loss'):.6f}")
-            print(f"[main] Perplexity     : {report.get('perplexity'):.4f}")
-            print(f"[main] Accuracy       : {report.get('accuracy'):.4f}")
-            print(f"[main] Valid tokens   : {report.get('num_valid_tokens')}")
-    else:
-        print("[main] Training dilewati karena --skip-training.")
-
-    # ------------------------------------------------------------------------
-    # 7. EVALUATION / AUDIT
-    # ------------------------------------------------------------------------
-    print_section("TAHAP 6: EVALUATOR AUDIT")
-
-    if not args.skip_eval:
-        eval_report = evaluate_model(
-            model=model,
-            trainer=trainer,
-            evaluator=evaluator,
-            max_batches=args.eval_batches,
-        )
-
-        if eval_report is not None:
-            report = eval_report
-
-            print("[main] Audit evaluasi selesai.")
-            print(f"[main] Eval loss       : {eval_report['loss']:.6f}")
-            print(f"[main] Eval perplexity : {eval_report['perplexity']:.4f}")
-            print(f"[main] Eval accuracy   : {eval_report['accuracy']:.4f}")
-            print(f"[main] Valid tokens    : {eval_report['num_valid_tokens']}")
-            print(f"[main] Eval batches    : {eval_report['num_batches']}")
+        if resumed:
+            print(f"[main] Model dimuat dari checkpoint (epoch {start_epoch}, step {global_step}).")
+            print("[main] Gunakan perintah 'training' untuk melatih lebih lanjut.")
         else:
-            print("[main] Audit evaluasi tidak menghasilkan token valid.")
-            print("[main] Pastikan folder datasets/ berisi data teks.")
-    else:
-        print("[main] Evaluasi dilewati karena --skip-eval.")
+            print("[main] Model baru dibuat (belum dilatih).")
+            print("[main] Gunakan perintah 'training' untuk melatih.")
 
-    # ------------------------------------------------------------------------
-    # 8. PLAYGROUND / TESTING
-    # ------------------------------------------------------------------------
-    print_section("TAHAP 7: PLAYGROUND TESTING")
+        print()
 
-    run_testing = (not args.skip_test) or args.interactive
-
-    if run_testing:
-        # Trainer diteruskan ke playground agar perintah 'training' bisa dipakai
         playground = Playground(
             model=model,
             tokenizer=tokenizer,
@@ -374,16 +332,98 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
             trainer=trainer,
         )
 
-        if args.interactive:
-            playground.interactive(
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                repetition_penalty=args.repetition_penalty,
-                min_new_tokens=args.min_new_tokens,
+        playground.interactive(
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+            min_new_tokens=args.min_new_tokens,
+        )
+
+        # Setelah keluar dari playground, export jika diminta
+        if not args.skip_export:
+            export_model(
+                model=model,
+                tokenizer=tokenizer,
+                evaluator=evaluator,
+                config=config,
+                report=report,
+                args=args,
             )
+
+    else:
+        # ----------------------------------------------------------------
+        # MODE PIPELINE
+        # Training -> Eval -> Test -> Export
+        # ----------------------------------------------------------------
+
+        # TRAINING
+        if not args.skip_training:
+            print_section("TRAINING")
+
+            history = trainer.run_epochs(
+                max_steps=args.max_steps,
+                save_checkpoints=True,
+                verbose=True,
+                start_epoch=start_epoch,
+                global_step=global_step,
+            )
+
+            if history:
+                report = history[-1]
+
+                print()
+                print("[main] Training selesai.")
+                print(f"[main] Epoch terakhir : {report.get('epoch')}")
+                print(f"[main] Loss           : {report.get('loss'):.6f}")
+                print(f"[main] Perplexity     : {report.get('perplexity'):.4f}")
+                print(f"[main] Accuracy       : {report.get('accuracy'):.4f}")
+                print(f"[main] Valid tokens   : {report.get('num_valid_tokens')}")
+            else:
+                print("[main] Training tidak menghasilkan history.")
         else:
+            print_section("TRAINING")
+            print("[main] Training dilewati karena --skip-training.")
+
+        # EVALUATOR AUDIT
+        if not args.skip_eval:
+            print_section("EVALUATOR AUDIT")
+
+            eval_report = evaluate_model(
+                model=model,
+                trainer=trainer,
+                evaluator=evaluator,
+                max_batches=args.eval_batches,
+            )
+
+            if eval_report is not None:
+                report = eval_report
+
+                print("[main] Audit evaluasi selesai.")
+                print(f"[main] Eval loss       : {eval_report['loss']:.6f}")
+                print(f"[main] Eval perplexity : {eval_report['perplexity']:.4f}")
+                print(f"[main] Eval accuracy   : {eval_report['accuracy']:.4f}")
+                print(f"[main] Valid tokens    : {eval_report['num_valid_tokens']}")
+                print(f"[main] Eval batches    : {eval_report['num_batches']}")
+            else:
+                print("[main] Audit evaluasi tidak menghasilkan token valid.")
+                print("[main] Pastikan folder datasets/ berisi data teks.")
+        else:
+            print_section("EVALUATOR AUDIT")
+            print("[main] Evaluasi dilewati karena --skip-eval.")
+
+        # PLAYGROUND TEST (non-interactive)
+        if not args.skip_test:
+            print_section("PLAYGROUND TEST")
+
+            playground = Playground(
+                model=model,
+                tokenizer=tokenizer,
+                config=config,
+                trainer=trainer,
+            )
+
             playground.test_prompt(
                 prompt=args.prompt,
                 max_new_tokens=args.max_new_tokens,
@@ -394,24 +434,23 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
                 min_new_tokens=args.min_new_tokens,
                 verbose=True,
             )
-    else:
-        print("[main] Testing dilewati karena --skip-test.")
+        else:
+            print_section("PLAYGROUND TEST")
+            print("[main] Testing dilewati karena --skip-test.")
 
-    # ------------------------------------------------------------------------
-    # 9. EXPORT MODEL
-    # ------------------------------------------------------------------------
-    if not args.skip_export:
-        export_model(
-            model=model,
-            tokenizer=tokenizer,
-            evaluator=evaluator,
-            config=config,
-            report=report,
-            args=args,
-        )
-    else:
-        print_section("EXPORT MODEL")
-        print("[main] Export dilewati karena --skip-export.")
+        # EXPORT
+        if not args.skip_export:
+            export_model(
+                model=model,
+                tokenizer=tokenizer,
+                evaluator=evaluator,
+                config=config,
+                report=report,
+                args=args,
+            )
+        else:
+            print_section("EXPORT MODEL")
+            print("[main] Export dilewati karena --skip-export.")
 
     print_section("PIPELINE SELESAI")
 
@@ -423,11 +462,6 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
 def run_demo(args: argparse.Namespace) -> None:
     """
     Menjalankan pipeline demo kecil memakai folder sementara.
-
-    Tujuan:
-    - memastikan seluruh pipeline bisa berjalan end-to-end
-    - tidak mengubah dataset utama
-    - tidak mengubah config utama
     """
     print_section("MODE DEMO")
 
@@ -492,17 +526,13 @@ def run_demo(args: argparse.Namespace) -> None:
 
         demo_args = copy.copy(args)
 
-        # Demo tidak perlu resume dari checkpoint lama.
         demo_args.resume = False
-
-        # Demo memakai path export sementara.
         demo_args.export_path = None
+        demo_args.interactive = False  # Demo selalu pakai mode pipeline
 
-        # Batasi step jika user tidak menentukan.
         if demo_args.max_steps is None:
             demo_args.max_steps = 4
 
-        # Batasi batch evaluasi agar demo cepat.
         if demo_args.eval_batches != 0:
             demo_args.eval_batches = 2
 
@@ -539,9 +569,18 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help=(
+            "Masuk langsung ke playground interaktif. "
+            "Training dilakukan via perintah 'training' di playground."
+        ),
+    )
+
+    parser.add_argument(
         "--skip-training",
         action="store_true",
-        help="Lewati tahap training.",
+        help="Lewati tahap training (mode pipeline).",
     )
 
     parser.add_argument(
@@ -560,12 +599,6 @@ def parse_args() -> argparse.Namespace:
         "--skip-export",
         action="store_true",
         help="Lewati tahap export model.",
-    )
-
-    parser.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Jalankan playground dalam mode CLI interaktif.",
     )
 
     parser.add_argument(
