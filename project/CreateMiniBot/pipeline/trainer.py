@@ -67,11 +67,10 @@ class Trainer:
     - Early stopping
     - Periodic checkpoint
     - Inline training dari playground (berbasis step & epoch)
+    - Global shuffle untuk menghilangkan bias urutan file
     """
 
     LOG_EVERY_STEPS = 10
-    SHUFFLE_BUFFER_BATCH_MULTIPLIER = 32
-    MIN_SHUFFLE_BUFFER = 128
 
     def __init__(
         self,
@@ -194,6 +193,11 @@ class Trainer:
             epoch_correct = 0
             steps_done = 0
 
+            # ============================================================
+            # SINKRONISASI RNG:
+            # Buat rng baru untuk setiap epoch agar pola pengacakan
+            # berbeda setiap epoch, tapi tetap reproducibel.
+            # ============================================================
             rng = np.random.default_rng(self.seed + epoch)
 
             if verbose:
@@ -517,6 +521,9 @@ class Trainer:
             epoch_correct = 0
             steps_done = 0
 
+            # ============================================================
+            # SINKRONISASI RNG untuk inline epoch training
+            # ============================================================
             rng = np.random.default_rng(self.seed + epoch_num + 1)
 
             if verbose:
@@ -604,10 +611,6 @@ class Trainer:
                 if verbose:
                     print(f"[Trainer] Checkpoint disimpan: {ckpt_path}")
 
-            # Jika min_steps sudah tercapai dan epoch sudah selesai,
-            # tetap lanjutkan epoch berikutnya sampai epochs terpenuhi.
-            # min_steps hanya menjamin minimal step, tidak memotong epoch.
-
         if verbose:
             print(
                 f"[Trainer] Inline epoch training selesai | "
@@ -618,7 +621,7 @@ class Trainer:
         return history
 
     # ========================================================================
-    # BATCHING
+    # BATCHING - GLOBAL LOADING & GLOBAL SHUFFLE
     # ========================================================================
 
     def iter_batches(
@@ -629,6 +632,11 @@ class Trainer:
         """
         Menghasilkan batch (inputs, targets).
 
+        PERUBAHAN SOTA:
+        - Membaca SELURUH dataset ke memori sekaligus (global loading)
+        - Melakukan shuffle GLOBAL pada semua contoh
+        - Tidak ada lagi buffer lokal per file
+
         Output:
         - inputs  : [B, sequence_length]
         - targets : [B, sequence_length]
@@ -636,37 +644,27 @@ class Trainer:
         if rng is None:
             rng = np.random.default_rng()
 
-        buffer: List[np.ndarray] = []
-        buffer_limit = max(
-            self.batch_size * self.SHUFFLE_BUFFER_BATCH_MULTIPLIER,
-            self.MIN_SHUFFLE_BUFFER,
-        )
+        # ================================================================
+        # GLOBAL LOADING:
+        # Kumpulkan semua contoh ke satu list besar di memori.
+        # Dataset Anda masih ringan (< 1 juta baris), jadi aman.
+        # ================================================================
+        all_examples: List[np.ndarray] = []
 
-        for example in self._iter_examples():
-            buffer.append(example)
+        for example in self._iter_examples(rng=rng):
+            all_examples.append(example)
 
-            if len(buffer) >= buffer_limit:
-                yield from self._yield_batches(buffer, shuffle, rng)
-                buffer.clear()
+        # ================================================================
+        # GLOBAL SHUFFLE:
+        # Acak seluruh contoh secara total untuk menghilangkan bias
+        # urutan antar file.
+        # ================================================================
+        if shuffle and len(all_examples) > 1:
+            rng.shuffle(all_examples)
 
-        if buffer:
-            yield from self._yield_batches(buffer, shuffle, rng)
-            buffer.clear()
-
-    def _yield_batches(
-        self,
-        buffer: List[np.ndarray],
-        shuffle: bool,
-        rng: np.random.Generator,
-    ) -> Iterable[Tuple[np.ndarray, np.ndarray]]:
-        """
-        Mengubah buffer contoh menjadi batch.
-        """
-        if shuffle:
-            rng.shuffle(buffer)
-
-        for i in range(0, len(buffer), self.batch_size):
-            chunk = buffer[i : i + self.batch_size]
+        # Yield batch dari list yang sudah di-shuffle global
+        for i in range(0, len(all_examples), self.batch_size):
+            chunk = all_examples[i : i + self.batch_size]
 
             if not chunk:
                 continue
@@ -678,15 +676,22 @@ class Trainer:
 
             yield inputs, targets
 
-    def _iter_examples(self) -> Iterable[np.ndarray]:
+    def _iter_examples(self, rng: Optional[np.random.Generator] = None) -> Iterable[np.ndarray]:
         """
         Menghasilkan contoh token sepanjang sequence_length + 1.
+
+        PERUBAHAN SOTA:
+        - Menerima parameter rng untuk sinkronisasi pengacakan
+        - Meneruskan rng ke _iter_text_sequences
         """
+        if rng is None:
+            rng = np.random.default_rng()
+
         chunk_size = self.sequence_length + 1
         current: List[int] = []
         pad_id = int(self.tokenizer.pad_id)
 
-        for text in self._iter_text_sequences():
+        for text in self._iter_text_sequences(rng=rng):
             text = text.strip()
 
             if not text:
@@ -717,21 +722,50 @@ class Trainer:
             yield np.array(padded, dtype=np.int64)
 
     # ========================================================================
-    # DATASET READING
+    # DATASET READING - PENGACAKAN URUTAN FILE
     # ========================================================================
 
-    def _iter_text_sequences(self) -> Iterable[str]:
+    def _iter_text_sequences(self, rng: Optional[np.random.Generator] = None) -> Iterable[str]:
         """
         Membaca urutan teks dari folder datasets/.
+
+        PERUBAHAN SOTA:
+        - Kumpulkan semua path file ke list terlebih dahulu
+        - Acak urutan file dengan rng.shuffle()
+        - Baca file dalam urutan acak (bukan sorted alfabetis)
+
+        Ini menghilangkan bias di mana file dengan nama alfabetis awal
+        selalu dibaca lebih dulu di setiap epoch.
         """
+        if rng is None:
+            rng = np.random.default_rng()
+
         if not self.datasets_dir.exists():
             self.datasets_dir.mkdir(parents=True, exist_ok=True)
             return
 
-        for path in sorted(self.datasets_dir.iterdir()):
-            if not path.is_file():
-                continue
+        # ================================================================
+        # PERUBAHAN 1: Kumpulkan semua path file ke list
+        # (tidak langsung loop generator iterdir)
+        # ================================================================
+        file_paths: List[Path] = []
 
+        for path in self.datasets_dir.iterdir():
+            if path.is_file() and path.suffix.lower() in {".txt", ".json"}:
+                file_paths.append(path)
+
+        if not file_paths:
+            return
+
+        # ================================================================
+        # PERUBAHAN 2: Acak urutan file dengan rng
+        # ================================================================
+        rng.shuffle(file_paths)
+
+        # ================================================================
+        # Baca file dalam urutan acak
+        # ================================================================
+        for path in file_paths:
             suffix = path.suffix.lower()
 
             if suffix == ".txt":
