@@ -153,7 +153,7 @@ class TrainingConfig:
 
     # Learning rate: diturunkan dari 3e-4 ke 1e-4 untuk stabilitas
     learning_rate: float = 1e-4
-    
+
     batch_size: int = 2
     epochs: int = 500
     sequence_length: int = 24
@@ -173,14 +173,14 @@ class TrainingConfig:
     # Learning rate scheduling
     # Warmup: LR naik perlahan di awal training
     lr_warmup_steps: int = 100
-    
+
     # Decay: LR turun setelah step tertentu
     # 0 = tidak ada decay, > 0 = decay setiap N step
     lr_decay_steps: int = 0
-    
+
     # Faktor decay (misal 0.5 = LR dibagi 2 setiap lr_decay_steps)
     lr_decay_factor: float = 0.5
-    
+
     # Minimum learning rate (LR tidak akan turun di bawah ini)
     lr_min: float = 1e-6
 
@@ -241,6 +241,36 @@ class ModelConfig:
     # Presisi saat training dan export
     train_dtype: str = "float32"
     export_dtype: str = "float16"
+
+    # ================================================================
+    # SOTA UPGRADE PARAMETERS
+    # ================================================================
+
+    # RoPE: Rotary Position Embedding (menggantikan sinusoidal absolut).
+    # Menerapkan rotasi pada Q dan K secara relatif, jauh lebih baik untuk
+    # menjaga koherensi konteks panjang.
+    use_rope: bool = True
+
+    # Weight Tying: share bobot embed_tokens dengan lm_head.
+    # Memangkas parameter, menyelaraskan ruang representasi input-output,
+    # dan mencegah model menghafal token ID secara berlebihan.
+    use_weight_tying: bool = True
+
+    # Attention logit soft-capping (tanh).
+    # Mencegah attention scores meledak tanpa memotong gradient keras.
+    # Nilai 30.0 mengikuti Gemma.
+    attention_logit_cap: float = 30.0
+
+    # Final logit soft-capping (tanh).
+    # Mencegah logits output meledak sebelum masuk ke Cross-Entropy Loss.
+    # Nilai 50.0 mengikuti Gemma.
+    final_logit_cap: float = 50.0
+
+    # Stochastic Depth (DropPath) base rate.
+    # Probabilitas drop meningkat linear dari 0 di layer pertama ke
+    # drop_path_rate di layer terakhir.
+    # Nilai 0.1 adalah rekomendasi umum untuk model Transformer kecil-menengah.
+    drop_path_rate: float = 0.1
 
     @property
     def head_dim(self) -> int:
@@ -332,6 +362,26 @@ class Config:
             raise ValueError(
                 f"model.export_dtype tidak valid. Pilihan: {sorted(ALLOWED_EXPORT_DTYPES)}"
             )
+
+        # ------------------------------------------------------------------
+        # Validasi SOTA parameters
+        # ------------------------------------------------------------------
+        if m.use_rope:
+            head_dim = m.embedding_dim // m.num_attention_heads
+            if head_dim % 2 != 0:
+                raise ValueError(
+                    "RoPE memerlukan head_dim genap. "
+                    f"Sekarang: {head_dim}. Pastikan embedding_dim / num_attention_heads genap."
+                )
+
+        if m.attention_logit_cap <= 0.0:
+            raise ValueError("model.attention_logit_cap harus lebih besar dari 0.")
+
+        if m.final_logit_cap <= 0.0:
+            raise ValueError("model.final_logit_cap harus lebih besar dari 0.")
+
+        if not (0.0 <= m.drop_path_rate < 1.0):
+            raise ValueError("model.drop_path_rate harus berada pada rentang [0, 1).")
 
         # ------------------------------------------------------------------
         # Validasi hyperparameter training
@@ -461,3 +511,10 @@ if __name__ == "__main__":
     print(f"  head_dim          : {CONFIG.model.head_dim}")
     print(f"  train_dtype       : {CONFIG.model.train_dtype}")
     print(f"  export_dtype      : {CONFIG.model.export_dtype}")
+    print()
+    print("SOTA features:")
+    print(f"  use_rope              : {CONFIG.model.use_rope}")
+    print(f"  use_weight_tying      : {CONFIG.model.use_weight_tying}")
+    print(f"  attention_logit_cap   : {CONFIG.model.attention_logit_cap}")
+    print(f"  final_logit_cap       : {CONFIG.model.final_logit_cap}")
+    print(f"  drop_path_rate        : {CONFIG.model.drop_path_rate}")

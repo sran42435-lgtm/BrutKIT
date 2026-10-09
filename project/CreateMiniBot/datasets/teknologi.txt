@@ -1,0 +1,15 @@
+Internet adalah jaringan komputer global yang menghubungkan jutaan perangkat di seluruh dunia. Teknologi ini pertama kali dikembangkan pada tahun 1969 dengan nama ARPANET oleh Departemen Pertahanan Amerika Serikat. Internet telah mengubah cara manusia berkomunikasi, bekerja, dan mengakses informasi.
+
+Kecerdasan buatan adalah cabang ilmu komputer yang berusaha membuat mesin mampu berpikir seperti manusia. Teknologi ini meliputi pembelajaran mesin, pengenalan pola, dan pemrosesan bahasa alami. Kecerdasan buatan kini digunakan di berbagai bidang seperti kesehatan, transportasi, dan pendidikan.
+
+Smartphone adalah perangkat komunikasi yang menggabungkan fungsi telepon seluler dengan komputer mini. Perangkat ini dilengkapi layar sentuh, kamera, dan berbagai aplikasi yang mendukung produktivitas. Smartphone pertama kali dipopulerkan oleh Apple dengan peluncuran iPhone pada tahun 2007.
+
+Blockchain adalah teknologi pencatatan data terdistribusi yang menjadi dasar mata uang kripto. Teknologi ini menyimpan informasi dalam blok-blok yang saling terhubung dan tidak dapat diubah. Blockchain menawarkan transparansi dan keamanan tinggi tanpa memerlukan perantara pusat.
+
+Komputer kuantum adalah jenis komputer yang memanfaatkan prinsip mekanika kuantum untuk melakukan perhitungan. Berbeda dengan komputer klasik yang menggunakan bit, komputer kuantum menggunakan qubit yang dapat berada dalam dua keadaan sekaligus. Teknologi ini berpotensi memecahkan masalah yang terlalu kompleks bagi komputer konvensional.
+
+Robot adalah mesin yang dapat melakukan tugas secara otomatis sesuai dengan program yang ditanamkan. Robot modern dilengkapi sensor, aktuator, dan sistem kontrol yang memungkinkan interaksi dengan lingkungan. Robot digunakan di industri manufaktur, rumah sakit, dan eksplorasi luar angkasa.
+
+Mobil listrik adalah kendaraan yang menggunakan motor listrik sebagai penggerak utama alih-alih mesin pembakaran. Kendaraan ini menggunakan baterai sebagai sumber energi dan tidak menghasilkan emisi gas buang. Industri mobil listrik berkembang pesat seiring dengan kesadaran akan perubahan iklim.
+
+Cloud computing adalah layanan komputasi yang menyediakan sumber daya melalui internet tanpa memerlukan infrastruktur fisik lokal. Layanan ini meliputi penyimpanan data, server, dan perangkat lunak yang dapat diakses dari mana saja. Cloud computing telah merevolusi cara perusahaan mengelola teknologi informasi mereka.
