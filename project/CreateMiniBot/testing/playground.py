@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ============================================================================
 # FIX IMPORT PATH
@@ -102,11 +102,12 @@ class Playground:
         repetition_window: int = DEFAULT_REPETITION_WINDOW,
         min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
         verbose: bool = True,
+        debug_tokens: bool = False,
     ) -> str:
         """
         Uji satu prompt dan cetak hasilnya.
         """
-        answer, generated_ids = self.generate(
+        answer, generated_ids, token_pieces = self.generate(
             prompt=prompt,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -115,13 +116,36 @@ class Playground:
             repetition_penalty=repetition_penalty,
             repetition_window=repetition_window,
             min_new_tokens=min_new_tokens,
+            return_debug=True,
         )
 
         if verbose:
             print("-" * 60)
             print("Prompt  :", prompt)
+
+            # ============================================================
+            # DEBUG MODE: Tampilkan Token IDs dan Token Pieces
+            # ============================================================
+            if debug_tokens:
+                print()
+                print("[DEBUG] Token IDs    :")
+                # Tampilkan dalam baris per 10 token agar rapi
+                for i in range(0, len(generated_ids), 10):
+                    chunk = generated_ids[i : i + 10]
+                    print(f"         {i+1:>3}-{i+len(chunk):<3} : {chunk}")
+
+                print()
+                print("[DEBUG] Token Pieces :")
+                for i in range(0, len(token_pieces), 10):
+                    chunk = token_pieces[i : i + 10]
+                    # Format agar mudah dibaca
+                    formatted = [f"'{p}'" for p in chunk]
+                    print(f"         {i+1:>3}-{i+len(chunk):<3} : {formatted}")
+
+                print()
+
             print("Jawaban :", answer if answer else "(kosong)")
-            print("Tokens  :", len(generated_ids))
+            print(f"Tokens  : {len(generated_ids)}")
             print("-" * 60)
 
         return answer
@@ -136,9 +160,15 @@ class Playground:
         repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
         repetition_window: int = DEFAULT_REPETITION_WINDOW,
         min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
-    ) -> tuple[str, List[int]]:
+        return_debug: bool = False,
+    ) -> Tuple[str, List[int], List[str]]:
         """
         Membuat jawaban/lanjutan teks dari prompt.
+
+        Return:
+        - answer_text   : teks hasil generation
+        - generated_ids : daftar token ID yang dihasilkan (tanpa prompt awal)
+        - token_pieces  : daftar token string/subword (untuk debug)
         """
         self._ensure_tokenizer_ready()
 
@@ -157,6 +187,9 @@ class Playground:
         max_new_tokens = max(0, int(max_new_tokens))
         min_new_tokens = max(0, int(min_new_tokens))
 
+        # ================================================================
+        # GENERATION LOOP
+        # ================================================================
         for step in range(max_new_tokens):
             context = current_ids[-self.max_context :]
             input_ids = np.array([context], dtype=np.int64)
@@ -166,6 +199,7 @@ class Playground:
 
             step_forbidden = forbidden_ids
 
+            # Jika belum mencapai min_new_tokens, larang EOS
             if step < min_new_tokens:
                 step_forbidden = list(forbidden_ids)
                 if self.eos_id not in step_forbidden:
@@ -195,12 +229,40 @@ class Playground:
 
         generated_ids = current_ids[len(prompt_ids) :]
 
+        # ================================================================
+        # DECODE: Token ID → Token String → Final Text
+        # ================================================================
+        token_pieces = self._get_token_pieces(generated_ids)
+
         answer_text = self.tokenizer.decode(
             generated_ids,
             skip_special_tokens=True,
         )
 
-        return answer_text, generated_ids
+        if return_debug:
+            return answer_text, generated_ids, token_pieces
+
+        return answer_text, generated_ids, token_pieces
+
+    def _get_token_pieces(self, token_ids: List[int]) -> List[str]:
+        """
+        Ubah daftar token ID menjadi daftar token string (subword).
+        Ini digunakan untuk debug agar user bisa melihat token per token.
+        """
+        pieces = []
+        id_to_token = getattr(self.tokenizer, "id_to_token", None)
+
+        if id_to_token is None:
+            # Fallback jika id_to_token tidak tersedia
+            for tid in token_ids:
+                pieces.append(f"<{tid}>")
+            return pieces
+
+        for tid in token_ids:
+            token_str = id_to_token.get(tid, f"<{tid}>")
+            pieces.append(token_str)
+
+        return pieces
 
     def interactive(
         self,
@@ -211,6 +273,7 @@ class Playground:
         repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
         repetition_window: int = DEFAULT_REPETITION_WINDOW,
         min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
+        debug_tokens: bool = False,
     ) -> None:
         """
         Mode CLI interaktif.
@@ -230,6 +293,10 @@ class Playground:
         print("=" * 60)
         print("Ketik prompt untuk inference.")
         print("Ketik /help untuk daftar perintah.")
+
+        if debug_tokens:
+            print(">>> DEBUG MODE AKTIF: Token IDs & Pieces akan ditampilkan <<<")
+
         print("=" * 60)
         print(f"temperature        : {temperature}")
         print(f"top_k              : {top_k}")
@@ -237,6 +304,7 @@ class Playground:
         print(f"repetition_penalty : {repetition_penalty}")
         print(f"min_new_tokens     : {min_new_tokens}")
         print(f"max_new_tokens     : {max_new_tokens}")
+        print(f"debug_tokens       : {debug_tokens}")
         print("=" * 60)
 
         while True:
@@ -274,7 +342,7 @@ class Playground:
             # ================================================================
             # PROMPT INFERENCE
             # ================================================================
-            answer, generated_ids = self.generate(
+            answer, generated_ids, token_pieces = self.generate(
                 prompt=stripped,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -283,7 +351,27 @@ class Playground:
                 repetition_penalty=repetition_penalty,
                 repetition_window=repetition_window,
                 min_new_tokens=min_new_tokens,
+                return_debug=True,
             )
+
+            # ============================================================
+            # DEBUG MODE: Tampilkan Token IDs dan Token Pieces
+            # ============================================================
+            if debug_tokens:
+                print()
+                print("[DEBUG] Token IDs    :")
+                for i in range(0, len(generated_ids), 10):
+                    chunk = generated_ids[i : i + 10]
+                    print(f"         {i+1:>3}-{i+len(chunk):<3} : {chunk}")
+
+                print()
+                print("[DEBUG] Token Pieces :")
+                for i in range(0, len(token_pieces), 10):
+                    chunk = token_pieces[i : i + 10]
+                    formatted = [f"'{p}'" for p in chunk]
+                    print(f"         {i+1:>3}-{i+len(chunk):<3} : {formatted}")
+
+                print()
 
             print("Jawaban :", answer if answer else "(kosong)")
             print(f"[{len(generated_ids)} token dihasilkan]")
@@ -799,6 +887,11 @@ if __name__ == "__main__":
         default=4,
         help="Jumlah token minimum sebelum EOS diperbolehkan.",
     )
+    parser.add_argument(
+        "--debug-tokens",
+        action="store_true",
+        help="Tampilkan Token IDs dan Token Pieces secara detail.",
+    )
 
     args = parser.parse_args()
 
@@ -874,11 +967,13 @@ if __name__ == "__main__":
         if args.interactive:
             playground.interactive(
                 max_new_tokens=args.max_new_tokens,
+                debug_tokens=args.debug_tokens,
             )
         else:
             playground.test_prompt(
                 prompt=args.prompt,
                 max_new_tokens=args.max_new_tokens,
+                debug_tokens=args.debug_tokens,
             )
 
         print("testing/playground.py test OK")

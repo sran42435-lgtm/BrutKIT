@@ -152,15 +152,15 @@ class TrainingConfig:
     """
 
     # Learning rate: diturunkan dari 3e-4 ke 1e-4 untuk stabilitas
-    learning_rate: float = 1e-4
+    learning_rate: float = 3e-4
 
     batch_size: int = 2
     epochs: int = 500
     sequence_length: int = 24
 
     # Regularization: dinaikkan dari 0.0 ke 0.1 untuk mencegah overfit
-    dropout_rate: float = 0.1
-    weight_decay: float = 0.01
+    dropout_rate: float = 0.4
+    weight_decay: float = 0.1
 
     # Gradient clipping untuk mencegah exploding gradient
     grad_clip_norm: float = 1.0
@@ -192,7 +192,7 @@ class TrainingConfig:
     # Early stopping
     # 0 = tidak ada early stopping
     # > 0 = stop jika loss tidak turun selama N epoch
-    early_stopping_patience: int = 0
+    early_stopping_patience: int = 5
 
     # Evaluasi dan checkpoint
     # 0 = hanya di akhir epoch
@@ -224,10 +224,10 @@ class ModelConfig:
     - testing/playground.py
     """
 
-    vocab_size: int = 512
-    embedding_dim: int = 96
-    num_attention_heads: int = 4
-    num_layers: int = 3
+    vocab_size: int = 4096
+    embedding_dim: int = 512
+    num_attention_heads: int = 16
+    num_layers: int = 6
 
     # Context length maksimal
     max_position_embeddings: int = 96
@@ -236,7 +236,7 @@ class ModelConfig:
     layer_norm_eps: float = 1e-5
 
     # Dimensi Feed-Forward Network
-    ffn_hidden_dim: int = 192
+    ffn_hidden_dim: int = 1024
 
     # Presisi saat training dan export
     train_dtype: str = "float32"

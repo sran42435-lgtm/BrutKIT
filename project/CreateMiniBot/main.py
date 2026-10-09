@@ -18,6 +18,7 @@
 # --skip-eval     : lewati evaluasi
 # --skip-test     : lewati test prompt
 # --skip-export   : lewati export model
+# --debug-tokens  : tampilkan Token IDs dan Token Pieces saat inference
 
 from __future__ import annotations
 
@@ -318,10 +319,10 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
 
         if resumed:
             print(f"[main] Model dimuat dari checkpoint (epoch {start_epoch}, step {global_step}).")
-            print("[main] Gunakan perintah 'training' untuk melatih lebih lanjut.")
+            print("[main] Gunakan perintah '/training' untuk melatih lebih lanjut.")
         else:
             print("[main] Model baru dibuat (belum dilatih).")
-            print("[main] Gunakan perintah 'training' untuk melatih.")
+            print("[main] Gunakan perintah '/training' untuk melatih.")
 
         print()
 
@@ -339,6 +340,7 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
             top_p=args.top_p,
             repetition_penalty=args.repetition_penalty,
             min_new_tokens=args.min_new_tokens,
+            debug_tokens=args.debug_tokens,
         )
 
         # Setelah keluar dari playground, export jika diminta
@@ -433,6 +435,7 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
                 repetition_penalty=args.repetition_penalty,
                 min_new_tokens=args.min_new_tokens,
                 verbose=True,
+                debug_tokens=args.debug_tokens,
             )
         else:
             print_section("PLAYGROUND TEST")
@@ -649,6 +652,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.25,
         help="Repetition penalty. Nilai > 1 mengurangi pengulangan.",
+    )
+
+    parser.add_argument(
+        "--debug-tokens",
+        action="store_true",
+        help="Tampilkan Token IDs dan Token Pieces secara detail saat inference.",
     )
 
     # ---- TRAINING CONTROL ----
