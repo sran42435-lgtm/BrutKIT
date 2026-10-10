@@ -15,6 +15,12 @@
 # 10. Mendukung periodic checkpoint & eval
 # 11. Mendukung inline training dari playground (step & epoch)
 #
+# Perubahan SOTA Batch 4 - Document Boundary:
+# - Setiap paragraf diisolasi: [BOS] + teks + [EOS] + [PAD]
+# - Tidak ada sliding window untuk paragraf pendek
+# - Paragraf panjang dipotong dengan [BOS] dan [EOS] di setiap potongan
+# - No Aggregation: tidak ada penyambungan antar paragraf di batch
+#
 # Keterhubungan:
 # - config.py              : hyperparameter training
 # - core/tokenizer.py      : encode teks menjadi token ID
@@ -67,7 +73,9 @@ class Trainer:
     - Early stopping
     - Periodic checkpoint
     - Inline training dari playground (berbasis step & epoch)
-    - Global shuffle untuk menghilangkan bias urutan file
+    - Pembacaan berbasis blok paragraf
+    - Shuffling tingkat blok paragraf
+    - Document Boundary: isolasi paragraf dengan BOS/EOS/PAD
     """
 
     LOG_EVERY_STEPS = 10
@@ -621,7 +629,7 @@ class Trainer:
         return history
 
     # ========================================================================
-    # BATCHING - GLOBAL LOADING & GLOBAL SHUFFLE
+    # BATCHING - DOCUMENT BOUNDARY (NO AGGREGATION)
     # ========================================================================
 
     def iter_batches(
@@ -632,10 +640,10 @@ class Trainer:
         """
         Menghasilkan batch (inputs, targets).
 
-        PERUBAHAN SOTA:
-        - Membaca SELURUH dataset ke memori sekaligus (global loading)
-        - Melakukan shuffle GLOBAL pada semua contoh
-        - Tidak ada lagi buffer lokal per file
+        DOCUMENT BOUNDARY - NO AGGREGATION:
+        - Setiap contoh token sudah terisolasi murni per paragraf
+        - Batch hanya menumpuk (stack) contoh-contoh mandiri
+        - Tidak ada proses penyambungan teks antar-paragraf di tingkat batch
 
         Output:
         - inputs  : [B, sequence_length]
@@ -645,24 +653,35 @@ class Trainer:
             rng = np.random.default_rng()
 
         # ================================================================
-        # GLOBAL LOADING:
-        # Kumpulkan semua contoh ke satu list besar di memori.
-        # Dataset Anda masih ringan (< 1 juta baris), jadi aman.
+        # SHUFFLING TINGKAT BLOK PARAGRAF
+        # ================================================================
+        all_paragraphs: List[str] = self._load_all_paragraphs(rng=rng)
+
+        if not all_paragraphs:
+            return
+
+        if shuffle and len(all_paragraphs) > 1:
+            rng.shuffle(all_paragraphs)
+
+        # ================================================================
+        # GENERATE ISOLATED EXAMPLES:
+        # Setiap paragraf menjadi satu atau lebih contoh terisolasi.
+        # Tidak ada penggabungan antar paragraf.
         # ================================================================
         all_examples: List[np.ndarray] = []
 
-        for example in self._iter_examples(rng=rng):
-            all_examples.append(example)
+        for paragraph in all_paragraphs:
+            for example in self._paragraph_to_examples(paragraph):
+                all_examples.append(example)
+
+        if not all_examples:
+            return
 
         # ================================================================
-        # GLOBAL SHUFFLE:
-        # Acak seluruh contoh secara total untuk menghilangkan bias
-        # urutan antar file.
+        # YIELD BATCH (NO AGGREGATION):
+        # Batch hanya menumpuk contoh-contoh mandiri yang sudah terisolasi.
+        # Tidak ada penyambungan atau penggabungan di sini.
         # ================================================================
-        if shuffle and len(all_examples) > 1:
-            rng.shuffle(all_examples)
-
-        # Yield batch dari list yang sudah di-shuffle global
         for i in range(0, len(all_examples), self.batch_size):
             chunk = all_examples[i : i + self.batch_size]
 
@@ -676,77 +695,93 @@ class Trainer:
 
             yield inputs, targets
 
-    def _iter_examples(self, rng: Optional[np.random.Generator] = None) -> Iterable[np.ndarray]:
+    def _paragraph_to_examples(self, paragraph: str) -> Iterable[np.ndarray]:
         """
-        Menghasilkan contoh token sepanjang sequence_length + 1.
+        Mengubah satu blok paragraf menjadi contoh token terisolasi.
 
-        PERUBAHAN SOTA:
-        - Menerima parameter rng untuk sinkronisasi pengacakan
-        - Meneruskan rng ke _iter_text_sequences
+        DOCUMENT BOUNDARY:
+        - Paragraf pendek (< sequence_length):
+          [BOS] + teks + [EOS] + [PAD] * sisa
+        - Paragraf panjang (> sequence_length):
+          Dipotong, setiap potongan: [BOS] + chunk + [EOS] + [PAD] * sisa
+        - Tidak ada sliding window untuk paragraf pendek
+        - Tidak ada pencampuran dengan paragraf lain
         """
-        if rng is None:
-            rng = np.random.default_rng()
+        paragraph = paragraph.strip()
+        if not paragraph:
+            return
 
         chunk_size = self.sequence_length + 1
-        current: List[int] = []
         pad_id = int(self.tokenizer.pad_id)
+        bos_id = int(self.tokenizer.bos_id)
+        eos_id = int(self.tokenizer.eos_id)
 
-        for text in self._iter_text_sequences(rng=rng):
-            text = text.strip()
+        # Encode paragraf tanpa BOS/EOS (kita tambahkan sendiri untuk kontrol penuh)
+        ids = self.tokenizer.encode(paragraph, add_bos=False, add_eos=False)
 
-            if not text:
-                continue
+        if not ids:
+            return
 
-            ids = self.tokenizer.encode(
-                text,
-                add_bos=True,
-                add_eos=True,
-            )
+        # ============================================================
+        # KASUS 1: Paragraf muat dalam satu sequence
+        # [BOS] + teks + [EOS] + [PAD] * sisa
+        # ============================================================
+        if len(ids) + 2 <= chunk_size:
+            sequence = [bos_id] + ids + [eos_id]
+            padding_needed = chunk_size - len(sequence)
+            sequence = sequence + [pad_id] * padding_needed
+            yield np.array(sequence, dtype=np.int64)
+            return
 
-            if not ids:
-                continue
+        # ============================================================
+        # KASUS 2: Paragraf terlalu panjang, potong dengan Document Boundary
+        # Setiap potongan: [BOS] + chunk + [EOS] + [PAD] * sisa
+        # ============================================================
+        content_size = chunk_size - 2  # Ruang untuk BOS dan EOS
 
-            current.extend(ids)
+        start = 0
+        while start < len(ids):
+            # Ambil chunk konten
+            chunk = ids[start : start + content_size]
 
-            start = 0
+            # Buat sequence dengan Document Boundary
+            sequence = [bos_id] + chunk + [eos_id]
 
-            while len(current) - start >= chunk_size:
-                yield np.array(current[start : start + chunk_size], dtype=np.int64)
-                start += chunk_size
+            # Jika potongan terakhir tidak penuh, pad
+            if len(sequence) < chunk_size:
+                padding_needed = chunk_size - len(sequence)
+                sequence = sequence + [pad_id] * padding_needed
 
-            if start > 0:
-                current = current[start:]
+            yield np.array(sequence, dtype=np.int64)
 
-        if len(current) > 1:
-            padded = current + [pad_id] * (chunk_size - len(current))
-            yield np.array(padded, dtype=np.int64)
+            start += content_size
 
     # ========================================================================
-    # DATASET READING - PENGACAKAN URUTAN FILE
+    # DATASET READING - PARAGRAPH-BASED LOADING
     # ========================================================================
 
-    def _iter_text_sequences(self, rng: Optional[np.random.Generator] = None) -> Iterable[str]:
+    def _load_all_paragraphs(self, rng: Optional[np.random.Generator] = None) -> List[str]:
         """
-        Membaca urutan teks dari folder datasets/.
+        Membaca seluruh dataset dan mengumpulkan blok paragraf.
 
         PERUBAHAN SOTA:
-        - Kumpulkan semua path file ke list terlebih dahulu
-        - Acak urutan file dengan rng.shuffle()
-        - Baca file dalam urutan acak (bukan sorted alfabetis)
+        - Baca seluruh isi file sekaligus dengan .read()
+        - Split menggunakan \\n\\n untuk mendapatkan blok paragraf
+        - Strip setiap blok dan buang yang kosong
+        - Kumpulkan semua paragraf ke satu list raksasa
 
-        Ini menghilangkan bias di mana file dengan nama alfabetis awal
-        selalu dibaca lebih dulu di setiap epoch.
+        Return:
+        - List[str]: daftar semua blok paragraf dari semua file
         """
         if rng is None:
             rng = np.random.default_rng()
 
         if not self.datasets_dir.exists():
             self.datasets_dir.mkdir(parents=True, exist_ok=True)
-            return
+            return []
 
         # ================================================================
-        # PERUBAHAN 1: Kumpulkan semua path file ke list
-        # (tidak langsung loop generator iterdir)
+        # Kumpulkan semua path file ke list (tanpa sorted)
         # ================================================================
         file_paths: List[Path] = []
 
@@ -755,23 +790,37 @@ class Trainer:
                 file_paths.append(path)
 
         if not file_paths:
-            return
+            return []
 
-        # ================================================================
-        # PERUBAHAN 2: Acak urutan file dengan rng
-        # ================================================================
+        # Acak urutan file
         rng.shuffle(file_paths)
 
         # ================================================================
-        # Baca file dalam urutan acak
+        # PEMBACAAN BERBASIS PARAGRAF
         # ================================================================
+        all_paragraphs: List[str] = []
+
         for path in file_paths:
             suffix = path.suffix.lower()
 
             if suffix == ".txt":
+                # Baca seluruh isi file sekaligus
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        yield line
+                    content = f.read()
+
+                # Split berdasarkan double newline (\n\n)
+                paragraphs = content.split("\n\n")
+
+                for para in paragraphs:
+                    # Bersihkan spasi/sisa baris kosong di awal/akhir
+                    para = para.strip()
+
+                    # Ganti single newline di dalam paragraf dengan spasi
+                    para = para.replace("\n", " ")
+
+                    # Hanya masukkan yang tidak kosong
+                    if para:
+                        all_paragraphs.append(para)
 
             elif suffix == ".json":
                 try:
@@ -779,23 +828,27 @@ class Trainer:
                         data = json.load(f)
 
                     for text in self._extract_json_strings(data):
-                        yield text
+                        text = text.strip()
+                        if text:
+                            all_paragraphs.append(text)
 
                 except json.JSONDecodeError:
                     with open(path, "r", encoding="utf-8", errors="ignore") as f:
                         for line in f:
                             line = line.strip()
-
                             if not line:
                                 continue
-
                             try:
                                 obj = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
 
                             for text in self._extract_json_strings(obj):
-                                yield text
+                                text = text.strip()
+                                if text:
+                                    all_paragraphs.append(text)
+
+        return all_paragraphs
 
     def _extract_json_strings(self, node) -> Iterable[str]:
         """
@@ -841,17 +894,18 @@ if __name__ == "__main__":
         datasets_dir.mkdir(parents=True, exist_ok=True)
         output_models_dir.mkdir(parents=True, exist_ok=True)
 
+        # Buat dataset dengan format paragraf (\n\n)
         sample_file = datasets_dir / "sample.txt"
         sample_file.write_text(
-            "\n".join(
-                [
-                    "mobil memiliki mesin",
-                    "mobil memakai bahan bakar",
-                    "kecepatan mobil tergantung mesin",
-                    "apa itu mobil",
-                    "mesin mobil perlu dirawat",
-                ]
-            ),
+            "Mobil adalah kendaraan beroda empat. "
+            "Mobil menggunakan mesin sebagai penggerak utama. "
+            "Bahan bakar digunakan untuk menghasilkan tenaga.\n\n"
+            "Kucing adalah hewan peliharaan yang lucu. "
+            "Kucing suka bermain dan tidur. "
+            "Kucing membutuhkan makanan dan air.\n\n"
+            "Teknologi berkembang sangat pesat. "
+            "Komputer dan internet mengubah cara hidup manusia. "
+            "Kecerdasan buatan menjadi tren masa depan.",
             encoding="utf-8",
         )
 
@@ -904,8 +958,24 @@ if __name__ == "__main__":
             config=small_config,
         )
 
+        # Test paragraph loading
+        print("Testing paragraph loading...")
+        rng = np.random.default_rng(1337)
+        paragraphs = trainer._load_all_paragraphs(rng=rng)
+        print(f"Number of paragraphs: {len(paragraphs)}")
+        for i, p in enumerate(paragraphs):
+            print(f"  Paragraph {i+1}: {p[:60]}...")
+
+        # Test Document Boundary
+        print("\nTesting Document Boundary...")
+        for i, p in enumerate(paragraphs[:2]):
+            examples = list(trainer._paragraph_to_examples(p))
+            print(f"  Paragraph {i+1} -> {len(examples)} example(s)")
+            for j, ex in enumerate(examples):
+                print(f"    Example {j+1}: {ex[:10]}... (len={len(ex)})")
+
         # Test train_steps
-        print("Testing train_steps...")
+        print("\nTesting train_steps...")
         result = trainer.train_steps(steps=5, verbose=True)
         print(f"Result: {result}")
 

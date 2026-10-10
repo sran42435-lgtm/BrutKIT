@@ -156,7 +156,7 @@ class TrainingConfig:
 
     batch_size: int = 2
     epochs: int = 500
-    sequence_length: int = 24
+    sequence_length: int = 64
 
     # Regularization: dinaikkan dari 0.0 ke 0.1 untuk mencegah overfit
     dropout_rate: float = 0.4
