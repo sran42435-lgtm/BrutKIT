@@ -1,15 +1,15 @@
-Filsafat adalah ilmu yang mempelajari pertanyaan-pertanyaan mendasar tentang keberadaan, pengetahuan, dan nilai. Kata filsafat berasal dari bahasa Yunani philosophia yang berarti cinta kebijaksanaan. Para filsuf berusaha memahami dunia melalui akal budi dan refleksi kritis.
+[FILSAFAT] Filsafat adalah ilmu yang mempelajari pertanyaan-pertanyaan mendasar tentang keberadaan, pengetahuan, dan nilai. Para filsuf berusaha memahami dunia melalui akal budi dan refleksi kritis.
 
-Etika adalah cabang filsafat yang membahas tentang apa yang baik dan buruk dalam perilaku manusia. Teori etika utama meliputi utilitarianisme, deontologi, dan etika kebajikan. Etika membantu manusia membuat keputusan moral dalam situasi yang kompleks dan penuh dilema.
+[FILSAFAT] Etika adalah cabang filsafat yang membahas tentang apa yang baik dan buruk dalam perilaku manusia. Teori etika utama meliputi utilitarianisme, deontologi, dan etika kebajikan.
 
-Logika adalah ilmu tentang prinsip-prinsip penalaran yang sah dan valid. Logika membedakan argumen yang benar dari argumen yang keliru melalui analisis struktur berpikir. Logika menjadi dasar bagi matematika, ilmu komputer, dan hukum.
+[FILSAFAT] Logika adalah ilmu tentang prinsip-prinsip penalaran yang sah dan valid. Logika membedakan argumen yang benar dari argumen yang keliru melalui analisis struktur berpikir.
 
-Epistemologi adalah cabang filsafat yang mempelajari hakikat, sumber, dan batas pengetahuan manusia. Para epistemolog mempertanyakan bagaimana kita tahu apa yang kita tahu dan apa yang membedakan pengetahuan dari keyakinan. Diskusi epistemologis mencakup empirisme, rasionalisme, dan skeptisisme.
+[FILSAFAT] Epistemologi adalah cabang filsafat yang mempelajari hakikat, sumber, dan batas pengetahuan manusia. Para epistemolog mempertanyakan bagaimana kita tahu apa yang kita tahu.
 
-Stoikisme adalah aliran filsafat yang mengajarkan manusia untuk fokus pada apa yang dapat mereka kendalikan. Aliran ini menekankan pentingnya kebajikan, rasionalitas, dan ketenangan batin dalam menghadapi tantangan hidup. Stoikisme masih relevan dan banyak dipraktikkan oleh orang modern hingga saat ini.
+[FILSAFAT] Stoikisme adalah aliran filsafat yang mengajarkan manusia untuk fokus pada apa yang dapat mereka kendalikan. Aliran ini menekankan pentingnya kebajikan dan ketenangan batin.
 
-Eksistensialisme adalah aliran filsafat yang menekankan kebebasan individu dan tanggung jawab atas pilihan hidup. Para eksistensialis percaya bahwa manusia menciptakan makna hidupnya sendiri melalui tindakan dan keputusan. Jean-Paul Sartre dan Albert Camus adalah tokoh utama aliran ini.
+[FILSAFAT] Eksistensialisme adalah aliran filsafat yang menekankan kebebasan individu dan tanggung jawab atas pilihan hidup. Jean-Paul Sartre dan Albert Camus adalah tokoh utama aliran ini.
 
-Platonisme adalah sistem filsafat yang dikembangkan oleh Plato, murid dari Socrates. Plato memperkenalkan teori Ide yang menyatakan bahwa realitas sejati ada di dunia ide yang abstrak dan sempurna. Pemikiran Plato menjadi fondasi bagi filsafat Barat selama lebih dari dua ribu tahun.
+[FILSAFAT] Platonisme adalah sistem filsafat yang dikembangkan oleh Plato, murid dari Socrates. Plato memperkenalkan teori Ide yang menyatakan bahwa realitas sejati ada di dunia ide yang abstrak.
 
-Pragmatisme adalah aliran filsafat yang menekankan kegunaan praktis dari ide dan keyakinan. Aliran ini menilai kebenaran berdasarkan konsekuensi nyata dan dampaknya terhadap kehidupan manusia. Pragmatisme berkembang pesat di Amerika Serikat pada akhir abad kesembilan belas.
+[FILSAFAT] Pragmatisme adalah aliran filsafat yang menekankan kegunaan praktis dari ide dan keyakinan. Aliran ini menilai kebenaran berdasarkan konsekuensi nyata dan dampaknya terhadap kehidupan.

@@ -166,7 +166,7 @@ class TrainingConfig:
 
     # Regularization: dinaikkan dari 0.0 ke 0.1 untuk mencegah overfit
     dropout_rate: float = 0.4
-    weight_decay: float = 0.1
+    weight_decay: float = 0.15
 
     # Gradient clipping untuk mencegah exploding gradient
     grad_clip_norm: float = 1.0

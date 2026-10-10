@@ -2,24 +2,11 @@
 #
 # Trainer / Training Loop Engine untuk Training Pipeline Engine.
 #
-# Tugas utama:
-# 1. Membaca dataset dari folder datasets/
-# 2. Mengubah teks menjadi token ID memakai tokenizer
-# 3. Menyusun batch input/target untuk language modeling
-# 4. Menjalankan forward pass
-# 5. Menghitung loss & gradient memakai evaluator
-# 6. Menjalankan backward pass
-# 7. Memperbarui bobot memakai weight_manager
-# 8. Mendukung resume dari epoch terakhir
-# 9. Mendukung early stopping
-# 10. Mendukung periodic checkpoint & eval
-# 11. Mendukung inline training dari playground (step & epoch)
-#
-# Perubahan SOTA Batch 4 - Document Boundary:
-# - Setiap paragraf diisolasi: [BOS] + teks + [EOS] + [PAD]
-# - Tidak ada sliding window untuk paragraf pendek
-# - Paragraf panjang dipotong dengan [BOS] dan [EOS] di setiap potongan
-# - No Aggregation: tidak ada penyambungan antar paragraf di batch
+# Perubahan SOTA Batch 6 - Domain Prefix + Document Boundary:
+# - Domain prefix ([MOBIL], [SAINS], dll.) dihapus saat training
+# - Domain prefix digunakan sebagai anchor context saat inference
+# - Setiap dokumen diisolasi dengan [BOS]+teks+[EOS]+<|endoftext|>+
+# - Loss masking untuk token pemisah dokumen
 #
 # Keterhubungan:
 # - config.py              : hyperparameter training
@@ -31,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -58,15 +46,13 @@ except ImportError as exc:
 from config import CONFIG, Config
 
 
+# Regex untuk mendeteksi dan menghapus domain prefix
+DOMAIN_PREFIX_PATTERN = re.compile(r'^\[[A-Z]+\]\s*')
+
+
 class Trainer:
     """
     Mesin latihan utama.
-
-    Trainer menghubungkan:
-    - tokenizer sebagai pengolah teks -> token ID
-    - model sebagai arsitektur neural network
-    - evaluator sebagai penghitung loss & gradient
-    - weight_manager sebagai optimizer AdamW
 
     Fitur:
     - Resume dari epoch terakhir
@@ -75,7 +61,8 @@ class Trainer:
     - Inline training dari playground (berbasis step & epoch)
     - Pembacaan berbasis blok paragraf
     - Shuffling tingkat blok paragraf
-    - Document Boundary: isolasi paragraf dengan BOS/EOS/PAD
+    - Document Boundary dengan <|endoftext|>
+    - Domain prefix handling untuk anchor context
     """
 
     LOG_EVERY_STEPS = 10
@@ -113,6 +100,12 @@ class Trainer:
         self.start_epoch = 0
         self.start_global_step = 0
 
+        # Token IDs untuk Document Boundary
+        self.pad_id = int(config.special_tokens.pad_id)
+        self.bos_id = int(config.special_tokens.bos_id)
+        self.eos_id = int(config.special_tokens.eos_id)
+        self.endoftext_id = int(config.special_tokens.endoftext_id)
+
         if self.batch_size <= 0:
             raise ValueError("batch_size harus lebih besar dari 0.")
 
@@ -124,17 +117,36 @@ class Trainer:
     # ========================================================================
 
     def set_resume_state(self, start_epoch: int = 0, global_step: int = 0) -> None:
-        """
-        Set state untuk resume training.
-
-        Dipanggil oleh main.py setelah checkpoint dimuat.
-
-        Parameter:
-        - start_epoch: epoch untuk mulai (0-indexed, dari checkpoint)
-        - global_step: global step terakhir
-        """
         self.start_epoch = max(0, int(start_epoch))
         self.start_global_step = max(0, int(global_step))
+
+    # ========================================================================
+    # DOMAIN PREFIX HANDLING
+    # ========================================================================
+
+    def _strip_domain_prefix(self, text: str) -> str:
+        """
+        Menghapus domain prefix dari teks untuk training.
+
+        Contoh:
+            "[MOBIL] Mobil adalah kendaraan." -> "Mobil adalah kendaraan."
+
+        Domain prefix tetap dipertahankan di dataset untuk digunakan
+        sebagai anchor context saat inference di playground.
+        """
+        return DOMAIN_PREFIX_PATTERN.sub('', text).strip()
+
+    def _extract_domain_from_text(self, text: str) -> Optional[str]:
+        """
+        Mengekstrak domain dari teks jika ada.
+
+        Contoh:
+            "[MOBIL] Mobil adalah kendaraan." -> "MOBIL"
+        """
+        match = re.match(r'^\[([A-Z]+)\]', text)
+        if match:
+            return match.group(1)
+        return None
 
     # ========================================================================
     # PUBLIC API: FULL TRAINING (MODE PIPELINE)
@@ -148,19 +160,6 @@ class Trainer:
         start_epoch: Optional[int] = None,
         global_step: Optional[int] = None,
     ) -> List[dict]:
-        """
-        Menjalankan epoch training untuk mode pipeline.
-
-        Parameter:
-        - max_steps: batasi jumlah step global (berguna untuk testing)
-        - save_checkpoints: simpan checkpoint setiap akhir epoch
-        - verbose: cetak log training
-        - start_epoch: epoch untuk mulai (jika None, pakai self.start_epoch)
-        - global_step: global step awal (jika None, pakai self.start_global_step)
-
-        Return:
-        - history list report epoch
-        """
         if not self.tokenizer.is_ready:
             self.tokenizer.load()
 
@@ -170,11 +169,6 @@ class Trainer:
         if global_step is None:
             global_step = self.start_global_step
 
-        # ----------------------------------------------------------------
-        # FIX BUG RESUME:
-        # Jika start_epoch >= self.epochs, semua epoch config sudah selesai.
-        # Lanjutkan dengan epoch baru sebanyak config epochs.
-        # ----------------------------------------------------------------
         if start_epoch >= self.epochs:
             total_epochs = start_epoch + self.epochs
             if verbose:
@@ -201,11 +195,6 @@ class Trainer:
             epoch_correct = 0
             steps_done = 0
 
-            # ============================================================
-            # SINKRONISASI RNG:
-            # Buat rng baru untuk setiap epoch agar pola pengacakan
-            # berbeda setiap epoch, tapi tetap reproducibel.
-            # ============================================================
             rng = np.random.default_rng(self.seed + epoch)
 
             if verbose:
@@ -261,7 +250,6 @@ class Trainer:
                 steps_done += 1
                 global_step += 1
 
-            # Rekap epoch
             if steps_done == 0:
                 if verbose:
                     print(
@@ -312,7 +300,6 @@ class Trainer:
                 if verbose:
                     print(f"[Trainer] Checkpoint disimpan: {ckpt_path}")
 
-            # Early stopping check
             if self.early_stopping_patience > 0 and steps_done > 0:
                 current_loss = epoch_report.get("loss", float("inf"))
 
@@ -350,20 +337,6 @@ class Trainer:
         save_checkpoint: bool = True,
         verbose: bool = True,
     ) -> List[dict]:
-        """
-        Menjalankan training sebanyak N step tanpa terikat jumlah epoch.
-
-        Jika dataset habis sebelum N step tercapai, dataset akan diulang
-        otomatis sampai N step terpenuhi.
-
-        Parameter:
-        - steps: jumlah step training (bukan epoch)
-        - save_checkpoint: simpan checkpoint setelah selesai
-        - verbose: cetak log training
-
-        Return:
-        - list berisi satu report training
-        """
         if not self.tokenizer.is_ready:
             self.tokenizer.load()
 
@@ -381,7 +354,6 @@ class Trainer:
         if verbose:
             print(f"[Trainer] Inline training dimulai: target {steps} step")
 
-        # Ulangi dataset sampai mencapai step yang diminta
         while steps_done < steps:
             batch_iterator = self.iter_batches(shuffle=True, rng=rng)
             batches_this_epoch = 0
@@ -428,13 +400,11 @@ class Trainer:
 
             epochs_traversed += 1
 
-            # Jika tidak ada batch sama sekali, berhenti
             if batches_this_epoch == 0:
                 if verbose:
                     print("[Trainer] Tidak ada batch tersedia. Dataset mungkin kosong.")
                 break
 
-            # Update seed untuk epoch berikutnya
             rng = np.random.default_rng(
                 self.seed + current_global_step + epochs_traversed
             )
@@ -487,22 +457,6 @@ class Trainer:
         save_checkpoint: bool = True,
         verbose: bool = True,
     ) -> List[dict]:
-        """
-        Menjalankan training sebanyak N epoch dari playground.
-
-        Setiap epoch melewati seluruh dataset satu kali.
-        Jika min_steps diberikan, training tetap berjalan sampai minimal
-        min_steps tercapai meskipun epoch sudah selesai.
-
-        Parameter:
-        - epochs: jumlah epoch yang ingin dijalankan
-        - min_steps: minimal step yang harus dijalankan (opsional)
-        - save_checkpoint: simpan checkpoint setiap akhir epoch
-        - verbose: cetak log training
-
-        Return:
-        - history list report epoch
-        """
         if not self.tokenizer.is_ready:
             self.tokenizer.load()
 
@@ -529,9 +483,6 @@ class Trainer:
             epoch_correct = 0
             steps_done = 0
 
-            # ============================================================
-            # SINKRONISASI RNG untuk inline epoch training
-            # ============================================================
             rng = np.random.default_rng(self.seed + epoch_num + 1)
 
             if verbose:
@@ -577,7 +528,6 @@ class Trainer:
                     self.weight_manager, "global_step", 0
                 ) + 1
 
-            # Rekap epoch
             if steps_done == 0:
                 if verbose:
                     print(
@@ -611,7 +561,6 @@ class Trainer:
 
             history.append(epoch_report)
 
-            # Update state di weight_manager
             self.weight_manager.last_epoch = epoch_num + 1
 
             if save_checkpoint:
@@ -629,7 +578,7 @@ class Trainer:
         return history
 
     # ========================================================================
-    # BATCHING - DOCUMENT BOUNDARY (NO AGGREGATION)
+    # BATCHING - DOCUMENT BOUNDARY + DOMAIN PREFIX
     # ========================================================================
 
     def iter_batches(
@@ -640,21 +589,14 @@ class Trainer:
         """
         Menghasilkan batch (inputs, targets).
 
-        DOCUMENT BOUNDARY - NO AGGREGATION:
-        - Setiap contoh token sudah terisolasi murni per paragraf
-        - Batch hanya menumpuk (stack) contoh-contoh mandiri
-        - Tidak ada proses penyambungan teks antar-paragraf di tingkat batch
-
-        Output:
-        - inputs  : [B, sequence_length]
-        - targets : [B, sequence_length]
+        DOCUMENT BOUNDARY + DOMAIN PREFIX:
+        - Domain prefix dihapus sebelum training
+        - Setiap dokumen diisolasi dengan BOS/EOS/endoftext
+        - Batch hanya menumpuk contoh-contoh mandiri
         """
         if rng is None:
             rng = np.random.default_rng()
 
-        # ================================================================
-        # SHUFFLING TINGKAT BLOK PARAGRAF
-        # ================================================================
         all_paragraphs: List[str] = self._load_all_paragraphs(rng=rng)
 
         if not all_paragraphs:
@@ -663,11 +605,6 @@ class Trainer:
         if shuffle and len(all_paragraphs) > 1:
             rng.shuffle(all_paragraphs)
 
-        # ================================================================
-        # GENERATE ISOLATED EXAMPLES:
-        # Setiap paragraf menjadi satu atau lebih contoh terisolasi.
-        # Tidak ada penggabungan antar paragraf.
-        # ================================================================
         all_examples: List[np.ndarray] = []
 
         for paragraph in all_paragraphs:
@@ -677,11 +614,6 @@ class Trainer:
         if not all_examples:
             return
 
-        # ================================================================
-        # YIELD BATCH (NO AGGREGATION):
-        # Batch hanya menumpuk contoh-contoh mandiri yang sudah terisolasi.
-        # Tidak ada penyambungan atau penggabungan di sini.
-        # ================================================================
         for i in range(0, len(all_examples), self.batch_size):
             chunk = all_examples[i : i + self.batch_size]
 
@@ -699,58 +631,51 @@ class Trainer:
         """
         Mengubah satu blok paragraf menjadi contoh token terisolasi.
 
-        DOCUMENT BOUNDARY:
-        - Paragraf pendek (< sequence_length):
-          [BOS] + teks + [EOS] + [PAD] * sisa
-        - Paragraf panjang (> sequence_length):
-          Dipotong, setiap potongan: [BOS] + chunk + [EOS] + [PAD] * sisa
-        - Tidak ada sliding window untuk paragraf pendek
-        - Tidak ada pencampuran dengan paragraf lain
+        DOCUMENT BOUNDARY + DOMAIN PREFIX:
+        - Domain prefix dihapus sebelum encoding
+        - Paragraf pendek: [BOS] + teks + [EOS] + <|endoftext|> + [PAD]
+        - Paragraf panjang: dipotong dengan BOS/EOS/endoftext di setiap potongan
         """
-        paragraph = paragraph.strip()
-        if not paragraph:
+        # Hapus domain prefix sebelum training
+        clean_paragraph = self._strip_domain_prefix(paragraph)
+
+        if not clean_paragraph:
             return
 
         chunk_size = self.sequence_length + 1
-        pad_id = int(self.tokenizer.pad_id)
-        bos_id = int(self.tokenizer.bos_id)
-        eos_id = int(self.tokenizer.eos_id)
 
-        # Encode paragraf tanpa BOS/EOS (kita tambahkan sendiri untuk kontrol penuh)
-        ids = self.tokenizer.encode(paragraph, add_bos=False, add_eos=False)
+        # Encode paragraf tanpa BOS/EOS (kita tambahkan sendiri)
+        ids = self.tokenizer.encode(clean_paragraph, add_bos=False, add_eos=False)
 
         if not ids:
             return
 
         # ============================================================
         # KASUS 1: Paragraf muat dalam satu sequence
-        # [BOS] + teks + [EOS] + [PAD] * sisa
+        # [BOS] + teks + [EOS] +  + [PAD] * sisa
         # ============================================================
-        if len(ids) + 2 <= chunk_size:
-            sequence = [bos_id] + ids + [eos_id]
+        if len(ids) + 3 <= chunk_size:
+            sequence = [self.bos_id] + ids + [self.eos_id, self.endoftext_id]
             padding_needed = chunk_size - len(sequence)
-            sequence = sequence + [pad_id] * padding_needed
+            sequence = sequence + [self.pad_id] * padding_needed
             yield np.array(sequence, dtype=np.int64)
             return
 
         # ============================================================
-        # KASUS 2: Paragraf terlalu panjang, potong dengan Document Boundary
-        # Setiap potongan: [BOS] + chunk + [EOS] + [PAD] * sisa
+        # KASUS 2: Paragraf terlalu panjang
+        # Setiap potongan: [BOS] + chunk + [EOS] +  + [PAD]
         # ============================================================
-        content_size = chunk_size - 2  # Ruang untuk BOS dan EOS
+        content_size = chunk_size - 3  # Ruang untuk BOS, EOS, endoftext
 
         start = 0
         while start < len(ids):
-            # Ambil chunk konten
             chunk = ids[start : start + content_size]
 
-            # Buat sequence dengan Document Boundary
-            sequence = [bos_id] + chunk + [eos_id]
+            sequence = [self.bos_id] + chunk + [self.eos_id, self.endoftext_id]
 
-            # Jika potongan terakhir tidak penuh, pad
             if len(sequence) < chunk_size:
                 padding_needed = chunk_size - len(sequence)
-                sequence = sequence + [pad_id] * padding_needed
+                sequence = sequence + [self.pad_id] * padding_needed
 
             yield np.array(sequence, dtype=np.int64)
 
@@ -763,15 +688,7 @@ class Trainer:
     def _load_all_paragraphs(self, rng: Optional[np.random.Generator] = None) -> List[str]:
         """
         Membaca seluruh dataset dan mengumpulkan blok paragraf.
-
-        PERUBAHAN SOTA:
-        - Baca seluruh isi file sekaligus dengan .read()
-        - Split menggunakan \\n\\n untuk mendapatkan blok paragraf
-        - Strip setiap blok dan buang yang kosong
-        - Kumpulkan semua paragraf ke satu list raksasa
-
-        Return:
-        - List[str]: daftar semua blok paragraf dari semua file
+        Domain prefix dipertahankan di teks untuk anchor context.
         """
         if rng is None:
             rng = np.random.default_rng()
@@ -780,9 +697,6 @@ class Trainer:
             self.datasets_dir.mkdir(parents=True, exist_ok=True)
             return []
 
-        # ================================================================
-        # Kumpulkan semua path file ke list (tanpa sorted)
-        # ================================================================
         file_paths: List[Path] = []
 
         for path in self.datasets_dir.iterdir():
@@ -792,33 +706,22 @@ class Trainer:
         if not file_paths:
             return []
 
-        # Acak urutan file
         rng.shuffle(file_paths)
 
-        # ================================================================
-        # PEMBACAAN BERBASIS PARAGRAF
-        # ================================================================
         all_paragraphs: List[str] = []
 
         for path in file_paths:
             suffix = path.suffix.lower()
 
             if suffix == ".txt":
-                # Baca seluruh isi file sekaligus
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
 
-                # Split berdasarkan double newline (\n\n)
                 paragraphs = content.split("\n\n")
 
                 for para in paragraphs:
-                    # Bersihkan spasi/sisa baris kosong di awal/akhir
                     para = para.strip()
-
-                    # Ganti single newline di dalam paragraf dengan spasi
                     para = para.replace("\n", " ")
-
-                    # Hanya masukkan yang tidak kosong
                     if para:
                         all_paragraphs.append(para)
 
@@ -851,16 +754,11 @@ class Trainer:
         return all_paragraphs
 
     def _extract_json_strings(self, node) -> Iterable[str]:
-        """
-        Mengambil semua string dari struktur JSON secara rekursif.
-        """
         if isinstance(node, str):
             yield node
-
         elif isinstance(node, dict):
             for value in node.values():
                 yield from self._extract_json_strings(value)
-
         elif isinstance(node, list):
             for value in node:
                 yield from self._extract_json_strings(value)
@@ -894,18 +792,13 @@ if __name__ == "__main__":
         datasets_dir.mkdir(parents=True, exist_ok=True)
         output_models_dir.mkdir(parents=True, exist_ok=True)
 
-        # Buat dataset dengan format paragraf (\n\n)
+        # Dataset dengan domain prefix
         sample_file = datasets_dir / "sample.txt"
         sample_file.write_text(
-            "Mobil adalah kendaraan beroda empat. "
-            "Mobil menggunakan mesin sebagai penggerak utama. "
-            "Bahan bakar digunakan untuk menghasilkan tenaga.\n\n"
-            "Kucing adalah hewan peliharaan yang lucu. "
-            "Kucing suka bermain dan tidur. "
-            "Kucing membutuhkan makanan dan air.\n\n"
-            "Teknologi berkembang sangat pesat. "
-            "Komputer dan internet mengubah cara hidup manusia. "
-            "Kecerdasan buatan menjadi tren masa depan.",
+            "[MOBIL] Mobil adalah kendaraan beroda empat. "
+            "Mobil menggunakan mesin sebagai penggerak utama.\n\n"
+            "[SAINS] Air adalah senyawa kimia dengan rumus H2O. "
+            "Air merupakan kebutuhan mendasar bagi makhluk hidup.",
             encoding="utf-8",
         )
 
@@ -958,30 +851,19 @@ if __name__ == "__main__":
             config=small_config,
         )
 
+        # Test domain prefix stripping
+        print("Testing domain prefix stripping...")
+        test_text = "[MOBIL] Mobil adalah kendaraan."
+        clean_text = trainer._strip_domain_prefix(test_text)
+        print(f"  Original: {test_text}")
+        print(f"  Cleaned : {clean_text}")
+
         # Test paragraph loading
-        print("Testing paragraph loading...")
+        print("\nTesting paragraph loading...")
         rng = np.random.default_rng(1337)
         paragraphs = trainer._load_all_paragraphs(rng=rng)
-        print(f"Number of paragraphs: {len(paragraphs)}")
+        print(f"  Number of paragraphs: {len(paragraphs)}")
         for i, p in enumerate(paragraphs):
             print(f"  Paragraph {i+1}: {p[:60]}...")
-
-        # Test Document Boundary
-        print("\nTesting Document Boundary...")
-        for i, p in enumerate(paragraphs[:2]):
-            examples = list(trainer._paragraph_to_examples(p))
-            print(f"  Paragraph {i+1} -> {len(examples)} example(s)")
-            for j, ex in enumerate(examples):
-                print(f"    Example {j+1}: {ex[:10]}... (len={len(ex)})")
-
-        # Test train_steps
-        print("\nTesting train_steps...")
-        result = trainer.train_steps(steps=5, verbose=True)
-        print(f"Result: {result}")
-
-        # Test train_epochs_inline
-        print("\nTesting train_epochs_inline...")
-        result = trainer.train_epochs_inline(epochs=2, verbose=True)
-        print(f"Result: {result}")
 
         print("\npipeline/trainer.py test OK")

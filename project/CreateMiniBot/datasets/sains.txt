@@ -1,15 +1,15 @@
-Air adalah senyawa kimia yang tersusun dari dua atom hidrogen dan satu atom oksigen. Senyawa ini memiliki rumus kimia H2O dan menjadi kebutuhan mendasar bagi seluruh makhluk hidup di bumi. Air dapat ditemukan dalam tiga wujud, yaitu padat, cair, dan gas, tergantung pada suhu dan tekanan lingkungannya.
+[SAINS] Air adalah senyawa kimia dengan rumus H2O yang tersusun dari dua atom hidrogen dan satu atom oksigen. Air merupakan kebutuhan mendasar bagi seluruh makhluk hidup.
 
-Fotosintesis adalah proses pembuatan makanan yang dilakukan oleh tumbuhan hijau. Proses ini membutuhkan cahaya matahari, air, dan karbon dioksida untuk menghasilkan glukosa dan oksigen. Tanpa fotosintesis, kehidupan di bumi tidak akan mampu bertahan karena pasokan oksigen akan habis.
+[SAINS] Fotosintesis adalah proses pembuatan makanan yang dilakukan oleh tumbuhan hijau. Proses ini membutuhkan cahaya matahari, air, dan karbon dioksida untuk menghasilkan glukosa dan oksigen.
 
-Bumi berputar pada porosnya sendiri dalam waktu dua puluh empat jam. Gerakan ini disebut sebagai rotasi dan menyebabkan terjadinya siang dan malam secara bergantian. Selain rotasi, bumi juga melakukan revolusi mengelilingi matahari yang membutuhkan waktu tiga ratus enam puluh lima hari.
+[SAINS] Gravitasi adalah gaya tarik-menarik antara dua benda yang memiliki massa. Gaya ini ditemukan oleh Isaac Newton dan membuat semua benda tetap berada di permukaan bumi.
 
-Gravitasi adalah gaya tarik-menarik antara dua benda yang memiliki massa. Gaya ini ditemukan oleh Isaac Newton setelah ia mengamati apel yang jatuh dari pohonnya. Gravitasi bumi membuat semua benda tetap berada di permukaan dan tidak melayang ke angkasa.
+[SAINS] Bumi berputar pada porosnya sendiri dalam waktu dua puluh empat jam. Gerakan rotasi ini menyebabkan terjadinya siang dan malam secara bergantian.
 
-Matahari adalah bintang terdekat dengan bumi yang menjadi pusat tata surya. Suhu di permukaannya mencapai lima ribu lima ratus derajat Celsius, sedangkan di intinya bisa mencapai lima belas juta derajat Celsius. Energi matahari dihasilkan dari reaksi fusi nuklir yang mengubah hidrogen menjadi helium.
+[SAINS] Matahari adalah bintang terdekat dengan bumi yang menjadi pusat tata surya. Energi matahari dihasilkan dari reaksi fusi nuklir yang mengubah hidrogen menjadi helium.
 
-Awan adalah kumpulan titik-titik air atau kristal es yang melayang di atmosfer. Pembentukan awan terjadi ketika uap air mengalami kondensasi karena penurunan suhu di ketinggian. Berdasarkan bentuknya, awan dibagi menjadi beberapa jenis seperti cumulus, stratus, dan cirrus.
+[SAINS] Awan adalah kumpulan titik-titik air atau kristal es yang melayang di atmosfer. Pembentukan awan terjadi ketika uap air mengalami kondensasi karena penurunan suhu.
 
-Pelangi adalah fenomena optik yang terjadi ketika cahaya matahari dibiaskan oleh tetesan air hujan. Cahaya putih matahari terurai menjadi tujuh warna, yaitu merah, jingga, kuning, hijau, biru, nila, dan ungu. Pelangi biasanya muncul setelah hujan reda ketika matahari kembali bersinar.
+[SAINS] Pelangi adalah fenomena optik yang terjadi ketika cahaya matahari dibiaskan oleh tetesan air hujan. Cahaya putih terurai menjadi tujuh warna yang indah.
 
-Gunung berapi adalah lubang di permukaan bumi yang dapat memuntahkan lava, abu, dan gas. Letusan gunung berapi terjadi karena tekanan magma dari dalam perut bumi yang mencari jalan keluar. Indonesia memiliki banyak gunung berapi aktif karena terletak di Ring of Fire.
+[SAINS] Gunung berapi adalah lubang di permukaan bumi yang dapat memuntahkan lava, abu, dan gas. Indonesia memiliki banyak gunung berapi aktif karena terletak di Ring of Fire.
