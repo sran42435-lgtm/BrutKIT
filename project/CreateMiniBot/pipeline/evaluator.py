@@ -10,6 +10,11 @@
 # 5. Menyediakan should_export() untuk membantu keputusan export model.
 # 6. Sanitasi logits dari NaN/Inf untuk mencegah loss beku.
 #
+# Perubahan SOTA Batch 5 - Document Boundary:
+# - Loss masking untuk token [PAD], [EOS], dan <|endoftext|>
+# - Model tidak belajar memprediksi token pemisah dokumen
+# - Mencegah topic drift antar dokumen
+#
 # Implementasi:
 # - Tidak memakai framework ML siap pakai.
 # - Memakai NumPy sebagai pustaka primitif numerik.
@@ -29,12 +34,6 @@ from typing import Dict, Iterable, Optional, Tuple
 # ============================================================================
 # FIX IMPORT PATH
 # ============================================================================
-# Memastikan project root ada di sys.path, sehingga file di dalam folder
-# pipeline/ tetap bisa meng-import config.py meskipun dijalankan langsung:
-#   python pipeline/evaluator.py
-# atau:
-#   cd pipeline && python evaluator.py
-
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if str(_PROJECT_ROOT) not in sys.path:
@@ -56,7 +55,6 @@ from config import CONFIG, Config
 
 
 # Batas clipping logits untuk mencegah overflow softmax.
-# Nilai 50 cukup besar untuk membedakan kelas tapi tidak menyebabkan overflow.
 LOGIT_CLIP_VALUE = 50.0
 
 
@@ -76,8 +74,18 @@ class Evaluator:
     def __init__(self, config: Config = CONFIG):
         self.config = config
 
-        # Secara default token [PAD] diabaikan saat menghitung loss.
+        # Token yang diabaikan saat menghitung loss.
+        # Model tidak belajar memprediksi token-token ini.
         self.ignore_index = int(config.special_tokens.pad_id)
+        self.eos_id = int(config.special_tokens.eos_id)
+        self.endoftext_id = int(config.special_tokens.endoftext_id)
+
+        # Set token yang harus di-ignore: PAD, EOS, dan endoftext
+        self._ignore_token_ids = frozenset({
+            self.ignore_index,
+            self.eos_id,
+            self.endoftext_id,
+        })
 
     # ========================================================================
     # PUBLIC API
@@ -255,6 +263,7 @@ class Evaluator:
         Fitur tambahan:
         - Sanitasi logits dari NaN/Inf
         - Clipping logits untuk mencegah overflow
+        - Ignore [PAD], [EOS], dan  di loss computation
         """
         logits = np.asarray(logits, dtype=np.float32)
         targets = np.asarray(targets, dtype=np.int64)
@@ -288,7 +297,7 @@ class Evaluator:
         logits = np.clip(logits, -LOGIT_CLIP_VALUE, LOGIT_CLIP_VALUE)
 
         # --------------------------------------------------------------------
-        # Tentukan ignore index
+        # Tentukan ignore index (parameter override)
         # --------------------------------------------------------------------
         if ignore_index is None:
             resolved_ignore_index = self.ignore_index
@@ -296,10 +305,21 @@ class Evaluator:
             resolved_ignore_index = int(ignore_index)
 
         # --------------------------------------------------------------------
-        # Valid mask
+        # Valid mask: token yang dihitung di loss
         # --------------------------------------------------------------------
         valid_mask = (targets >= 0) & (targets < V)
 
+        # --------------------------------------------------------------------
+        # DOCUMENT BOUNDARY: Ignore token pemisah dokumen
+        # Model tidak belajar memprediksi:
+        # - [PAD] (padding)
+        # - [EOS] (end of sequence)
+        # -  (document boundary)
+        # --------------------------------------------------------------------
+        for ignore_id in self._ignore_token_ids:
+            valid_mask = valid_mask & (targets != ignore_id)
+
+        # Juga tambahkan ignore_index dari parameter (untuk kompatibilitas)
         if resolved_ignore_index is not None and resolved_ignore_index >= 0:
             valid_mask = valid_mask & (targets != resolved_ignore_index)
 
@@ -386,6 +406,7 @@ class Evaluator:
             grad_logits[batch_idx, time_idx, safe_targets] -= 1.0
 
             # Token invalid tidak boleh mengirim gradient
+            # (termasuk PAD, EOS, dan )
             grad_logits *= valid_mask[:, :, None].astype(np.float32)
 
             # Normalisasi terhadap jumlah token valid
@@ -456,11 +477,12 @@ if __name__ == "__main__":
     logits = rng.normal(size=(B, T, V)).astype(np.float32)
 
     # Target contoh.
-    # Token 0 adalah [PAD] pada config default, sehingga akan diabaikan.
+    # Token 0 adalah [PAD], 3 adalah [EOS], 4 adalah 
+    # Semua akan diabaikan di loss computation.
     targets = np.array(
         [
-            [1, 2, 3, 0],
-            [2, 0, 0, 0],
+            [1, 2, 3, 0],   # 3 dan 0 di-ignore
+            [2, 4, 0, 0],   # 4 dan 0 di-ignore
         ],
         dtype=np.int64,
     )
@@ -492,3 +514,12 @@ if __name__ == "__main__":
     loss3, grad3, metrics3 = evaluator.compute_loss_and_grad(nan_logits, nan_targets)
     print(f"Loss dengan logits NaN : {loss3:.6f}")
     print(f"Grad finite: {np.all(np.isfinite(grad3))}")
+
+    # Test dengan token  (ID=4)
+    print("\nTest dengan token ...")
+    test_logits = rng.normal(size=(1, 5, V)).astype(np.float32)
+    test_targets = np.array([[1, 2, 4, 4, 1]], dtype=np.int64)  # 4 = endoftext
+
+    loss4, grad4, metrics4 = evaluator.compute_loss_and_grad(test_logits, test_targets)
+    print(f"Valid tokens (harus 3, bukan 5): {metrics4['num_valid_tokens']}")
+    print(f"Token  (ID=4) berhasil di-ignore di loss computation.")

@@ -10,6 +10,11 @@
 # 4. Encode teks -> token ID
 # 5. Decode token ID -> teks
 #
+# Perubahan SOTA Batch 5 - Document Boundary:
+# - Menambahkan token  (pemisah dokumen)
+# - Token ini tidak dipecah oleh BPE dan selalu diperlakukan sebagai satu kesatuan
+# - Digunakan untuk mencegah topic drift antar dokumen
+#
 # Keterhubungan:
 # - config.py      : membaca path, vocab size, dan special tokens
 # - trainer.py     : menyiapkan input berbasis token ID
@@ -48,6 +53,7 @@ class Tokenizer:
     - BPE dipelajari dari frekuensi pasangan token dasar.
     - Vocabulary dipaksa sesuai config.model.vocab_size dengan menambahkan
       token [UNUSED_x] jika jumlah token hasil training belum mencukupi.
+    -  diperlakukan sebagai special token dan tidak dipecah oleh BPE.
     """
 
     SPACE_MARKER = "▁"
@@ -63,11 +69,13 @@ class Tokenizer:
         self.unk_token: str = config.special_tokens.unk
         self.bos_token: str = config.special_tokens.bos
         self.eos_token: str = config.special_tokens.eos
+        self.endoftext_token: str = config.special_tokens.endoftext
 
         self.pad_id: int = config.special_tokens.pad_id
         self.unk_id: int = config.special_tokens.unk_id
         self.bos_id: int = config.special_tokens.bos_id
         self.eos_id: int = config.special_tokens.eos_id
+        self.endoftext_id: int = config.special_tokens.endoftext_id
 
         self.special_ordered: Tuple[str, ...] = config.special_tokens.ordered_tokens
         self._special_set = frozenset(self.special_ordered)
@@ -106,7 +114,7 @@ class Tokenizer:
         self._validate_target_vocab()
 
         word_freq, char_freq = self._build_corpus_statistics()
-        
+
         # Jika dataset kosong, char_freq akan kosong.
         # Kita tetap bangun vocab dengan special tokens dan padding.
         token_to_id = self._build_initial_vocab(char_freq)
@@ -198,6 +206,7 @@ class Tokenizer:
                 "unk": self.unk_token,
                 "bos": self.bos_token,
                 "eos": self.eos_token,
+                "endoftext": self.endoftext_token,
             },
             "token_to_id": self.token_to_id,
             "merges": [[a, b] for a, b in self.merges],
@@ -241,10 +250,40 @@ class Tokenizer:
     def encode_to_tokens(self, text: str) -> List[str]:
         """
         Mengubah teks menjadi daftar token string sebelum dikonversi ke ID.
+
+        PERUBAHAN SOTA:
+        - Token  dideteksi dan dipisahkan dari teks utama
+        - Setiap kemunculan  menjadi satu token utuh
+        - Bagian teks lainnya diproses seperti biasa
         """
         self._ensure_ready()
 
-        normalized = self._normalize_text(str(text))
+        text = str(text)
+        if not text.strip():
+            return []
+
+        # ============================================================
+        # DETEKSI DAN PISAHKAN 
+        # ============================================================
+        parts = text.split(self.endoftext_token)
+        all_tokens: List[str] = []
+
+        for idx, part in enumerate(parts):
+            # Encode bagian teks biasa
+            part_tokens = self._encode_text_part(part)
+            all_tokens.extend(part_tokens)
+
+            # Tambahkan token  jika bukan bagian terakhir
+            if idx < len(parts) - 1:
+                all_tokens.append(self.endoftext_token)
+
+        return all_tokens
+
+    def _encode_text_part(self, text: str) -> List[str]:
+        """
+        Encode bagian teks biasa (tanpa ).
+        """
+        normalized = self._normalize_text(text)
         if not normalized:
             return []
 
@@ -308,6 +347,30 @@ class Tokenizer:
         text = re.sub(r"\s+", " ", text).strip()
 
         return text
+
+    def get_token_pieces(self, token_ids: Iterable[int]) -> List[str]:
+        """
+        Mengubah daftar token ID menjadi daftar token string (subword).
+        Method ini disediakan khusus untuk kompatibilitas dengan
+        debug mode di playground.py.
+        """
+        self._ensure_ready()
+
+        pieces: List[str] = []
+        for token_id in token_ids:
+            try:
+                tid = int(token_id)
+            except (TypeError, ValueError):
+                pieces.append(f"<invalid:{token_id}>")
+                continue
+
+            token = self.id_to_token.get(tid)
+            if token is None:
+                pieces.append(f"<{tid}>")
+            else:
+                pieces.append(token)
+
+        return pieces
 
     # ======================================================================
     # INTERNAL: VALIDATION
@@ -454,6 +517,7 @@ class Tokenizer:
     def _build_initial_vocab(self, char_freq: Counter) -> Dict[str, int]:
         token_to_id: Dict[str, int] = {}
 
+        # Tambahkan semua special tokens (termasuk )
         for token in self.special_ordered:
             token_to_id[token] = len(token_to_id)
 
@@ -674,6 +738,7 @@ if __name__ == "__main__":
     )
 
     tokens = tokenizer.encode_to_tokens(sample_text)
+    token_pieces = tokenizer.get_token_pieces(token_ids)
     decoded = tokenizer.decode(token_ids, skip_special_tokens=True)
 
     print("Tokenizer ready.")
@@ -682,4 +747,21 @@ if __name__ == "__main__":
     print(f"Sample text       : {sample_text}")
     print(f"Tokens            : {tokens}")
     print(f"Token IDs         : {token_ids}")
+    print(f"Token Pieces      : {token_pieces}")
     print(f"Decoded           : {decoded}")
+
+    # Test dengan 
+    print("\n--- Test dengan  ---")
+    test_text = "Mobil adalah kendaraan.  Kucing adalah hewan."
+    test_ids = tokenizer.encode(test_text, add_bos=True, add_eos=True)
+    test_tokens = tokenizer.encode_to_tokens(test_text)
+    test_pieces = tokenizer.get_token_pieces(test_ids)
+    test_decoded = tokenizer.decode(test_ids, skip_special_tokens=True)
+    test_decoded_full = tokenizer.decode(test_ids, skip_special_tokens=False)
+
+    print(f"Input text        : {test_text}")
+    print(f"Tokens            : {test_tokens}")
+    print(f"Token IDs         : {test_ids}")
+    print(f"Token Pieces      : {test_pieces}")
+    print(f"Decoded (skip)    : {test_decoded}")
+    print(f"Decoded (full)    : {test_decoded_full}")

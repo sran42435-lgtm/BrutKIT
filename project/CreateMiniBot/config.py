@@ -104,16 +104,18 @@ class SpecialTokensConfig:
     1 -> [UNK]
     2 -> [BOS]
     3 -> [EOS]
+    4 -> <|endoftext|>  (pemisah dokumen, untuk mencegah topic drift)
     """
 
     pad: str = "[PAD]"
     unk: str = "[UNK]"
     bos: str = "[BOS]"
     eos: str = "[EOS]"
+    endoftext: str = "<|endoftext|>"
 
     @property
     def ordered_tokens(self) -> Tuple[str, ...]:
-        return (self.pad, self.unk, self.bos, self.eos)
+        return (self.pad, self.unk, self.bos, self.eos, self.endoftext)
 
     @property
     def token_to_id(self) -> Dict[str, int]:
@@ -134,6 +136,10 @@ class SpecialTokensConfig:
     @property
     def eos_id(self) -> int:
         return 3
+
+    @property
+    def endoftext_id(self) -> int:
+        return 4
 
 
 # ==============================================================================
@@ -321,7 +327,8 @@ class Config:
         if m.vocab_size < len(s.ordered_tokens):
             raise ValueError(
                 "model.vocab_size terlalu kecil. "
-                "Minimal harus menampung seluruh special tokens."
+                f"Minimal harus {len(s.ordered_tokens)} untuk menampung seluruh "
+                f"special tokens: {s.ordered_tokens}"
             )
 
         # ------------------------------------------------------------------
@@ -482,6 +489,13 @@ if __name__ == "__main__":
     print(f"Vocab path          : {CONFIG.paths.vocab_path}")
     print(f"Final model path    : {CONFIG.paths.final_model_path}")
     print(f"Checkpoint path     : {CONFIG.paths.checkpoint_path}")
+    print()
+    print("Special tokens:")
+    print(f"  [PAD]              : {CONFIG.special_tokens.pad_id}")
+    print(f"  [UNK]              : {CONFIG.special_tokens.unk_id}")
+    print(f"  [BOS]              : {CONFIG.special_tokens.bos_id}")
+    print(f"  [EOS]              : {CONFIG.special_tokens.eos_id}")
+    print(f"  <|endoftext|>      : {CONFIG.special_tokens.endoftext_id}")
     print()
     print("Training config:")
     print(f"  learning_rate                : {CONFIG.training.learning_rate}")
