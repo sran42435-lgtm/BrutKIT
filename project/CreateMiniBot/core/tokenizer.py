@@ -4,7 +4,13 @@
 #
 # Perbaikan SOTA:
 # - Token  dideteksi dan dipisahkan sebagai special token
-# - Tidak dipecah oleh BPE, selalu menjadi satu token utuh
+# - Tidak dipecah oleh BPE, selalu diperlakukan sebagai satu kesatuan
+# - GUARD: handle endoftext_token kosong (empty separator)
+#
+# Catatan:
+# - Tokenizer TIDAK otomatis menambah BOS/EOS/endoftext saat encode
+# - Special token ditambahkan oleh trainer._paragraph_to_examples()
+# - Untuk menambah manual: encode(text, add_bos=True, add_eos=True)
 
 from __future__ import annotations
 
@@ -30,6 +36,11 @@ class Tokenizer:
     - Token  dipisahkan dari teks utama
     - Setiap kemunculan  menjadi satu token utuh
     - Bagian teks lainnya diproses seperti biasa
+    
+    Catatan penting:
+    - Tokenizer TIDAK otomatis menambah BOS/EOS/endoftext
+    - Trainer bertanggung jawab menambah special token saat training
+    - Gunakan encode(text, add_bos=True, add_eos=True) untuk manual
     """
 
     SPACE_MARKER = "▁"
@@ -45,7 +56,14 @@ class Tokenizer:
         self.unk_token: str = config.special_tokens.unk
         self.bos_token: str = config.special_tokens.bos
         self.eos_token: str = config.special_tokens.eos
-        self.endoftext_token: str = config.special_tokens.endoftext
+        
+        # GUARD: Pastikan endoftext_token tidak kosong
+        # Jika kosong (karena markdown rendering), gunakan fallback
+        raw_endoftext = config.special_tokens.endoftext
+        if not raw_endoftext:
+            # Fallback: reconstruct dari string literal
+            raw_endoftext = '<' + '|' + 'endoftext' + '|' + '>'
+        self.endoftext_token: str = raw_endoftext
 
         self.pad_id: int = config.special_tokens.pad_id
         self.unk_id: int = config.special_tokens.unk_id
@@ -179,11 +197,20 @@ class Tokenizer:
         text: str,
         add_bos: bool = False,
         add_eos: bool = False,
+        add_endoftext: bool = False,
     ) -> List[int]:
         """
         Mengubah teks menjadi daftar token ID.
         
-        PENTING: Token  dideteksi dan di-encode sebagai ID khusus.
+        Parameter:
+        - text: teks yang akan di-encode
+        - add_bos: tambahkan [BOS] (ID 2) di awal
+        - add_eos: tambahkan [EOS] (ID 3) di akhir
+        - add_endoftext: tambahkan  (ID 4) di akhir
+        
+        Catatan:
+        - Token  yang ada di dalam teks akan otomatis dideteksi
+        - add_endoftext hanya menambah 1 token di akhir (jika True)
         """
         self._ensure_ready()
 
@@ -198,6 +225,9 @@ class Tokenizer:
         if add_eos:
             ids = ids + [self.eos_id]
 
+        if add_endoftext:
+            ids = ids + [self.endoftext_id]
+
         return ids
 
     def encode_to_tokens(self, text: str) -> List[str]:
@@ -208,6 +238,7 @@ class Tokenizer:
         - Token  dideteksi dan dipisahkan dari teks utama
         - Setiap kemunculan  menjadi satu token utuh
         - Bagian teks lainnya diproses seperti biasa
+        - GUARD: jika endoftext_token kosong, skip splitting
         """
         self._ensure_ready()
 
@@ -216,10 +247,21 @@ class Tokenizer:
             return []
 
         # ============================================================
+        # GUARD: Jika endoftext_token kosong, skip splitting
+        # ============================================================
+        if not self.endoftext_token:
+            return self._encode_text_part(text)
+
+        # ============================================================
         # DETEKSI DAN PISAHKAN 
         # ============================================================
         # Split teks berdasarkan 
-        parts = text.split(self.endoftext_token)
+        try:
+            parts = text.split(self.endoftext_token)
+        except ValueError:
+            # Fallback jika split gagal (empty separator)
+            return self._encode_text_part(text)
+            
         all_tokens: List[str] = []
 
         for idx, part in enumerate(parts):
@@ -334,6 +376,9 @@ class Tokenizer:
 
     def _validate_loaded_vocab(self) -> None:
         for token in self.special_ordered:
+            # GUARD: Skip validasi jika token kosong
+            if not token:
+                continue
             if token not in self.token_to_id:
                 raise ValueError(
                     f"Special token {token} tidak ditemukan di vocab.json."
@@ -465,7 +510,14 @@ class Tokenizer:
         token_to_id: Dict[str, int] = {}
 
         # Tambahkan semua special tokens (termasuk )
+        # GUARD: Skip jika token kosong
         for token in self.special_ordered:
+            if not token:
+                # Jika token kosong (e.g. endoftext), gunakan fallback
+                if len(token_to_id) == 4:  # index 4 = endoftext
+                    fallback_token = '<' + '|' + 'endoftext' + '|' + '>'
+                    token_to_id[fallback_token] = len(token_to_id)
+                continue
             token_to_id[token] = len(token_to_id)
 
         if len(token_to_id) >= self.target_vocab_size:
@@ -676,6 +728,15 @@ if __name__ == "__main__":
     tokenizer = Tokenizer()
     tokenizer.train()
 
+    # Verifikasi endoftext_token
+    print("=" * 60)
+    print("Tokenizer Verification")
+    print("=" * 60)
+    print(f"endoftext_token : {repr(tokenizer.endoftext_token)}")
+    print(f"endoftext_id    : {tokenizer.endoftext_id}")
+    print(f"Is empty?       : {not tokenizer.endoftext_token}")
+    print()
+
     sample_text = "Apa itu mobil?"
 
     token_ids = tokenizer.encode(
@@ -697,11 +758,17 @@ if __name__ == "__main__":
     print(f"Token Pieces      : {token_pieces}")
     print(f"Decoded           : {decoded}")
 
-    # Test dengan 
+    # ================================================================
+    # Test dengan document boundary
+    # ================================================================
     print("\n" + "=" * 60)
     print("TEST: Document Boundary Token")
     print("=" * 60)
-    test_text = "Mobil adalah kendaraan.  Kucing adalah hewan."
+    
+    # Gunakan fallback token jika endoftext kosong
+    eot_token = tokenizer.endoftext_token or '<|endoftext|>'
+    test_text = f"Mobil adalah kendaraan. {eot_token} Kucing adalah hewan."
+    
     test_ids = tokenizer.encode(test_text, add_bos=True, add_eos=True)
     test_tokens = tokenizer.encode_to_tokens(test_text)
     test_pieces = tokenizer.get_token_pieces(test_ids)
@@ -712,3 +779,25 @@ if __name__ == "__main__":
     print(f"Token Pieces      : {test_pieces}")
     print(f"endoftext in tokens: {tokenizer.endoftext_token in test_tokens}")
     print(f"endoftext_id in IDs: {tokenizer.endoftext_id in test_ids}")
+    
+    # ================================================================
+    # Test dengan trainer-style encoding
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("TEST: Trainer-Style Encoding")
+    print("=" * 60)
+    
+    paragraph = "[MOBIL] Mobil adalah kendaraan beroda empat."
+    ids_no_special = tokenizer.encode(paragraph, add_bos=False, add_eos=False)
+    ids_with_special = tokenizer.encode(paragraph, add_bos=True, add_eos=True, add_endoftext=True)
+    
+    print(f"Paragraph         : {paragraph}")
+    print(f"IDs (no special)  : {ids_no_special}")
+    print(f"IDs (+BOS/EOS/EOT): {ids_with_special}")
+    print()
+    print("Struktur IDs dengan special tokens:")
+    print(f"  [BOS]       = 2  (di awal)")
+    print(f"  teks        = {ids_no_special[:3]}... (middle)")
+    print(f"  [EOS]       = 3  (di akhir teks)")
+    print(f"  <> = 4  (document boundary)")
+    print(f"  [PAD]       = 0  (akan ditambahkan oleh trainer)")

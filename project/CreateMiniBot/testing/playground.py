@@ -1,25 +1,29 @@
 # testing/playground.py
 #
-# Playground / Inference Testing Engine.
+# Playground / Inference Testing Engine dengan MoE Auto-Routing.
 #
-# Perubahan SOTA Batch 7 - Anti Semantic Drift:
-# - Temperature diturunkan ke 0.3 (lebih deterministik)
-# - Top-K diperketat ke 20 (filtering lebih ketat)
-# - Top-P diperketat ke 0.85 (nucleus sampling lebih fokus)
-# - Stop generation saat encounter 
-# - endoftext_id ditambahkan ke forbidden tokens
-# - Domain-aware inference: command /domain untuk set prefix default
+# Fitur Utama:
+# - Anti Semantic Drift: temperature rendah, top-k/top-p ketat
+# - MoE Auto-Routing: otomatis pilih LM head berdasarkan domain
+# - Semantic Context Injection: inject paragraf relevan ke prompt
+# - Domain-Aware Inference: manual prefix via /domain
+# - Stop generation saat  atau [EOS]
+# - Debug mode: tampilkan token IDs dan pieces
 #
 # Perintah interactive (slash commands):
 #   /help                  : tampilkan bantuan
-#   /training              : latih model (step default dari config)
+#   /training              : latih model (step default)
 #   /training 100          : latih model 100 step
 #   /training --steps 100  : latih model 100 step
 #   /training --epochs 10  : latih model 10 epoch
 #   /training --epochs 10 --steps 50 : latih 10 epoch, minimal 50 step
 #   /status                : tampilkan status model
-#   /domain [NAMA]         : set domain prefix default (contoh: /domain MOBIL)
-#   /domain                : hapus domain prefix default
+#   /domain MOBIL          : set domain prefix manual
+#   /domain                : hapus domain prefix manual
+#   /domains               : list semua domain yang tersedia (MoE)
+#   /auto [on|off]         : toggle auto-routing MoE (BARU)
+#   /force DOMAIN          : force domain untuk testing (BARU)
+#   /force                 : hapus force domain (BARU)
 #   /exit                  : keluar
 #
 # Semua input tanpa prefix / dianggap sebagai prompt inference.
@@ -53,6 +57,14 @@ except ImportError as exc:
 
 from config import CONFIG, Config
 
+# Import DomainRouter untuk MoE auto-routing (optional)
+try:
+    from core.router import DomainRouter
+    _ROUTER_AVAILABLE = True
+except ImportError:
+    DomainRouter = None
+    _ROUTER_AVAILABLE = False
+
 
 # Regex untuk mendeteksi domain prefix
 DOMAIN_PREFIX_PATTERN = re.compile(r'^\[([A-Z]+)\]\s*')
@@ -60,13 +72,17 @@ DOMAIN_PREFIX_PATTERN = re.compile(r'^\[([A-Z]+)\]\s*')
 
 class Playground:
     """
-    Tempat testing pertanyaan / inference.
+    Tempat testing pertanyaan / inference dengan MoE Auto-Routing.
 
     Fitur Anti Semantic Drift:
     - Temperature rendah (0.3) untuk determinisme
     - Top-K/Top-P ketat untuk filtering
     - Stop generation saat 
-    - Domain-aware inference dengan command /domain
+
+    Fitur MoE (BARU):
+    - Auto-routing: otomatis pilih LM head berdasarkan keyword di prompt
+    - Semantic context injection: inject paragraf relevan ke prompt
+    - Domain info: /domains untuk list domain, /force untuk testing
 
     Perintah interactive (slash commands):
         /help                  : tampilkan bantuan
@@ -76,8 +92,12 @@ class Playground:
         /training --epochs 10  : latih model 10 epoch
         /training --epochs 10 --steps 50 : latih 10 epoch, minimal 50 step
         /status                : tampilkan status model
-        /domain MOBIL          : set domain prefix default
-        /domain                : hapus domain prefix default
+        /domain MOBIL          : set domain prefix manual
+        /domain                : hapus domain prefix manual
+        /domains               : list semua domain yang tersedia
+        /auto [on|off]         : toggle auto-routing MoE
+        /force DOMAIN          : force domain untuk testing
+        /force                 : hapus force domain
         /exit                  : keluar
     """
 
@@ -103,6 +123,9 @@ class Playground:
     # Default step untuk /training tanpa argumen
     DEFAULT_INLINE_TRAINING_STEPS = 10
 
+    # Domain fallback jika router tidak bisa menentukan
+    FALLBACK_DOMAIN = "GENERAL"
+
     def __init__(self, model, tokenizer, config: Config = CONFIG, trainer=None):
         self.model = model
         self.tokenizer = tokenizer
@@ -120,8 +143,188 @@ class Playground:
 
         self._forbidden_cache: Optional[List[int]] = None
         
-        # Domain prefix default untuk domain-aware inference
+        # Domain prefix manual untuk domain-aware inference
         self._default_domain: Optional[str] = None
+        
+        # ============================================================
+        # MoE STATE (BARU)
+        # ============================================================
+        self._router: Optional[object] = None  # DomainRouter instance
+        self._auto_routing: bool = bool(getattr(config.model, 'moe_auto_routing', True))
+        self._force_domain: Optional[str] = None
+        self._use_moe: bool = bool(getattr(config.model, 'use_moe', False))
+        self._semantic_top_k: int = int(getattr(config.model, 'moe_semantic_top_k', 2))
+        
+        # Routing stats untuk debugging
+        self._routing_stats: Dict[str, int] = {}
+        
+        # Auto-setup router jika tersedia
+        self._setup_router()
+
+    # ========================================================================
+    # MoE SETUP
+    # ========================================================================
+
+    def _setup_router(self) -> None:
+        """
+        Setup DomainRouter dari trainer (jika tersedia).
+        
+        Urutan pencarian:
+        1. Dari trainer.get_router() (jika sudah di-build saat training)
+        2. Dari cache file di output folder (jika ada)
+        """
+        if not _ROUTER_AVAILABLE:
+            return
+        
+        if not self._use_moe:
+            return
+        
+        # ============================================================
+        # Opsi 1: Dari trainer
+        # ============================================================
+        if self.trainer is not None:
+            router = None
+            if hasattr(self.trainer, "get_router"):
+                router = self.trainer.get_router()
+            
+            if router is not None:
+                self._router = router
+                print(f"[playground] MoE router dimuat dari trainer.")
+                print(f"[playground] Domains tersedia: {list(router.domain_keywords.keys())}")
+                return
+        
+        # ============================================================
+        # Opsi 2: Dari cache file
+        # ============================================================
+        try:
+            router = DomainRouter(self.config)
+            
+            keywords_path = Path(self.config.paths.output_models_dir) / "domain_keywords.json"
+            cache_path = Path(self.config.paths.output_models_dir) / "semantic_cache.npz"
+            
+            keywords_loaded = router.load_keywords(keywords_path)
+            cache_loaded = router.load_cache(cache_path)
+            
+            if keywords_loaded:
+                self._router = router
+                domains = list(router.domain_keywords.keys())
+                print(f"[playground] MoE router dimuat dari cache.")
+                print(f"[playground] Domains tersedia: {domains}")
+                if cache_loaded:
+                    print(f"[playground] Semantic cache dimuat: {len(router.search_engine.domain_embeddings)} domain")
+            else:
+                print(f"[playground] MoE router tidak tersedia (keywords belum dibangun).")
+                print(f"[playground] Jalankan training dulu untuk membangun router.")
+        except Exception as exc:
+            print(f"[playground] Warning: Gagal setup router: {exc}")
+
+    # ========================================================================
+    # MoE ROUTING (BARU)
+    # ========================================================================
+
+    def _route_prompt(self, prompt: str) -> Tuple[str, float]:
+        """
+        Route prompt ke domain menggunakan router.
+        
+        Return:
+        - (domain, confidence)
+        - Jika router tidak tersedia, return (None, 0.0)
+        """
+        # Force domain punya prioritas tertinggi
+        if self._force_domain is not None:
+            return (self._force_domain, 1.0)
+        
+        # Manual domain prefix (untuk backward compat)
+        if self._default_domain is not None:
+            return (self._default_domain, 0.9)
+        
+        # Auto routing via router
+        if self._router is not None and self._auto_routing:
+            available_domains = None
+            if hasattr(self.model, "list_domains"):
+                available_domains = self.model.list_domains()
+            
+            domain, confidence, _ = self._router.route(
+                prompt,
+                available_domains=available_domains,
+            )
+            
+            # Track stats
+            self._routing_stats[domain] = self._routing_stats.get(domain, 0) + 1
+            
+            return (domain, confidence)
+        
+        return (None, 0.0)
+
+    def _inject_semantic_context(self, prompt: str, domain: Optional[str]) -> Tuple[str, List[str]]:
+        """
+        Inject paragraf relevan ke prompt via semantic search.
+        
+        Return:
+        - (augmented_prompt, context_paragraphs)
+        """
+        # Skip jika tidak ada router atau semantic search disabled
+        if self._router is None:
+            return (prompt, [])
+        
+        if self._semantic_top_k <= 0:
+            return (prompt, [])
+        
+        if not hasattr(self._router, "search_engine"):
+            return (prompt, [])
+        
+        if not self._router.search_engine.domain_embeddings:
+            return (prompt, [])
+        
+        # Skip semantic search jika prompt sudah sangat panjang
+        # (untuk menghemat context window)
+        if len(prompt.split()) > 20:
+            return (prompt, [])
+        
+        try:
+            paragraphs, similarities = self._router.semantic_search(
+                prompt=prompt,
+                model=self.model,
+                tokenizer=self.tokenizer,
+                domain=domain,
+                top_k=self._semantic_top_k,
+            )
+            
+            if not paragraphs:
+                return (prompt, [])
+            
+            # Format context injection
+            context_lines = []
+            for para, sim in zip(paragraphs, similarities):
+                # Truncate paragraf jika terlalu panjang
+                para_truncated = para[:200] + "..." if len(para) > 200 else para
+                context_lines.append(f"- {para_truncated}")
+            
+            context_text = "\n".join(context_lines)
+            
+            # Format: context dulu, lalu prompt
+            augmented = f"Berdasarkan informasi berikut:\n{context_text}\n\nJawab pertanyaan: {prompt}"
+            
+            return (augmented, paragraphs)
+            
+        except Exception as exc:
+            # Fallback: prompt asli tanpa context
+            return (prompt, [])
+
+    def _set_model_domain(self, domain: Optional[str]) -> None:
+        """
+        Set active domain di model (untuk MoE LM head selection).
+        """
+        if domain is None:
+            return
+        
+        if not hasattr(self.model, "set_active_domain"):
+            return
+        
+        try:
+            self.model.set_active_domain(domain)
+        except Exception:
+            pass
 
     # ========================================================================
     # PUBLIC API
@@ -143,7 +346,7 @@ class Playground:
         """
         Uji satu prompt dan cetak hasilnya.
         """
-        answer, generated_ids, token_pieces = self.generate(
+        answer, generated_ids, token_pieces, routing_info = self.generate(
             prompt=prompt,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -158,6 +361,18 @@ class Playground:
         if verbose:
             print("-" * 60)
             print("Prompt  :", prompt)
+            
+            # ============================================================
+            # MoE ROUTING INFO
+            # ============================================================
+            if routing_info.get("domain"):
+                domain = routing_info["domain"]
+                confidence = routing_info.get("confidence", 0.0)
+                print(f"Domain  : [{domain}] (confidence: {confidence:.2%})")
+                
+                if routing_info.get("semantic_context"):
+                    n_ctx = len(routing_info["semantic_context"])
+                    print(f"Context : {n_ctx} paragraf relevan di-inject")
 
             # ============================================================
             # DEBUG MODE: Tampilkan Token IDs dan Token Pieces
@@ -195,25 +410,48 @@ class Playground:
         repetition_window: int = DEFAULT_REPETITION_WINDOW,
         min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
         return_debug: bool = False,
-    ) -> Tuple[str, List[int], List[str]]:
+    ) -> Tuple[str, List[int], List[str], Dict]:
         """
         Membuat jawaban/lanjutan teks dari prompt.
 
-        DOMAIN-AWARE INFERENCE:
-        - Jika ada default domain dan prompt tidak memiliki prefix, tambahkan prefix
-        - Stop generation saat encounter 
+        MoE INFERENCE FLOW:
+        1. Route prompt ke domain (auto atau manual)
+        2. Set active LM head di model
+        3. Inject semantic context (jika tersedia)
+        4. Generate dengan sampling parameters
+        5. Stop saat EOS atau 
         """
         self._ensure_tokenizer_ready()
 
         # ================================================================
-        # DOMAIN-AWARE INFERENCE
-        # Jika ada default domain dan prompt tidak punya prefix, tambahkan
+        # MoE ROUTING
         # ================================================================
-        actual_prompt = prompt
-        if self._default_domain is not None:
-            # Cek apakah prompt sudah punya domain prefix
+        domain, confidence = self._route_prompt(prompt)
+        
+        # Set active domain di model (untuk MoE LM head)
+        if domain is not None:
+            self._set_model_domain(domain)
+
+        # ================================================================
+        # SEMANTIC CONTEXT INJECTION
+        # ================================================================
+        augmented_prompt = prompt
+        semantic_context: List[str] = []
+        
+        if self._use_moe and domain is not None and self._auto_routing:
+            augmented_prompt, semantic_context = self._inject_semantic_context(
+                prompt, domain
+            )
+
+        # ================================================================
+        # DOMAIN PREFIX (untuk backward compat)
+        # ================================================================
+        actual_prompt = augmented_prompt
+        if self._default_domain is not None and not semantic_context:
+            # Hanya tambahkan prefix jika tidak ada semantic context
+            # (untuk menghindari duplikasi)
             if not DOMAIN_PREFIX_PATTERN.match(prompt.strip()):
-                actual_prompt = f"[{self._default_domain}] {prompt}"
+                actual_prompt = f"[{self._default_domain}] {augmented_prompt}"
 
         prompt_ids = self.tokenizer.encode(
             actual_prompt,
@@ -292,10 +530,20 @@ class Playground:
             skip_special_tokens=True,
         )
 
-        if return_debug:
-            return answer_text, generated_ids, token_pieces
+        # ================================================================
+        # ROUTING INFO (untuk debug)
+        # ================================================================
+        routing_info = {
+            "domain": domain,
+            "confidence": confidence,
+            "semantic_context": semantic_context,
+            "auto_routing": self._auto_routing,
+        }
 
-        return answer_text, generated_ids, token_pieces
+        if return_debug:
+            return answer_text, generated_ids, token_pieces, routing_info
+
+        return answer_text, generated_ids, token_pieces, routing_info
 
     def _get_token_pieces(self, token_ids: List[int]) -> List[str]:
         """
@@ -337,6 +585,9 @@ class Playground:
 
         if debug_tokens:
             print(">>> DEBUG MODE AKTIF: Token IDs & Pieces akan ditampilkan <<<")
+        
+        if self._use_moe:
+            print(f">>> MoE AKTIF: auto-routing = {self._auto_routing} <<<")
 
         print("=" * 60)
         print(f"temperature        : {temperature}")
@@ -346,8 +597,12 @@ class Playground:
         print(f"min_new_tokens     : {min_new_tokens}")
         print(f"max_new_tokens     : {max_new_tokens}")
         print(f"debug_tokens       : {debug_tokens}")
+        print(f"use_moe            : {self._use_moe}")
+        print(f"auto_routing       : {self._auto_routing}")
         if self._default_domain:
             print(f"default_domain     : [{self._default_domain}]")
+        if self._force_domain:
+            print(f"force_domain       : [{self._force_domain}]")
         print("=" * 60)
 
         while True:
@@ -385,7 +640,7 @@ class Playground:
             # ================================================================
             # PROMPT INFERENCE
             # ================================================================
-            answer, generated_ids, token_pieces = self.generate(
+            answer, generated_ids, token_pieces, routing_info = self.generate(
                 prompt=stripped,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -396,6 +651,18 @@ class Playground:
                 min_new_tokens=min_new_tokens,
                 return_debug=True,
             )
+
+            # ============================================================
+            # MoE ROUTING INFO
+            # ============================================================
+            if routing_info.get("domain"):
+                domain = routing_info["domain"]
+                confidence = routing_info.get("confidence", 0.0)
+                print(f"[Router] Domain: [{domain}] (confidence: {confidence:.2%})")
+                
+                if routing_info.get("semantic_context"):
+                    n_ctx = len(routing_info["semantic_context"])
+                    print(f"[Router] Context: {n_ctx} paragraf relevan di-inject")
 
             # ============================================================
             # DEBUG MODE
@@ -473,10 +740,31 @@ class Playground:
             return False
 
         # ----------------------------------------------------------------
-        # /domain [NAMA] - Set domain prefix default
+        # /domain [NAMA] - Set domain prefix manual
         # ----------------------------------------------------------------
         if cmd == "/domain":
             self._handle_domain_command(parts)
+            return False
+
+        # ----------------------------------------------------------------
+        # /domains - List semua domain yang tersedia (BARU)
+        # ----------------------------------------------------------------
+        if cmd == "/domains":
+            self._handle_domains_command()
+            return False
+
+        # ----------------------------------------------------------------
+        # /auto [on|off] - Toggle auto-routing MoE (BARU)
+        # ----------------------------------------------------------------
+        if cmd == "/auto":
+            self._handle_auto_command(parts)
+            return False
+
+        # ----------------------------------------------------------------
+        # /force DOMAIN - Force domain untuk testing (BARU)
+        # ----------------------------------------------------------------
+        if cmd == "/force":
+            self._handle_force_command(parts)
             return False
 
         # ----------------------------------------------------------------
@@ -497,7 +785,6 @@ class Playground:
         Format:
             /domain          → hapus domain default
             /domain MOBIL    → set domain default ke MOBIL
-            /domain SAINS    → set domain default ke SAINS
         """
         if len(parts) < 2:
             # Hapus domain default
@@ -507,22 +794,144 @@ class Playground:
             else:
                 print("[playground] Tidak ada domain default yang aktif.")
                 print("[playground] Gunakan: /domain MOBIL, /domain SAINS, /domain FILSAFAT, dll.")
+                print("[playground] Atau gunakan /domains untuk lihat domain yang tersedia.")
             return
 
         # Set domain baru
         domain = parts[1].upper().strip()
         
-        # Validasi: hanya huruf kapital
-        if not domain.isalpha():
+        # Validasi: hanya huruf kapital, angka, dan underscore
+        if not re.match(r'^[A-Z0-9_]+$', domain):
             print(f"[playground] Domain tidak valid: {domain}")
-            print("[playground] Domain harus berupa huruf saja (contoh: MOBIL, SAINS, FILSAFAT)")
+            print("[playground] Domain harus huruf kapital/angka/underscore (contoh: MOBIL, SAINS)")
             return
 
         self._default_domain = domain
         print(f"[playground] Domain default diset ke: [{domain}]")
         print(f"[playground] Semua prompt akan otomatis di-prefix dengan [{domain}]")
-        print(f"[playground] Contoh: 'mobil adalah' → '[{domain}] mobil adalah'")
         print(f"[playground] Gunakan /domain untuk menghapus domain default.")
+
+    def _handle_domains_command(self) -> None:
+        """
+        Memproses perintah /domains.
+        
+        List semua domain yang tersedia (dari model dan router).
+        """
+        print("=" * 60)
+        print("Daftar Domain yang Tersedia")
+        print("=" * 60)
+        
+        # Dari model (LM heads)
+        model_domains = []
+        if hasattr(self.model, "list_domains"):
+            try:
+                model_domains = self.model.list_domains()
+            except Exception:
+                model_domains = []
+        
+        if model_domains:
+            print(f"\nModel LM heads ({len(model_domains)}):")
+            for domain in model_domains:
+                marker = " ← aktif" if self._force_domain == domain else ""
+                marker += " ← default" if self._default_domain == domain else ""
+                print(f"  [{domain}]{marker}")
+        else:
+            print("\nModel LM heads: (tidak ada / MoE tidak aktif)")
+        
+        # Dari router (keywords)
+        if self._router is not None:
+            router_domains = list(self._router.domain_keywords.keys())
+            if router_domains:
+                print(f"\nRouter keywords ({len(router_domains)}):")
+                for domain in router_domains:
+                    n_keywords = len(self._router.domain_keywords.get(domain, []))
+                    print(f"  [{domain}]: {n_keywords} keywords")
+            else:
+                print("\nRouter keywords: (belum dibangun)")
+        else:
+            print("\nRouter: (tidak tersedia)")
+            print("  Jalankan training dulu untuk membangun router.")
+        
+        # Routing stats
+        if self._routing_stats:
+            print(f"\nRouting statistics (sesi ini):")
+            for domain, count in sorted(
+                self._routing_stats.items(),
+                key=lambda x: -x[1]
+            ):
+                print(f"  [{domain}]: {count}x")
+        
+        print("=" * 60)
+
+    def _handle_auto_command(self, parts: List[str]) -> None:
+        """
+        Memproses perintah /auto.
+        
+        Format:
+            /auto          → tampilkan status auto-routing
+            /auto on       → aktifkan auto-routing
+            /auto off      → nonaktifkan auto-routing
+        """
+        if len(parts) < 2:
+            # Tampilkan status
+            status = "AKTIF" if self._auto_routing else "NONAKTIF"
+            print(f"[playground] Auto-routing: {status}")
+            print(f"[playground] Gunakan: /auto on atau /auto off")
+            return
+        
+        mode = parts[1].lower().strip()
+        
+        if mode in {"on", "1", "true", "aktif"}:
+            self._auto_routing = True
+            print("[playground] Auto-routing MoE: AKTIF")
+            print("[playground] Router akan otomatis memilih LM head berdasarkan prompt.")
+        elif mode in {"off", "0", "false", "nonaktif", "mati"}:
+            self._auto_routing = False
+            print("[playground] Auto-routing MoE: NONAKTIF")
+            print("[playground] Gunakan /domain untuk set domain manual.")
+        else:
+            print(f"[playground] Mode tidak valid: {mode}")
+            print("[playground] Gunakan: /auto on atau /auto off")
+
+    def _handle_force_command(self, parts: List[str]) -> None:
+        """
+        Memproses perintah /force.
+        
+        Format:
+            /force          → hapus force domain
+            /force MOBIL    → force domain ke MOBIL (bypass router)
+        """
+        if len(parts) < 2:
+            # Hapus force domain
+            if self._force_domain:
+                print(f"[playground] Force domain dihapus (sebelumnya: [{self._force_domain}])")
+                self._force_domain = None
+            else:
+                print("[playground] Tidak ada force domain yang aktif.")
+            return
+        
+        # Set force domain
+        domain = parts[1].upper().strip()
+        
+        # Validasi
+        if not re.match(r'^[A-Z0-9_]+$', domain):
+            print(f"[playground] Domain tidak valid: {domain}")
+            return
+        
+        # Cek apakah domain ada di model
+        if hasattr(self.model, "has_domain"):
+            try:
+                if not self.model.has_domain(domain):
+                    print(f"[playground] Warning: Domain [{domain}] tidak ada di model.")
+                    print(f"[playground] Domain yang tersedia: {self.model.list_domains()}")
+            except Exception:
+                pass
+        
+        self._force_domain = domain
+        self._set_model_domain(domain)
+        print(f"[playground] Force domain diset ke: [{domain}]")
+        print(f"[playground] Router akan di-bypass, semua prompt pakai LM head [{domain}].")
+        print(f"[playground] Gunakan /force untuk menghapus force domain.")
 
     # ========================================================================
     # TRAINING COMMAND HANDLER
@@ -578,6 +987,9 @@ class Playground:
                     print(f"[playground] Perplexity     : {last.get('perplexity', 0.0):.4f}")
                     print(f"[playground] Accuracy       : {last.get('accuracy', 0.0):.4f}")
                     print("-" * 60)
+                    
+                    # Reload router setelah training (karena mungkin sudah di-rebuild)
+                    self._setup_router()
                 else:
                     print("[playground] Training tidak menghasilkan history.")
                     print("[playground] Pastikan folder datasets/ berisi data.")
@@ -671,7 +1083,22 @@ class Playground:
         print(f"  Vocab size      : {self.tokenizer.vocab_size}")
         print(f"  Max context     : {self.max_context}")
         print(f"  Trainer         : {'Tersedia' if self.trainer is not None else 'Tidak tersedia'}")
+        print(f"  Use MoE         : {self._use_moe}")
+        print(f"  Auto-routing    : {self._auto_routing}")
         print(f"  Domain default  : {f'[{self._default_domain}]' if self._default_domain else 'Tidak diset'}")
+        print(f"  Force domain    : {f'[{self._force_domain}]' if self._force_domain else 'Tidak diset'}")
+        print(f"  Router          : {'Tersedia' if self._router is not None else 'Tidak tersedia'}")
+        
+        # LM heads info
+        if hasattr(self.model, "list_domains"):
+            try:
+                domains = self.model.list_domains()
+                print(f"  LM heads        : {len(domains)} domain")
+                for domain in domains:
+                    active_marker = " ← aktif" if self._force_domain == domain else ""
+                    print(f"    [{domain}]{active_marker}")
+            except Exception:
+                pass
 
         if self.trainer is not None and hasattr(self.trainer, "weight_manager"):
             wm = self.trainer.weight_manager
@@ -700,10 +1127,20 @@ class Playground:
         print()
         print("  /help                  : tampilkan bantuan ini")
         print()
+        print("  MoE Commands (BARU):")
+        print("  /domains               : list semua domain yang tersedia")
+        print("  /auto                  : tampilkan status auto-routing")
+        print("  /auto on               : aktifkan auto-routing")
+        print("  /auto off              : nonaktifkan auto-routing")
+        print("  /force MOBIL           : force domain ke MOBIL (bypass router)")
+        print("  /force                 : hapus force domain")
+        print()
+        print("  Domain Commands (manual):")
         print("  /domain MOBIL          : set domain default ke MOBIL")
         print("  /domain SAINS          : set domain default ke SAINS")
         print("  /domain                : hapus domain default")
         print()
+        print("  Training Commands:")
         print("  /training              : latih model (step default)")
         print("  /training 100          : latih model 100 step")
         print("  /training --steps 100  : latih model 100 step")
@@ -711,16 +1148,19 @@ class Playground:
         print("  /training --epochs 10 --steps 50")
         print("                         : latih 10 epoch, minimal 50 step")
         print()
+        print("  Lainnya:")
         print("  /status                : tampilkan status model")
         print("  /exit                  : keluar dari playground")
         print("  /quit                  : keluar dari playground")
         print("  /keluar                : keluar dari playground")
         print()
-        print("TIPS DOMAIN-AWARE INFERENCE:")
-        print("  1. Set domain: /domain MOBIL")
-        print("  2. Ketik prompt: mobil adalah")
-        print("  3. Model akan otomatis menambahkan [MOBIL] di depan prompt")
-        print("  4. Jawaban akan tetap di topik mobil, tidak melantur")
+        print("TIPS MoE INFERENCE:")
+        print("  1. Pastikan training sudah dilakukan (router auto-built)")
+        print("  2. Auto-routing aktif by default (/auto on)")
+        print("  3. Ketik prompt biasa: 'fotosintesis adalah'")
+        print("  4. Router otomatis pilih LM head SAINS")
+        print("  5. Gunakan /domains untuk lihat domain yang tersedia")
+        print("  6. Gunakan /force MOBIL untuk test domain spesifik")
         print()
         print("Semua input tanpa prefix / dianggap sebagai prompt inference.")
         print("=" * 60)
@@ -1022,6 +1462,7 @@ if __name__ == "__main__":
             checkpoint_path=output_models_dir / "training_checkpoint.npz",
         )
 
+        # CATATAN: dropout_rate ada di TrainingConfig, BUKAN ModelConfig
         small_config = Config(
             paths=paths,
             special_tokens=SpecialTokensConfig(),
@@ -1040,12 +1481,12 @@ if __name__ == "__main__":
                 embedding_dim=32,
                 num_attention_heads=4,
                 num_layers=1,
-                dropout_rate=0.0,
                 max_position_embeddings=64,
                 layer_norm_eps=1e-5,
                 ffn_hidden_dim=64,
                 train_dtype="float32",
                 export_dtype="float32",
+                use_moe=True,  # Aktifkan MoE untuk test
             ),
         )
 

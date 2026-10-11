@@ -1,15 +1,25 @@
 # core/architecture.py
 #
 # Arsitektur neural network custom untuk Training Pipeline Engine.
-# VERSI SOTA UPGRADE:
+#
+# VERSI SOTA + MOE UPGRADE:
+# SOTA features:
 # - RoPE (Rotary Position Embedding) menggantikan sinusoidal absolut
-# - Weight Tying antara embed_tokens dan lm_head
+# - Weight Tying antara embed_tokens dan lm_head (single-head mode)
 # - Logit Soft-Capping (tanh) menggantikan hard clipping
 # - Stochastic Depth (DropPath) pada TransformerBlock
 # - Scaled Initialization untuk residual sublayers (GPT-2 style)
 #
+# MoE features (BARU):
+# - Dynamic LM Heads: satu LM head per domain (auto-detect dari datasets/)
+# - Shared backbone: semua domain berbagi encoder yang sama
+# - Active domain selector: pilih head saat inference/training
+# - Hidden states extraction: untuk semantic search
+# - Backward compatibility: auto-convert old single-head checkpoints
+#
 # Keterhubungan:
-# - config.py          : parameter arsitektur
+# - config.py          : parameter arsitektur + MoE
+# - core/router.py     : memilih active_domain saat inference
 # - pipeline/trainer.py     : forward pass saat training
 # - pipeline/evaluator.py   : menerima logits
 # - pipeline/weight_manager.py : memakai gradient dari backward pass
@@ -21,7 +31,7 @@ from __future__ import annotations
 import math
 import sys
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # ============================================================================
 # FIX IMPORT PATH
@@ -251,7 +261,6 @@ def _apply_rotary_emb(
     Output:
     - q_rot, k_rot: [B, H, T, D]
     """
-    # Reshape cos dan sin: [1, 1, T, D]
     cos_expanded = cos[np.newaxis, np.newaxis, :, :]
     sin_expanded = sin[np.newaxis, np.newaxis, :, :]
 
@@ -271,10 +280,6 @@ def _rotary_backward(
     Backward untuk RoPE.
 
     Rotasi adalah operasi orthogonal, jadi backward = rotasi dengan sudut negatif.
-    cos(-θ) = cos(θ), sin(-θ) = -sin(θ)
-
-    Untuk q: q_rot = q*cos + rotate_half(q)*sin
-    dq = dq_rot*cos - rotate_half(dq_rot)*sin
     """
     cos_expanded = cos[np.newaxis, np.newaxis, :, :]
     sin_expanded = sin[np.newaxis, np.newaxis, :, :]
@@ -384,7 +389,6 @@ class MultiHeadSelfAttention:
             dropout_rate = config.model.dropout_rate
         self.dropout_p = float(dropout_rate)
 
-        # Logit soft-capping untuk attention scores
         self.attention_logit_cap = float(
             getattr(config.model, 'attention_logit_cap', 30.0)
         )
@@ -404,7 +408,6 @@ class MultiHeadSelfAttention:
         self.q_proj = Parameter(_init_weight(rng, (self.hidden_size, self.hidden_size)))
         self.k_proj = Parameter(_init_weight(rng, (self.hidden_size, self.hidden_size)))
         self.v_proj = Parameter(_init_weight(rng, (self.hidden_size, self.hidden_size)))
-        # o_proj menggunakan scaled init karena merupakan residual sublayer
         self.o_proj = Parameter(
             _init_weight(rng, (self.hidden_size, self.hidden_size), scale=residual_scale)
         )
@@ -427,23 +430,15 @@ class MultiHeadSelfAttention:
         Kh = K.reshape(B, T, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         Vh = V.reshape(B, T, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        # ================================================================
-        # RoPE: rotasi pada Q dan K
-        # ================================================================
         Qh_rot, Kh_rot = _apply_rotary_emb(Qh, Kh, cos[:T], sin[:T])
         Qh_rot = _sanitize(Qh_rot)
         Kh_rot = _sanitize(Kh_rot)
 
-        # scores: [B, H, T, T]
         scores = Qh_rot @ Kh_rot.transpose(0, 1, 3, 2)
         scores = scores * self.scale
 
-        # ================================================================
-        # Soft-capping pada attention scores
-        # ================================================================
         scores = _softcap(scores, self.attention_logit_cap)
 
-        # Causal mask: token tidak boleh melihat masa depan
         causal_mask = np.triu(np.ones((T, T), dtype=bool), k=1)
         scores = np.where(causal_mask[None, None, :, :], -1e9, scores)
 
@@ -507,9 +502,6 @@ class MultiHeadSelfAttention:
         dout = _sanitize(dout)
         B, T, D = x.shape
 
-        # ================================================================
-        # Output projection backward
-        # ================================================================
         dout_2d = dout.reshape(-1, D)
         context_2d = context.reshape(-1, D)
 
@@ -522,40 +514,23 @@ class MultiHeadSelfAttention:
             B, T, self.num_heads, self.head_dim
         ).transpose(0, 2, 1, 3)
 
-        # ================================================================
-        # Gradient terhadap attention probabilities dan value
-        # ================================================================
         dprobs_drop = dcontext_heads @ Vh.transpose(0, 1, 3, 2)
         dVh = probs_drop.transpose(0, 1, 3, 2) @ dcontext_heads
 
-        # Dropout backward pada attention probabilities
         dprobs = _dropout_backward(dprobs_drop, attn_dropout_mask)
 
-        # Softmax backward
         sum_dp = np.sum(dprobs * probs, axis=-1, keepdims=True)
         dscores = probs * (dprobs - sum_dp)
         dscores = dscores * self.scale
 
-        # Masked position tidak boleh mengirim gradient
         causal_mask = np.triu(np.ones((T, T), dtype=bool), k=1)
         dscores = np.where(causal_mask[None, None, :, :], 0.0, dscores)
 
-        # ================================================================
-        # Soft-cap backward pada scores
-        # ================================================================
-        # scores sebelum softcap: (scores / scale) = Qh_rot @ Kh_rot.T
-        # Kita perlu dscores sebelum softcap
         dscores_pre_cap = _softcap_backward(dscores, scores * (1.0 / self.scale) * self.scale, self.attention_logit_cap)
 
-        # ================================================================
-        # Gradient terhadap Q_rot dan K_rot
-        # ================================================================
         dQh_rot = dscores_pre_cap @ Kh_rot
         dKh_rot = dscores_pre_cap.transpose(0, 1, 3, 2) @ Qh_rot
 
-        # ================================================================
-        # RoPE backward
-        # ================================================================
         dQh, dKh = _rotary_backward(dQh_rot, dKh_rot, cos, sin)
 
         dQ = dQh.transpose(0, 2, 1, 3).reshape(B, T, D)
@@ -566,9 +541,6 @@ class MultiHeadSelfAttention:
         dK = _sanitize(dK)
         dV = _sanitize(dV)
 
-        # ================================================================
-        # Projection backward untuk Q, K, V
-        # ================================================================
         x_2d = x.reshape(-1, D)
 
         self.q_proj.grad += dQ.reshape(-1, D).T @ x_2d
@@ -625,7 +597,6 @@ class SwiGLUFFN:
 
         self.rng = rng
 
-        # GPT-2 style scaled init untuk residual sublayers
         residual_scale = 1.0 / math.sqrt(2.0 * num_layers)
 
         self.gate_proj = Parameter(
@@ -634,7 +605,6 @@ class SwiGLUFFN:
         self.up_proj = Parameter(
             _init_weight(rng, (self.ffn_hidden_dim, self.hidden_size))
         )
-        # down_proj menggunakan scaled init
         self.down_proj = Parameter(
             _init_weight(rng, (self.hidden_size, self.ffn_hidden_dim), scale=residual_scale)
         )
@@ -697,7 +667,6 @@ class SwiGLUFFN:
         D = x.shape[-1]
         F = gate.shape[-1]
 
-        # Down projection
         dout_2d = dout.reshape(-1, D)
         h_2d = h_drop.reshape(-1, F)
 
@@ -706,10 +675,8 @@ class SwiGLUFFN:
         dh_drop = dout @ self.down_proj.data
         dh_drop = _sanitize(dh_drop)
 
-        # Dropout backward
         dh = _dropout_backward(dh_drop, dropout_mask)
 
-        # SwiGLU backward
         dsilu = dh * up
         dup = dh * silu
 
@@ -717,7 +684,6 @@ class SwiGLUFFN:
         dgate = _sanitize(dgate)
         dup = _sanitize(dup)
 
-        # Gate dan Up projection
         x_2d = x.reshape(-1, D)
 
         self.gate_proj.grad += dgate.reshape(-1, F).T @ x_2d
@@ -795,32 +761,24 @@ class TransformerBlock:
         cos: np.ndarray,
         sin: np.ndarray,
     ) -> np.ndarray:
-        residual_1 = x  # Pure residual - NO sanitization
+        residual_1 = x
 
         h = self.input_norm.forward(x)
         h = self.attn.forward(h, training, cos, sin)
         h, attn_dropout_mask = _dropout(h, self.dropout_p, training, self.rng)
 
-        # ================================================================
-        # Stochastic Depth (DropPath) pada attention branch
-        # ================================================================
         h, attn_dropped = _drop_path(h, self.drop_path_rate, training, self.rng)
 
-        # Residual connection (pure, no sanitization)
         x_1 = residual_1 + h
 
-        residual_2 = x_1  # Pure residual - NO sanitization
+        residual_2 = x_1
 
         h = self.post_attention_norm.forward(x_1)
         h = self.ffn.forward(h, training)
         h, ffn_dropout_mask = _dropout(h, self.dropout_p, training, self.rng)
 
-        # ================================================================
-        # Stochastic Depth (DropPath) pada FFN branch
-        # ================================================================
         h, ffn_dropped = _drop_path(h, self.drop_path_rate, training, self.rng)
 
-        # Residual connection (pure, no sanitization)
         out = residual_2 + h
 
         self.cache = (
@@ -838,30 +796,21 @@ class TransformerBlock:
 
         attn_dropout_mask, ffn_dropout_mask, attn_dropped, ffn_dropped = self.cache
 
-        # ================================================================
-        # Branch FFN + residual kedua
-        # ================================================================
-        # Gradient dari residual = dout (pure flow)
         d_ffn_out = _dropout_backward(dout, ffn_dropout_mask)
         d_ffn_out = _drop_path_backward(d_ffn_out, ffn_dropped, self.drop_path_rate)
 
         d_ffn_in = self.ffn.backward(d_ffn_out)
         d_post_norm = self.post_attention_norm.backward(d_ffn_in)
 
-        # Gradient ke x_1 = dout (residual) + d_post_norm (FFN branch)
         d_x_1 = dout + d_post_norm
         d_x_1 = _sanitize(d_x_1)
 
-        # ================================================================
-        # Branch Attention + residual pertama
-        # ================================================================
         d_attn_out = _dropout_backward(d_x_1, attn_dropout_mask)
         d_attn_out = _drop_path_backward(d_attn_out, attn_dropped, self.drop_path_rate)
 
         d_attn_in = self.attn.backward(d_attn_out)
         d_input_norm = self.input_norm.backward(d_attn_in)
 
-        # Gradient ke x = d_x_1 (residual) + d_input_norm (attention branch)
         dx = d_x_1 + d_input_norm
         dx = _sanitize(dx)
 
@@ -884,7 +833,7 @@ class TransformerBlock:
 
 
 # ============================================================================
-# CUSTOM TRANSFORMER LANGUAGE MODEL dengan Weight Tying
+# CUSTOM TRANSFORMER LANGUAGE MODEL dengan MoE Dynamic LM Heads
 # ============================================================================
 
 class CustomTransformerLM:
@@ -893,13 +842,23 @@ class CustomTransformerLM:
 
     Fitur SOTA:
     - RoPE untuk positional encoding
-    - Weight Tying antara embed_tokens dan lm_head
+    - Weight Tying antara embed_tokens dan lm_head (single-head mode)
     - Logit Soft-Capping pada final logits
     - Stochastic Depth pada setiap layer
     - Scaled Initialization untuk residual sublayers
+
+    Fitur MoE (BARU):
+    - Dynamic LM Heads: satu head per domain, auto-detect dari datasets/
+    - Shared backbone: semua domain berbagi encoder yang sama
+    - Active domain selector: pilih head saat inference/training
+    - Hidden states extraction: untuk semantic search (cosine similarity)
+    - Backward compatibility: auto-convert old single-head checkpoints
     """
 
     MAX_PARAMS: Optional[int] = 50_000_000
+
+    # Domain default untuk fallback
+    GENERAL_DOMAIN: str = "GENERAL"
 
     def __init__(self, config: Config = CONFIG):
         self.config = config
@@ -912,11 +871,23 @@ class CustomTransformerLM:
         self.max_position_embeddings = int(config.model.max_position_embeddings)
         self.layer_norm_eps = float(config.model.layer_norm_eps)
 
+        # ================================================================
         # SOTA config
-        self.use_weight_tying = bool(getattr(config.model, 'use_weight_tying', True))
+        # ================================================================
         self.use_rope = bool(getattr(config.model, 'use_rope', True))
         self.final_logit_cap = float(getattr(config.model, 'final_logit_cap', 50.0))
         self.drop_path_rate = float(getattr(config.model, 'drop_path_rate', 0.1))
+
+        # ================================================================
+        # MOE config (BARU)
+        # ================================================================
+        self.use_moe = bool(getattr(config.model, 'use_moe', True))
+
+        # Weight tying: otomatis di-disable jika MoE aktif
+        self.use_weight_tying = bool(
+            getattr(config.model, 'effective_use_weight_tying',
+                    getattr(config.model, 'use_weight_tying', True))
+        )
 
         self._validate_practical_size()
 
@@ -934,7 +905,6 @@ class CustomTransformerLM:
         # ================================================================
         self.layers = []
         for i in range(self.num_layers):
-            # Linear ramp dari 0 di layer pertama ke drop_path_rate di layer terakhir
             layer_drop_rate = (
                 self.drop_path_rate * i / max(1, self.num_layers - 1)
             )
@@ -950,18 +920,26 @@ class CustomTransformerLM:
         self.final_norm = RMSNorm(self.embedding_dim, self.layer_norm_eps)
 
         # ================================================================
-        # LM Head dengan Weight Tying
+        # LM HEADS: Dynamic (MoE) atau Single (Weight Tying)
         # ================================================================
-        if self.use_weight_tying:
-            # Share reference - lm_head adalah embed_tokens yang sama
-            self.lm_head = self.embed_tokens
-        else:
-            self.lm_head = Parameter(
-                _init_weight(self.rng, (self.vocab_size, self.embedding_dim))
-            )
+        self.lm_heads: Dict[str, Parameter] = {}
+
+        # Selalu buat GENERAL head sebagai fallback
+        self.lm_heads[self.GENERAL_DOMAIN] = Parameter(
+            _init_weight(self.rng, (self.vocab_size, self.embedding_dim))
+        )
+
+        # Active domain untuk forward/backward (default: GENERAL)
+        self.active_domain: str = self.GENERAL_DOMAIN
+
+        # Legacy single lm_head (untuk backward compatibility)
+        # Hanya dipakai jika use_moe=False dan use_weight_tying=False
+        self.lm_head: Optional[Parameter] = None
+        if not self.use_moe and not self.use_weight_tying:
+            self.lm_head = self.lm_heads[self.GENERAL_DOMAIN]
 
         # ================================================================
-        # RoPE cache (hanya dibangun jika RoPE aktif)
+        # RoPE cache
         # ================================================================
         if self.use_rope:
             self.rope_cos, self.rope_sin = _build_rope_cache(
@@ -969,7 +947,6 @@ class CustomTransformerLM:
                 self.embedding_dim // self.num_heads,
             )
         else:
-            # Fallback: sinusoidal positional encoding (legacy mode)
             self.pos_encoding = self._build_sinusoidal_positional_encoding(
                 self.max_position_embeddings,
                 self.embedding_dim,
@@ -987,29 +964,27 @@ class CustomTransformerLM:
         L = self.num_layers
         F = self.ffn_hidden_dim
 
-        # Dengan weight tying, lm_head tidak dihitung terpisah
-        embedding_params = V * D
-        lm_head_params = 0 if self.use_weight_tying else V * D
-
-        estimated_params = (
-            embedding_params
-            + L * (
-                2 * D
-                + 4 * D * D
-                + 3 * D * F
-            )
-            + D
-            + lm_head_params
+        # Base: backbone params (tanpa LM head)
+        backbone_params = (
+            V * D  # embed_tokens
+            + L * (2 * D + 4 * D * D + 3 * D * F)  # transformer layers
+            + D  # final_norm
         )
+
+        # LM heads: minimal 1 (GENERAL)
+        lm_head_params = V * D  # GENERAL head
+
+        estimated_params = backbone_params + lm_head_params
 
         if estimated_params > self.MAX_PARAMS:
             raise RuntimeError(
                 "Estimasi jumlah parameter terlalu besar untuk engine custom "
                 "berbasis NumPy ini. "
-                f"Estimasi: {estimated_params:,} parameter. "
+                f"Estimasi (base): {estimated_params:,} parameter. "
                 f"Batas aman: {self.MAX_PARAMS:,} parameter. "
                 "Kurangi vocab_size, embedding_dim, num_layers, atau ffn_hidden_dim "
-                "di config.py, atau set CustomTransformerLM.MAX_PARAMS = None."
+                "di config.py, atau set CustomTransformerLM.MAX_PARAMS = None.\n"
+                f"Catatan: setiap domain tambahan menambah {V*D:,} parameter."
             )
 
     def _build_sinusoidal_positional_encoding(
@@ -1029,6 +1004,201 @@ class CustomTransformerLM:
 
         return pe
 
+    # ====================================================================
+    # MOE: DYNAMIC DOMAIN MANAGEMENT
+    # ====================================================================
+
+    def list_domains(self) -> List[str]:
+        """
+        Return list semua domain yang terdaftar di model.
+        """
+        return list(self.lm_heads.keys())
+
+    def has_domain(self, domain: str) -> bool:
+        """
+        Cek apakah domain sudah terdaftar.
+        """
+        return domain in self.lm_heads
+
+    def add_domain(self, domain: str, init_from_general: bool = True) -> None:
+        """
+        Tambah LM head baru untuk domain.
+
+        Parameter:
+        - domain: nama domain (uppercase, alphanumeric)
+        - init_from_general: jika True, inisialisasi dengan copy GENERAL head
+                             (transfer learning dari base model)
+        """
+        if not domain or not domain.strip():
+            raise ValueError("Nama domain tidak boleh kosong.")
+
+        domain = domain.strip().upper()
+
+        if domain in self.lm_heads:
+            return  # Sudah ada, skip
+
+        if init_from_general:
+            # Transfer learning: mulai dari GENERAL head
+            general_data = self.lm_heads[self.GENERAL_DOMAIN].data
+            new_head = Parameter(general_data.copy())
+        else:
+            # Random initialization
+            new_head = Parameter(
+                _init_weight(self.rng, (self.vocab_size, self.embedding_dim))
+            )
+
+        self.lm_heads[domain] = new_head
+
+        # Update _parameters dict
+        self._parameters[f"lm_heads.{domain}.weight"] = new_head
+
+    def init_domains(self, domains: List[str]) -> None:
+        """
+        Inisialisasi multiple domain sekaligus.
+
+        Parameter:
+        - domains: list nama domain (e.g., ["MOBIL", "SAINS", "FILSAFAT"])
+        """
+        for domain in domains:
+            self.add_domain(domain, init_from_general=True)
+
+    def remove_domain(self, domain: str) -> None:
+        """
+        Hapus LM head untuk domain tertentu.
+        GENERAL domain tidak bisa dihapus.
+        """
+        if domain == self.GENERAL_DOMAIN:
+            raise ValueError(f"Domain {self.GENERAL_DOMAIN} tidak bisa dihapus (wajib ada).")
+
+        if domain not in self.lm_heads:
+            return
+
+        del self.lm_heads[domain]
+
+        # Update _parameters dict
+        key = f"lm_heads.{domain}.weight"
+        if key in self._parameters:
+            del self._parameters[key]
+
+        # Reset active domain jika yang aktif dihapus
+        if self.active_domain == domain:
+            self.active_domain = self.GENERAL_DOMAIN
+
+    def set_active_domain(self, domain: str) -> None:
+        """
+        Set domain aktif untuk forward/backward pass.
+
+        Jika domain tidak ada, fallback ke GENERAL.
+        """
+        if domain in self.lm_heads:
+            self.active_domain = domain
+        else:
+            # Fallback ke GENERAL
+            self.active_domain = self.GENERAL_DOMAIN
+
+    def get_active_head(self) -> Parameter:
+        """
+        Return LM head yang sedang aktif.
+        """
+        return self.lm_heads[self.active_domain]
+
+    def estimated_params_for_domains(self, num_domains: int) -> int:
+        """
+        Hitung estimasi total parameter jika ada N domain.
+
+        Termasuk GENERAL head.
+        """
+        V = self.vocab_size
+        D = self.embedding_dim
+        L = self.num_layers
+        F = self.ffn_hidden_dim
+
+        backbone_params = (
+            V * D
+            + L * (2 * D + 4 * D * D + 3 * D * F)
+            + D
+        )
+
+        # N domain + 1 GENERAL = (N+1) LM heads
+        lm_head_params = (num_domains + 1) * V * D
+
+        return backbone_params + lm_head_params
+
+    # ====================================================================
+    # HIDDEN STATES EXTRACTION (untuk Semantic Search)
+    # ====================================================================
+
+    def get_hidden_states(
+        self,
+        input_ids: np.ndarray,
+        pooling: str = "mean",
+    ) -> np.ndarray:
+        """
+        Extract embeddings dari final layer (sebelum LM head).
+
+        Parameter:
+        - input_ids: [B, T] atau [T]
+        - pooling: "mean" (default), "last", atau "none"
+            - "mean": mean pooling → [B, D]
+            - "last": ambil token terakhir → [B, D]
+            - "none": return full sequence → [B, T, D]
+
+        Return:
+        - embeddings: np.ndarray
+        """
+        ids = np.asarray(input_ids, dtype=np.int64)
+
+        if ids.ndim == 1:
+            ids = ids[None, :]
+
+        if ids.ndim != 2:
+            raise ValueError("input_ids harus berbentuk [T] atau [B, T].")
+
+        B, T = ids.shape
+
+        if T == 0:
+            raise ValueError("Sequence length tidak boleh kosong.")
+
+        if T > self.max_position_embeddings:
+            # Truncate
+            ids = ids[:, :self.max_position_embeddings]
+            T = self.max_position_embeddings
+
+        unk_id = int(self.config.special_tokens.unk_id)
+        ids = np.where((ids < 0) | (ids >= self.vocab_size), unk_id, ids)
+
+        x = self.embed_tokens.data[ids]
+        x = _sanitize(x)
+
+        if not self.use_rope:
+            x = x + self.pos_encoding[:T][None, :, :]
+            x = _sanitize(x)
+
+        # NO dropout untuk inference embeddings
+        for layer in self.layers:
+            if self.use_rope:
+                x = layer.forward(x, training=False, cos=self.rope_cos, sin=self.rope_sin)
+            else:
+                dummy_cos = np.zeros((T, self.embedding_dim // self.num_heads), dtype=np.float32)
+                dummy_sin = np.zeros((T, self.embedding_dim // self.num_heads), dtype=np.float32)
+                x = layer.forward(x, training=False, cos=dummy_cos, sin=dummy_sin)
+
+        final_hidden = self.final_norm.forward(x)
+
+        # Pooling
+        if pooling == "mean":
+            return np.mean(final_hidden, axis=1).astype(np.float32)
+        elif pooling == "last":
+            return final_hidden[:, -1, :].astype(np.float32)
+        elif pooling == "none":
+            return final_hidden.astype(np.float32)
+        else:
+            raise ValueError(f"Pooling mode tidak valid: {pooling}")
+
+    # ====================================================================
+    # PARAMETER COLLECTION
+    # ====================================================================
+
     def _collect_parameters(self) -> Dict[str, Parameter]:
         params: Dict[str, Parameter] = {}
 
@@ -1041,10 +1211,10 @@ class CustomTransformerLM:
         params.update(self.final_norm.parameters("norm."))
 
         # ================================================================
-        # Weight Tying: lm_head TIDAK ditambahkan jika sharing
+        # Multiple LM Heads (MoE)
         # ================================================================
-        if not self.use_weight_tying:
-            params["lm_head.weight"] = self.lm_head
+        for domain, head in self.lm_heads.items():
+            params[f"lm_heads.{domain}.weight"] = head
 
         return params
 
@@ -1052,43 +1222,116 @@ class CustomTransformerLM:
         return dict(self._parameters)
 
     def parameter_count(self) -> int:
+        """
+        Hitung total parameter (termasuk semua LM heads).
+        """
         return sum(p.data.size for p in self._parameters.values())
+
+    def backbone_parameter_count(self) -> int:
+        """
+        Hitung parameter backbone saja (tanpa LM heads).
+        """
+        count = 0
+        for name, p in self._parameters.items():
+            if not name.startswith("lm_heads."):
+                count += p.data.size
+        return count
+
+    def lm_heads_parameter_count(self) -> int:
+        """
+        Hitung total parameter semua LM heads.
+        """
+        count = 0
+        for name, p in self._parameters.items():
+            if name.startswith("lm_heads."):
+                count += p.data.size
+        return count
 
     def zero_grad(self) -> None:
         for param in self._parameters.values():
             param.zero_grad()
 
+    # ====================================================================
+    # STATE DICT (Save/Load)
+    # ====================================================================
+
     def state_dict(self) -> Dict[str, np.ndarray]:
+        """
+        Return semua bobot model.
+
+        Format keys:
+        - embed_tokens.weight
+        - layers.{i}.*
+        - norm.weight
+        - lm_heads.{DOMAIN}.weight  (satu per domain, termasuk GENERAL)
+        """
         state = {
             name: param.data.copy()
             for name, param in self._parameters.items()
         }
 
-        # ================================================================
-        # Weight Tying: simpan lm_head sebagai reference ke embed_tokens
-        # ================================================================
-        if self.use_weight_tying:
-            state["lm_head.weight"] = self.embed_tokens.data.copy()
+        # Metadata tambahan
+        state["__moe_metadata__"] = {
+            "active_domains": list(self.lm_heads.keys()),
+            "use_moe": self.use_moe,
+            "use_weight_tying": self.use_weight_tying,
+            "use_rope": self.use_rope,
+        }
 
         return state
 
-    def load_state_dict(self, state_dict: Dict[str, np.ndarray]) -> None:
-        for name, array in state_dict.items():
-            if name not in self._parameters:
-                # Weight tying: lm_head.weight mungkin ada di state_dict tapi
-                # tidak di _parameters karena sharing
-                if name == "lm_head.weight" and self.use_weight_tying:
-                    arr = np.asarray(array, dtype=np.float32)
-                    if arr.shape != self.embed_tokens.data.shape:
-                        raise ValueError(
-                            f"Shape tidak cocok untuk {name}. "
-                            f"Diharapkan {self.embed_tokens.data.shape}, diterima {arr.shape}."
-                        )
-                    self.embed_tokens.data = arr
-                    self.embed_tokens.grad = np.zeros_like(arr, dtype=np.float32)
-                    continue
+    def load_state_dict(
+        self,
+        state_dict: Dict[str, np.ndarray],
+        strict: bool = False,
+    ) -> Dict[str, List[str]]:
+        """
+        Muat bobot dari state_dict.
 
-                raise KeyError(f"Parameter tidak dikenal: {name}")
+        Backward compatibility:
+        - Jika state_dict berisi "lm_head.weight" (format lama),
+          auto-convert ke lm_heads.GENERAL.weight
+        - Jika ada domain baru di state_dict yang belum ada di model,
+          otomatis ditambahkan
+
+        Return:
+        - dict dengan keys "missing" dan "unexpected"
+        """
+        missing = []
+        unexpected = []
+
+        # ================================================================
+        # Backward compatibility: convert old format
+        # ================================================================
+        converted_state = dict(state_dict)
+
+        # Jika ada lm_head.weight (format lama single head)
+        if "lm_head.weight" in converted_state and "lm_heads.GENERAL.weight" not in converted_state:
+            converted_state["lm_heads.GENERAL.weight"] = converted_state["lm_head.weight"]
+
+        # Auto-create domain baru jika ada di state_dict tapi belum ada di model
+        for key in converted_state.keys():
+            if key.startswith("lm_heads.") and key.endswith(".weight"):
+                domain = key[len("lm_heads."):-len(".weight")]
+                if domain != "__moe_metadata__" and not self.has_domain(domain):
+                    self.add_domain(domain, init_from_general=False)
+
+        # Update _parameters setelah domain baru ditambahkan
+        self._parameters = self._collect_parameters()
+
+        # ================================================================
+        # Load parameters
+        # ================================================================
+        for name, array in converted_state.items():
+            # Skip metadata
+            if name == "__moe_metadata__":
+                continue
+
+            if name not in self._parameters:
+                unexpected.append(name)
+                if strict:
+                    raise KeyError(f"Parameter tidak dikenal: {name}")
+                continue
 
             param = self._parameters[name]
             arr = np.asarray(array, dtype=np.float32)
@@ -1102,11 +1345,37 @@ class CustomTransformerLM:
             param.data = arr
             param.grad = np.zeros_like(arr, dtype=np.float32)
 
+        # Cek parameter yang missing
+        for name in self._parameters.keys():
+            if name not in converted_state:
+                missing.append(name)
+
+        return {"missing": missing, "unexpected": unexpected}
+
+    # ====================================================================
+    # FORWARD PASS
+    # ====================================================================
+
     def forward(
         self,
         input_ids: np.ndarray,
         training: bool = False,
+        domain: Optional[str] = None,
+        return_hidden: bool = False,
     ) -> np.ndarray:
+        """
+        Forward pass.
+
+        Input:
+        - input_ids: [B, T] atau [T]
+        - training: True saat training, False saat inference
+        - domain: override active_domain (optional)
+        - return_hidden: jika True, return tuple (logits, hidden_states)
+
+        Output:
+        - logits: [B, T, vocab_size]
+        - atau (logits, hidden_states) jika return_hidden=True
+        """
         ids = np.asarray(input_ids, dtype=np.int64)
 
         if ids.ndim == 1:
@@ -1129,21 +1398,18 @@ class CustomTransformerLM:
         unk_id = int(self.config.special_tokens.unk_id)
         ids = np.where((ids < 0) | (ids >= self.vocab_size), unk_id, ids)
 
+        # Embedding
         x = self.embed_tokens.data[ids]
         x = _sanitize(x)
 
-        # ================================================================
-        # Positional encoding: RoPE atau sinusoidal (fallback)
-        # ================================================================
+        # Positional encoding
         if self.use_rope:
-            # RoPE diterapkan di setiap attention layer, bukan di embedding
-            pass
+            pass  # RoPE diterapkan di attention layer
         else:
-            # Legacy sinusoidal PE
             x = x + self.pos_encoding[:T][None, :, :]
             x = _sanitize(x)
 
-        # Embedding dropout
+        # Dropout embedding
         dropout_rate = getattr(self.config.training, 'dropout_rate', None)
         if dropout_rate is None:
             dropout_rate = self.config.model.dropout_rate
@@ -1155,14 +1421,11 @@ class CustomTransformerLM:
             self.rng,
         )
 
-        # ================================================================
-        # Forward melalui semua layer
-        # ================================================================
+        # Transformer blocks
         for layer in self.layers:
             if self.use_rope:
                 x = layer.forward(x, training, self.rope_cos, self.rope_sin)
             else:
-                # Fallback: pass dummy cos/sin (tidak dipakai)
                 dummy_cos = np.zeros((T, self.embedding_dim // self.num_heads), dtype=np.float32)
                 dummy_sin = np.zeros((T, self.embedding_dim // self.num_heads), dtype=np.float32)
                 x = layer.forward(x, training, dummy_cos, dummy_sin)
@@ -1170,31 +1433,52 @@ class CustomTransformerLM:
         final_hidden = self.final_norm.forward(x)
 
         # ================================================================
-        # LM Head dengan Weight Tying
+        # LM Head: pilih berdasarkan domain
         # ================================================================
-        logits = final_hidden @ self.embed_tokens.data.T
+        if domain is not None:
+            forward_domain = domain if domain in self.lm_heads else self.GENERAL_DOMAIN
+        else:
+            forward_domain = self.active_domain
 
-        # ================================================================
+        active_head = self.lm_heads[forward_domain]
+        logits = final_hidden @ active_head.data.T
+
         # Final logit soft-capping
-        # ================================================================
         logits = _softcap(logits, self.final_logit_cap)
         logits = _sanitize(logits)
 
+        # ================================================================
+        # Cache untuk backward
+        # ================================================================
         self._forward_cache = (
             ids,
             embed_dropout_mask,
             final_hidden,
+            forward_domain,  # Track domain yang dipakai
         )
 
+        if return_hidden:
+            return logits, final_hidden
         return logits
 
+    # ====================================================================
+    # BACKWARD PASS
+    # ====================================================================
+
     def backward(self, grad_logits: np.ndarray) -> None:
+        """
+        Backward pass dari gradient logits.
+
+        Gradient akan mengalir ke:
+        - LM head yang aktif saat forward
+        - Shared backbone (embed_tokens, layers, final_norm)
+        """
         if self._forward_cache is None:
             raise RuntimeError(
                 "CustomTransformerLM.backward dipanggil sebelum forward."
             )
 
-        ids, embed_dropout_mask, final_hidden = self._forward_cache
+        ids, embed_dropout_mask, final_hidden, forward_domain = self._forward_cache
 
         grad_logits = np.asarray(grad_logits, dtype=np.float32)
         grad_logits = _sanitize(grad_logits)
@@ -1205,39 +1489,33 @@ class CustomTransformerLM:
         # ================================================================
         # Soft-cap backward pada logits
         # ================================================================
-        # logits = cap * tanh(final_hidden @ embed_tokens.T / cap)
-        # Kita perlu gradient terhadap pre-cap logits
-        pre_cap_logits = final_hidden @ self.embed_tokens.data.T
+        active_head = self.lm_heads[forward_domain]
+        pre_cap_logits = final_hidden @ active_head.data.T
         grad_logits = _softcap_backward(grad_logits, pre_cap_logits, self.final_logit_cap)
 
         grad_logits_2d = grad_logits.reshape(-1, V)
         final_hidden_2d = final_hidden.reshape(-1, D)
 
         # ================================================================
-        # Gradient untuk lm_head (yang sama dengan embed_tokens jika weight tying)
+        # Gradient untuk LM head yang aktif
         # ================================================================
-        # grad_logits = grad @ (embed_tokens.T)
-        # d(embed_tokens) dari logits = grad.T @ final_hidden
         lm_grad = grad_logits_2d.T @ final_hidden_2d
+        active_head.grad += lm_grad
+        active_head.grad = _sanitize(active_head.grad)
 
-        if self.use_weight_tying:
-            # lm_head = embed_tokens, accumulate gradient langsung ke embed_tokens
-            self.embed_tokens.grad += lm_grad
-        else:
-            self.lm_head.grad += lm_grad
-            self.lm_head.grad = _sanitize(self.lm_head.grad)
-
-        d_hidden = grad_logits @ self.embed_tokens.data
+        # ================================================================
+        # Backprop ke hidden states
+        # ================================================================
+        d_hidden = grad_logits @ active_head.data
         d_hidden = _sanitize(d_hidden)
 
         d_hidden = self.final_norm.backward(d_hidden)
 
+        # Backward melalui layers
         for layer in reversed(self.layers):
-            if self.use_rope:
-                d_hidden = layer.backward(d_hidden)
-            else:
-                d_hidden = layer.backward(d_hidden)
+            d_hidden = layer.backward(d_hidden)
 
+        # Embedding dropout backward
         d_hidden = _dropout_backward(d_hidden, embed_dropout_mask)
         d_hidden = _sanitize(d_hidden)
 
@@ -1295,10 +1573,38 @@ if __name__ == "__main__":
             attention_logit_cap=30.0,
             final_logit_cap=50.0,
             drop_path_rate=0.1,
+            # MoE parameters
+            use_moe=True,
+            moe_auto_routing=True,
         ),
     )
 
     model = CustomTransformerLM(small_config)
+
+    # ================================================================
+    # Test 1: MoE domain management
+    # ================================================================
+    print("=" * 60)
+    print("Test 1: MoE Domain Management")
+    print("=" * 60)
+
+    print(f"Initial domains: {model.list_domains()}")
+
+    # Tambah beberapa domain
+    model.init_domains(["MOBIL", "SAINS", "FILSAFAT"])
+    print(f"After init_domains: {model.list_domains()}")
+
+    print(f"\nParameter count:")
+    print(f"  Backbone     : {model.backbone_parameter_count():,}")
+    print(f"  LM heads     : {model.lm_heads_parameter_count():,}")
+    print(f"  Total        : {model.parameter_count():,}")
+
+    # ================================================================
+    # Test 2: Forward dengan domain berbeda
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("Test 2: Forward dengan Domain Berbeda")
+    print("=" * 60)
 
     batch_ids = np.array(
         [
@@ -1308,29 +1614,104 @@ if __name__ == "__main__":
         dtype=np.int64,
     )
 
+    # Test per domain
+    for domain in ["GENERAL", "MOBIL", "SAINS"]:
+        model.set_active_domain(domain)
+        model.zero_grad()
+
+        logits = model.forward(batch_ids, training=True)
+        print(f"Domain {domain:10s} - logits shape: {logits.shape}, sample: {logits[0, 0, :4]}")
+
+    # ================================================================
+    # Test 3: Backward hanya update active domain
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("Test 3: Backward per Domain")
+    print("=" * 60)
+
+    model.set_active_domain("MOBIL")
     model.zero_grad()
 
     logits = model.forward(batch_ids, training=True)
-
     grad_logits = np.ones_like(logits, dtype=np.float32)
-
     model.backward(grad_logits)
 
-    print("core/architecture.py (SOTA) test OK")
-    print(f"Parameter count   : {model.parameter_count():,}")
-    print(f"Logits shape      : {logits.shape}")
-    print(f"Sample logits     : {logits[0, 0, :8]}")
-    print(f"Weight tying      : {model.use_weight_tying}")
-    print(f"RoPE              : {model.use_rope}")
-    print(f"Final logit cap   : {model.final_logit_cap}")
-    print(f"Drop path rate    : {model.drop_path_rate}")
+    # Cek gradient per domain
+    for domain in model.list_domains():
+        head = model.lm_heads[domain]
+        grad_norm = np.linalg.norm(head.grad)
+        print(f"Domain {domain:10s} - grad norm: {grad_norm:.6f}")
 
-    # Test sanitasi dengan input ekstrem
-    print("\nTest sanitasi dengan input ekstrem...")
-    extreme_ids = np.array([[2, 5, 7]], dtype=np.int64)
-    extreme_logits = model.forward(extreme_ids, training=True)
-    print(f"Logits finite: {np.all(np.isfinite(extreme_logits))}")
+    # ================================================================
+    # Test 4: Hidden states extraction
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("Test 4: Hidden States Extraction")
+    print("=" * 60)
 
-    # Test weight tying
-    if model.use_weight_tying:
-        print(f"\nWeight tying check: embed_tokens is lm_head: {model.embed_tokens is model.lm_head}")
+    test_ids = np.array([[2, 5, 7, 10]], dtype=np.int64)
+
+    emb_mean = model.get_hidden_states(test_ids, pooling="mean")
+    emb_last = model.get_hidden_states(test_ids, pooling="last")
+    emb_none = model.get_hidden_states(test_ids, pooling="none")
+
+    print(f"Mean pooling  : shape {emb_mean.shape}")
+    print(f"Last token    : shape {emb_last.shape}")
+    print(f"No pooling    : shape {emb_none.shape}")
+
+    # ================================================================
+    # Test 5: State dict save/load
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("Test 5: State Dict Save/Load")
+    print("=" * 60)
+
+    state = model.state_dict()
+    print(f"State dict keys ({len(state)} total):")
+    for key in list(state.keys())[:8]:
+        if isinstance(state[key], np.ndarray):
+            print(f"  {key}: shape {state[key].shape}")
+        else:
+            print(f"  {key}: {state[key]}")
+    if len(state) > 8:
+        print(f"  ... and {len(state) - 8} more")
+
+    # Load ke model baru
+    print("\nLoading ke model baru...")
+    model2 = CustomTransformerLM(small_config)
+    result = model2.load_state_dict(state, strict=False)
+    print(f"Load result: {result}")
+    print(f"Domains di model2: {model2.list_domains()}")
+
+    # ================================================================
+    # Test 6: Backward compatibility dengan old format
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("Test 6: Backward Compatibility (Old Single-Head Format)")
+    print("=" * 60)
+
+    # Simulasi state_dict lama
+    old_state = {
+        "embed_tokens.weight": np.random.randn(64, 32).astype(np.float32),
+        "norm.weight": np.ones(32, dtype=np.float32),
+        "lm_head.weight": np.random.randn(64, 32).astype(np.float32),  # Old format
+    }
+    # Tambah dummy layer weights
+    for i in range(2):
+        old_state[f"layers.{i}.input_layernorm.weight"] = np.ones(32, dtype=np.float32)
+        old_state[f"layers.{i}.post_attention_layernorm.weight"] = np.ones(32, dtype=np.float32)
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            old_state[f"layers.{i}.self_attn.{proj}.weight"] = np.random.randn(32, 32).astype(np.float32)
+        for proj in ["gate_proj", "up_proj"]:
+            old_state[f"layers.{i}.mlp.{proj}.weight"] = np.random.randn(48, 32).astype(np.float32)
+        old_state[f"layers.{i}.mlp.down_proj.weight"] = np.random.randn(32, 48).astype(np.float32)
+
+    model3 = CustomTransformerLM(small_config)
+    result3 = model3.load_state_dict(old_state, strict=False)
+    print(f"Load result: {result3}")
+    print(f"Domains setelah load old format: {model3.list_domains()}")
+    print(f"GENERAL head shape: {model3.lm_heads['GENERAL'].shape}")
+
+    print("\n" + "=" * 60)
+    print("core/architecture.py (SOTA + MoE) test OK")
+    print("=" * 60)

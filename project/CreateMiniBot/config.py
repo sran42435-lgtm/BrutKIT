@@ -4,12 +4,19 @@
 # File ini menjadi sumber parameter tunggal untuk seluruh modul:
 # - core/tokenizer.py
 # - core/architecture.py
+# - core/router.py
 # - pipeline/trainer.py
 # - pipeline/evaluator.py
 # - pipeline/weight_manager.py
 # - core/model_exporter.py
 # - testing/playground.py
 # - main.py
+#
+# Fitur Unggulan:
+# - Dynamic MoE: auto-detect domain dari file dataset baru
+# - Auto Routing: keyword-based routing tanpa hardcode domain
+# - Standalone Engine: support export ke format portable
+# - SOTA: RoPE, Weight Tying, Soft-Capping, DropPath
 #
 # Implementasi ini sengaja tidak bergantung pada pustaka ML eksternal.
 # Hanya menggunakan standard library Python.
@@ -50,6 +57,21 @@ ALLOWED_EXPORT_DTYPES: Final[frozenset] = frozenset(
     }
 )
 
+ALLOWED_KEYWORD_METHODS: Final[frozenset] = frozenset(
+    {
+        "frequency",  # Top-N kata paling frequent
+        "tfidf",      # TF-IDF: kata unik yang khas untuk domain
+        "hybrid",     # Frequency × uniqueness score (rekomendasi)
+    }
+)
+
+ALLOWED_MOE_TRAIN_MODES: Final[frozenset] = frozenset(
+    {
+        "per_domain",  # Train per domain (backbone shared, head specific)
+        "mixed",       # Mix semua domain dalam satu epoch (traditional)
+    }
+)
+
 
 # ==============================================================================
 # PATH CONFIG
@@ -61,9 +83,15 @@ class PathsConfig:
     Konfigurasi lokasi folder dan file penting.
 
     Sesuai struktur proyek:
-    plural-dev/
+    CreateMiniBot/
     ├── datasets/
     ├── output_models/
+    │   ├── otak_model.safetensors
+    │   ├── otak_engine.py          (standalone inference)
+    │   ├── training_checkpoint.npz
+    │   ├── domain_keywords.json
+    │   ├── semantic_cache.npz
+    │   └── moe_cache/              (cached embeddings per domain)
     ├── vocab.json
     """
 
@@ -77,17 +105,25 @@ class PathsConfig:
         default_factory=lambda: ROOT_DIR / "output_models" / "training_checkpoint.npz"
     )
 
+    # Path untuk standalone engine yang ikut di-export
+    engine_standalone_path: Path = field(
+        default_factory=lambda: ROOT_DIR / "output_models" / "otak_engine.py"
+    )
+
+    # Folder untuk cached semantic embeddings per domain
+    moe_cache_dir: Path = field(
+        default_factory=lambda: ROOT_DIR / "output_models" / "moe_cache"
+    )
+
     def ensure_dirs(self) -> None:
         """
         Membuat folder-folder penting jika belum ada.
-
-        Dipanggil secara eksplisit oleh main.py atau saat pengguna menjalankan:
-            python config.py
         """
         self.datasets_dir.mkdir(parents=True, exist_ok=True)
         self.output_models_dir.mkdir(parents=True, exist_ok=True)
         self.final_model_path.parent.mkdir(parents=True, exist_ok=True)
         self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        self.moe_cache_dir.mkdir(parents=True, exist_ok=True)
 
 
 # ==============================================================================
@@ -100,22 +136,36 @@ class SpecialTokensConfig:
     Token khusus yang wajib ada dalam tokenizer.
 
     Urutan ID dikunci:
-    0 -> [PAD]
-    1 -> [UNK]
-    2 -> [BOS]
-    3 -> [EOS]
-    4 -> <|endoftext|>  (pemisah dokumen, untuk mencegah topic drift)
+    0 -> [PAD]       : padding
+    1 -> [UNK]       : unknown token
+    2 -> [BOS]       : begin of sequence
+    3 -> [EOS]       : end of sequence
+    4 ->  : pemisah dokumen (mencegah topic drift)
+
+    Perbedaan [EOS] vs :
+    - [EOS]    : akhir satu utterance/kalimat pendek
+    -  : pemisah antar dokumen/paragraf dalam korpus training
+
+    Catatan:
+    - String literal dikonkatenasi untuk menghindari rendering markdown
+      yang mungkin menghapus tag  sebagai HTML.
     """
 
     pad: str = "[PAD]"
     unk: str = "[UNK]"
     bos: str = "[BOS]"
     eos: str = "[EOS]"
-    endoftext: str = "<|endoftext|>"
+    endoftext: str = '<' + '|' + 'endoftext' + '|' + '>'
 
     @property
     def ordered_tokens(self) -> Tuple[str, ...]:
-        return (self.pad, self.unk, self.bos, self.eos, self.endoftext)
+        return (
+            self.pad,
+            self.unk,
+            self.bos,
+            self.eos,
+            self.endoftext,
+        )
 
     @property
     def token_to_id(self) -> Dict[str, int]:
@@ -157,18 +207,18 @@ class TrainingConfig:
     - pipeline/evaluator.py
     """
 
-    # Learning rate: diturunkan dari 3e-4 ke 1e-4 untuk stabilitas
+    # Learning rate
     learning_rate: float = 3e-4
 
     batch_size: int = 2
     epochs: int = 500
     sequence_length: int = 64
 
-    # Regularization: dinaikkan dari 0.0 ke 0.1 untuk mencegah overfit
+    # Regularization
     dropout_rate: float = 0.4
     weight_decay: float = 0.15
 
-    # Gradient clipping untuk mencegah exploding gradient
+    # Gradient clipping
     grad_clip_norm: float = 1.0
 
     # AdamW optimizer parameters
@@ -177,41 +227,51 @@ class TrainingConfig:
     adam_epsilon: float = 1e-8
 
     # Learning rate scheduling
-    # Warmup: LR naik perlahan di awal training
     lr_warmup_steps: int = 100
-
-    # Decay: LR turun setelah step tertentu
-    # 0 = tidak ada decay, > 0 = decay setiap N step
     lr_decay_steps: int = 0
-
-    # Faktor decay (misal 0.5 = LR dibagi 2 setiap lr_decay_steps)
     lr_decay_factor: float = 0.5
-
-    # Minimum learning rate (LR tidak akan turun di bawah ini)
     lr_min: float = 1e-6
 
-    # Gradient accumulation untuk effective batch size lebih besar
-    # effective_batch_size = batch_size * gradient_accumulation_steps
-    # 1 = tidak ada accumulation
+    # Gradient accumulation
     gradient_accumulation_steps: int = 1
 
     # Early stopping
-    # 0 = tidak ada early stopping
-    # > 0 = stop jika loss tidak turun selama N epoch
     early_stopping_patience: int = 5
 
     # Evaluasi dan checkpoint
-    # 0 = hanya di akhir epoch
-    # > 0 = evaluasi/checkpoint setiap N step
     eval_every_n_steps: int = 0
     save_checkpoint_every_n_steps: int = 0
 
     # Inline training dari playground
-    # Jumlah step default saat user mengetik "training" di interactive mode
     inline_training_steps: int = 10
 
     # Reproducibility
     seed: int = 1337
+
+    # ================================================================
+    # MOE TRAINING PARAMETERS
+    # ================================================================
+
+    # Metode ekstraksi keywords per domain
+    # "frequency" : top-N kata paling frequent
+    # "tfidf"     : TF-IDF (kata unik yang khas)
+    # "hybrid"    : frequency × uniqueness (rekomendasi)
+    moe_keyword_method: str = "hybrid"
+
+    # Jumlah keywords yang diekstrak per domain
+    moe_keywords_per_domain: int = 30
+
+    # Mode training MoE
+    # "per_domain" : latih per domain secara bergantian (backbone shared)
+    # "mixed"      : campur semua domain dalam satu epoch
+    moe_train_mode: str = "per_domain"
+
+    # Jumlah epochs per domain dalam mode per_domain
+    # Total epochs = epochs_per_domain × num_domains
+    moe_epochs_per_domain: int = 30
+
+    # Rebuild semantic cache setelah training selesai
+    moe_rebuild_cache_after_training: bool = True
 
 
 # ==============================================================================
@@ -225,6 +285,7 @@ class ModelConfig:
 
     Dipakai oleh:
     - core/architecture.py
+    - core/router.py
     - core/model_exporter.py
     - core/tokenizer.py untuk vocab_size
     - testing/playground.py
@@ -252,43 +313,89 @@ class ModelConfig:
     # SOTA UPGRADE PARAMETERS
     # ================================================================
 
-    # RoPE: Rotary Position Embedding (menggantikan sinusoidal absolut).
-    # Menerapkan rotasi pada Q dan K secara relatif, jauh lebih baik untuk
-    # menjaga koherensi konteks panjang.
+    # RoPE: Rotary Position Embedding
     use_rope: bool = True
 
     # Weight Tying: share bobot embed_tokens dengan lm_head.
-    # Memangkas parameter, menyelaraskan ruang representasi input-output,
-    # dan mencegah model menghafal token ID secara berlebihan.
+    # CATATAN: akan otomatis di-disable jika use_moe=True
+    # karena MoE membutuhkan multiple LM heads yang berbeda.
     use_weight_tying: bool = True
 
-    # Attention logit soft-capping (tanh).
-    # Mencegah attention scores meledak tanpa memotong gradient keras.
-    # Nilai 30.0 mengikuti Gemma.
+    # Attention logit soft-capping (tanh)
     attention_logit_cap: float = 30.0
 
-    # Final logit soft-capping (tanh).
-    # Mencegah logits output meledak sebelum masuk ke Cross-Entropy Loss.
-    # Nilai 50.0 mengikuti Gemma.
+    # Final logit soft-capping (tanh)
     final_logit_cap: float = 50.0
 
-    # Stochastic Depth (DropPath) base rate.
-    # Probabilitas drop meningkat linear dari 0 di layer pertama ke
-    # drop_path_rate di layer terakhir.
-    # Nilai 0.1 adalah rekomendasi umum untuk model Transformer kecil-menengah.
+    # Stochastic Depth (DropPath) base rate
     drop_path_rate: float = 0.1
+
+    # ================================================================
+    # MOE PARAMETERS
+    # ================================================================
+
+    # Aktifkan Mixture of Experts dengan dynamic LM heads.
+    # Jika True, model akan memiliki:
+    #   - Shared backbone (17M params)
+    #   - Multiple LM heads (satu per domain yang terdeteksi dari datasets/)
+    #   - GENERAL head sebagai fallback
+    #
+    # Jika False, model behave seperti biasa (single LM head).
+    use_moe: bool = True
+
+    # Auto-routing saat inference
+    # True  : otomatis pilih LM head berdasarkan keyword di prompt
+    # False : user harus pilih domain manual via /domain command
+    moe_auto_routing: bool = True
+
+    # Confidence threshold untuk router
+    # Jika score domain teratas < threshold, fallback ke GENERAL head
+    # Range: 0.0 - 1.0
+    moe_router_confidence_threshold: float = 0.3
+
+    # Selalu buat head GENERAL sebagai fallback
+    # Head ini dilatih dengan data campuran semua domain
+    moe_always_create_general_head: bool = True
+
+    # Jumlah top keywords yang digunakan untuk scoring router
+    # Lebih tinggi = lebih akurat tapi lebih lambat
+    moe_router_top_keywords: int = 30
+
+    # Semantic search: jumlah paragraf relevan yang di-inject ke prompt
+    # 0 = disable semantic context injection
+    moe_semantic_top_k: int = 2
+
+    # Dimension untuk cached embeddings (semantic search)
+    # Jika None, pakai embedding_dim
+    moe_embedding_dim: Optional[int] = None
 
     @property
     def head_dim(self) -> int:
         """
         Dimensi per attention head.
-
-        Rumus:
-            head_dim = embedding_dim / num_attention_heads
         """
         if self.num_attention_heads == 0:
             return 0
         return self.embedding_dim // self.num_attention_heads
+
+    @property
+    def effective_use_weight_tying(self) -> bool:
+        """
+        Weight tying otomatis di-disable jika MoE aktif.
+        """
+        if self.use_moe:
+            return False
+        return self.use_weight_tying
+
+    @property
+    def effective_moe_embedding_dim(self) -> int:
+        """
+        Dimensi embedding untuk semantic search.
+        Default ke embedding_dim jika tidak diset.
+        """
+        if self.moe_embedding_dim is None:
+            return self.embedding_dim
+        return self.moe_embedding_dim
 
 
 # ==============================================================================
@@ -391,6 +498,46 @@ class Config:
             raise ValueError("model.drop_path_rate harus berada pada rentang [0, 1).")
 
         # ------------------------------------------------------------------
+        # Validasi MOE parameters
+        # ------------------------------------------------------------------
+        if t.moe_keyword_method not in ALLOWED_KEYWORD_METHODS:
+            raise ValueError(
+                f"training.moe_keyword_method tidak valid. "
+                f"Pilihan: {sorted(ALLOWED_KEYWORD_METHODS)}"
+            )
+
+        if t.moe_train_mode not in ALLOWED_MOE_TRAIN_MODES:
+            raise ValueError(
+                f"training.moe_train_mode tidak valid. "
+                f"Pilihan: {sorted(ALLOWED_MOE_TRAIN_MODES)}"
+            )
+
+        if t.moe_keywords_per_domain < 1:
+            raise ValueError("training.moe_keywords_per_domain harus >= 1.")
+
+        if t.moe_epochs_per_domain < 1:
+            raise ValueError("training.moe_epochs_per_domain harus >= 1.")
+
+        if not (0.0 <= m.moe_router_confidence_threshold <= 1.0):
+            raise ValueError(
+                "model.moe_router_confidence_threshold harus berada pada rentang [0, 1]."
+            )
+
+        if m.moe_router_top_keywords < 1:
+            raise ValueError("model.moe_router_top_keywords harus >= 1.")
+
+        if m.moe_semantic_top_k < 0:
+            raise ValueError("model.moe_semantic_top_k tidak boleh negatif.")
+
+        if m.moe_embedding_dim is not None and m.moe_embedding_dim <= 0:
+            raise ValueError("model.moe_embedding_dim harus > 0 jika diset.")
+
+        # Warning jika MoE aktif tapi weight tying juga aktif
+        if m.use_moe and m.use_weight_tying:
+            # Ini bukan error, hanya info - weight tying akan auto-disable
+            pass
+
+        # ------------------------------------------------------------------
         # Validasi hyperparameter training
         # ------------------------------------------------------------------
         if t.learning_rate <= 0.0:
@@ -477,9 +624,6 @@ CONFIG.validate()
 # ==============================================================================
 
 if __name__ == "__main__":
-    # Jika file ini dijalankan langsung, buat folder-folder yang dibutuhkan
-    # dan tampilkan ringkasan konfigurasi.
-
     CONFIG.ensure_dirs()
 
     print("config.py valid.")
@@ -489,13 +633,15 @@ if __name__ == "__main__":
     print(f"Vocab path          : {CONFIG.paths.vocab_path}")
     print(f"Final model path    : {CONFIG.paths.final_model_path}")
     print(f"Checkpoint path     : {CONFIG.paths.checkpoint_path}")
+    print(f"Engine standalone   : {CONFIG.paths.engine_standalone_path}")
+    print(f"MoE cache dir       : {CONFIG.paths.moe_cache_dir}")
     print()
     print("Special tokens:")
     print(f"  [PAD]              : {CONFIG.special_tokens.pad_id}")
     print(f"  [UNK]              : {CONFIG.special_tokens.unk_id}")
     print(f"  [BOS]              : {CONFIG.special_tokens.bos_id}")
     print(f"  [EOS]              : {CONFIG.special_tokens.eos_id}")
-    print(f"  <|endoftext|>      : {CONFIG.special_tokens.endoftext_id}")
+    print(f"    : {CONFIG.special_tokens.endoftext_id}")
     print()
     print("Training config:")
     print(f"  learning_rate                : {CONFIG.training.learning_rate}")
@@ -515,6 +661,13 @@ if __name__ == "__main__":
     print(f"  save_checkpoint_every_n_steps: {CONFIG.training.save_checkpoint_every_n_steps}")
     print(f"  inline_training_steps        : {CONFIG.training.inline_training_steps}")
     print()
+    print("Training (MoE):")
+    print(f"  moe_keyword_method           : {CONFIG.training.moe_keyword_method}")
+    print(f"  moe_keywords_per_domain      : {CONFIG.training.moe_keywords_per_domain}")
+    print(f"  moe_train_mode               : {CONFIG.training.moe_train_mode}")
+    print(f"  moe_epochs_per_domain        : {CONFIG.training.moe_epochs_per_domain}")
+    print(f"  moe_rebuild_cache_after_train: {CONFIG.training.moe_rebuild_cache_after_training}")
+    print()
     print("Model config:")
     print(f"  vocab_size        : {CONFIG.model.vocab_size}")
     print(f"  embedding_dim     : {CONFIG.model.embedding_dim}")
@@ -527,8 +680,18 @@ if __name__ == "__main__":
     print(f"  export_dtype      : {CONFIG.model.export_dtype}")
     print()
     print("SOTA features:")
-    print(f"  use_rope              : {CONFIG.model.use_rope}")
-    print(f"  use_weight_tying      : {CONFIG.model.use_weight_tying}")
-    print(f"  attention_logit_cap   : {CONFIG.model.attention_logit_cap}")
-    print(f"  final_logit_cap       : {CONFIG.model.final_logit_cap}")
-    print(f"  drop_path_rate        : {CONFIG.model.drop_path_rate}")
+    print(f"  use_rope                          : {CONFIG.model.use_rope}")
+    print(f"  use_weight_tying                  : {CONFIG.model.use_weight_tying}")
+    print(f"  effective_use_weight_tying        : {CONFIG.model.effective_use_weight_tying}")
+    print(f"  attention_logit_cap               : {CONFIG.model.attention_logit_cap}")
+    print(f"  final_logit_cap                   : {CONFIG.model.final_logit_cap}")
+    print(f"  drop_path_rate                    : {CONFIG.model.drop_path_rate}")
+    print()
+    print("MoE features:")
+    print(f"  use_moe                           : {CONFIG.model.use_moe}")
+    print(f"  moe_auto_routing                  : {CONFIG.model.moe_auto_routing}")
+    print(f"  moe_router_confidence_threshold   : {CONFIG.model.moe_router_confidence_threshold}")
+    print(f"  moe_always_create_general_head    : {CONFIG.model.moe_always_create_general_head}")
+    print(f"  moe_router_top_keywords           : {CONFIG.model.moe_router_top_keywords}")
+    print(f"  moe_semantic_top_k                : {CONFIG.model.moe_semantic_top_k}")
+    print(f"  moe_embedding_dim                 : {CONFIG.model.effective_moe_embedding_dim}")
