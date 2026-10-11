@@ -19,6 +19,22 @@
 # --skip-test     : lewati test prompt
 # --skip-export   : lewati export model
 # --debug-tokens  : tampilkan Token IDs dan Token Pieces saat inference
+#
+# BUG FIX:
+# - sync_model_domains() dipanggil setelah resume untuk memastikan
+#   semua LM heads (domain-specific) ada di model, tidak hanya GENERAL
+# - Sampling parameters dari CLI (temperature, top_k, dll) benar-benar
+#   dipass ke playground.interactive()
+#
+# Keterhubungan:
+# - config.py              : konfigurasi global
+# - core/tokenizer.py      : tokenizer BPE
+# - core/architecture.py   : model transformer
+# - core/model_exporter.py : export ke safetensors
+# - pipeline/trainer.py    : training loop (dengan sync_model_domains)
+# - pipeline/evaluator.py  : evaluasi model
+# - pipeline/weight_manager.py : load/save checkpoint
+# - testing/playground.py  : inference testing
 
 from __future__ import annotations
 
@@ -78,6 +94,7 @@ def print_config_summary(config: Config) -> None:
     print(f"  max_position_embeddings : {config.model.max_position_embeddings}")
     print(f"  train_dtype             : {config.model.train_dtype}")
     print(f"  export_dtype            : {config.model.export_dtype}")
+    print(f"  use_moe                 : {getattr(config.model, 'use_moe', False)}")
 
     print()
     print("Training:")
@@ -194,6 +211,7 @@ def export_model(
         output_path=args.export_path,
         export_dtype=args.export_dtype,
         include_vocab=True,
+        include_moe_assets=True,
     )
 
     file_size = Path(output_path).stat().st_size
@@ -205,6 +223,47 @@ def export_model(
 
 
 # ============================================================================
+# SYNC MODEL DOMAINS HELPER (BARU)
+# ============================================================================
+
+def sync_and_save_domains(
+    trainer: Trainer,
+    weight_manager: WeightManager,
+    verbose: bool = True,
+) -> int:
+    """
+    Sync LM heads dengan dataset, lalu save checkpoint.
+    
+    FIX KRITIS: Memastikan semua domain punya LM head setelah resume.
+    
+    Return:
+    - int: jumlah domain baru yang di-init (0 jika sudah lengkap)
+    """
+    if not hasattr(trainer, 'sync_model_domains'):
+        if verbose:
+            print("[main] ⚠️ Trainer tidak punya sync_model_domains(). Skip.")
+        return 0
+    
+    if verbose:
+        print("[main] Syncing model domains dengan dataset...")
+    
+    new_domains = trainer.sync_model_domains(verbose=verbose)
+    
+    if new_domains > 0:
+        # Save ulang checkpoint dengan semua LM heads
+        if verbose:
+            print(f"[main] Saving checkpoint dengan {new_domains} LM heads baru...")
+        ckpt_path = weight_manager.save_checkpoint()
+        if verbose:
+            print(f"[main] ✅ Checkpoint updated: {ckpt_path}")
+    else:
+        if verbose:
+            print("[main] ✅ Semua LM heads sudah lengkap, tidak perlu update checkpoint.")
+    
+    return new_domains
+
+
+# ============================================================================
 # MAIN PIPELINE
 # ============================================================================
 
@@ -213,7 +272,7 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     Menjalankan pipeline.
 
     MODE INTERACTIVE (--interactive):
-        Tokenizer -> Load Model -> Playground
+        Tokenizer -> Load Model -> Sync Domains -> Playground
         Training dilakukan via perintah 'training' di playground.
 
     MODE PIPELINE (default):
@@ -259,8 +318,6 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     print("[main] Evaluator siap.")
     print("[main] WeightManager siap.")
 
-    # Trainer dibuat tanpa print section terpisah.
-    # Trainer dibutuhkan oleh playground untuk inline training.
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
@@ -313,19 +370,43 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
         # MODE INTERACTIVE
         # Langsung masuk playground.
         # Training dilakukan via perintah 'training' di playground.
-        # Tidak ada segment TRAINER / TRAINING / EVAL.
         # ----------------------------------------------------------------
         print_section("PLAYGROUND INTERACTIVE")
 
         if resumed:
             print(f"[main] Model dimuat dari checkpoint (epoch {start_epoch}, step {global_step}).")
+            
+            # ============================================================
+            # FIX KRITIS: Sync LM heads dengan dataset
+            # ============================================================
+            # Pastikan semua domain punya LM head (tidak hanya GENERAL)
+            sync_and_save_domains(
+                trainer=trainer,
+                weight_manager=weight_manager,
+                verbose=True,
+            )
+            
             print("[main] Gunakan perintah '/training' untuk melatih lebih lanjut.")
         else:
             print("[main] Model baru dibuat (belum dilatih).")
+            
+            # Init domains untuk model baru juga
+            use_moe = bool(getattr(config.model, 'use_moe', False))
+            if use_moe:
+                print("[main] Menginisialisasi domain LM heads...")
+                sync_and_save_domains(
+                    trainer=trainer,
+                    weight_manager=weight_manager,
+                    verbose=True,
+                )
+            
             print("[main] Gunakan perintah '/training' untuk melatih.")
 
         print()
 
+        # ============================================================
+        # BUG FIX: Pass sampling parameters dari CLI ke playground
+        # ============================================================
         playground = Playground(
             model=model,
             tokenizer=tokenizer,
@@ -363,6 +444,15 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
         # TRAINING
         if not args.skip_training:
             print_section("TRAINING")
+            
+            # Untuk MoE, sync domains dulu sebelum training (jika belum)
+            use_moe = bool(getattr(config.model, 'use_moe', False))
+            if use_moe and not resumed:
+                sync_and_save_domains(
+                    trainer=trainer,
+                    weight_manager=weight_manager,
+                    verbose=True,
+                )
 
             history = trainer.run_epochs(
                 max_steps=args.max_steps,
@@ -477,19 +567,23 @@ def run_demo(args: argparse.Namespace) -> None:
         datasets_dir.mkdir(parents=True, exist_ok=True)
         output_models_dir.mkdir(parents=True, exist_ok=True)
 
-        sample_file = datasets_dir / "sample.txt"
-        sample_file.write_text(
-            "\n".join(
-                [
-                    "mobil memiliki mesin",
-                    "mobil memakai bahan bakar",
-                    "kecepatan mobil tergantung mesin",
-                    "apa itu mobil",
-                    "mesin mobil perlu dirawat",
-                    "bahan bakar mempengaruhi performa mobil",
-                    "performa mobil tergantung efisiensi mesin",
-                ]
-            ),
+        # Dataset demo dengan multi-domain
+        mobil_file = datasets_dir / "mobil.txt"
+        mobil_file.write_text(
+            "[MOBIL] Mobil adalah kendaraan beroda empat.\n\n"
+            "[MOBIL] Mobil menggunakan mesin sebagai penggerak utama.\n\n"
+            "[MOBIL] Rem mobil berfungsi untuk menghentikan kendaraan.\n\n"
+            "[MOBIL] Bahan bakar mobil bisa berupa bensin atau diesel.\n\n"
+            "[MOBIL] Transmisi mobil mengatur perpindahan gigi.",
+            encoding="utf-8",
+        )
+
+        sains_file = datasets_dir / "sains.txt"
+        sains_file.write_text(
+            "[SAINS] Air adalah senyawa kimia dengan rumus H2O.\n\n"
+            "[SAINS] Fotosintesis menghasilkan oksigen dari CO2.\n\n"
+            "[SAINS] Matahari adalah bintang terdekat dengan Bumi.\n\n"
+            "[SAINS] Atom terdiri dari proton, neutron, dan elektron.",
             encoding="utf-8",
         )
 
@@ -508,22 +602,25 @@ def run_demo(args: argparse.Namespace) -> None:
                 learning_rate=3e-4,
                 batch_size=2,
                 epochs=1,
-                sequence_length=8,
+                sequence_length=16,
+                dropout_rate=0.0,
                 weight_decay=0.01,
                 grad_clip_norm=1.0,
                 seed=1337,
+                moe_train_mode="per_domain",
+                moe_epochs_per_domain=1,
             ),
             model=ModelConfig(
-                vocab_size=96,
+                vocab_size=128,
                 embedding_dim=32,
-                num_attention_heads=2,
+                num_attention_heads=4,
                 num_layers=1,
-                dropout_rate=0.0,
                 max_position_embeddings=64,
                 layer_norm_eps=1e-5,
                 ffn_hidden_dim=64,
                 train_dtype="float32",
-                export_dtype="float16",
+                export_dtype="float32",
+                use_moe=True,
             ),
         )
 
@@ -531,10 +628,10 @@ def run_demo(args: argparse.Namespace) -> None:
 
         demo_args.resume = False
         demo_args.export_path = None
-        demo_args.interactive = False  # Demo selalu pakai mode pipeline
+        demo_args.interactive = False
 
         if demo_args.max_steps is None:
-            demo_args.max_steps = 4
+            demo_args.max_steps = 10
 
         if demo_args.eval_batches != 0:
             demo_args.eval_batches = 2
@@ -629,29 +726,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.75,
-        help="Temperature sampling untuk playground.",
+        default=0.3,
+        help="Temperature sampling untuk playground (default: 0.3 untuk model kecil).",
     )
 
     parser.add_argument(
         "--top-k",
         type=int,
-        default=30,
-        help="Top-K sampling untuk playground.",
+        default=20,
+        help="Top-K sampling untuk playground (default: 20 untuk fokus).",
     )
 
     parser.add_argument(
         "--top-p",
         type=float,
-        default=0.92,
-        help="Top-P sampling untuk playground.",
+        default=0.85,
+        help="Top-P sampling untuk playground (default: 0.85).",
     )
 
     parser.add_argument(
         "--repetition-penalty",
         type=float,
-        default=1.25,
-        help="Repetition penalty. Nilai > 1 mengurangi pengulangan.",
+        default=1.3,
+        help="Repetition penalty. Nilai > 1 mengurangi pengulangan (default: 1.3).",
     )
 
     parser.add_argument(

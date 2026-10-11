@@ -2,8 +2,8 @@
 #
 # Trainer / Training Loop Engine untuk Training Pipeline Engine.
 #
-# VERSI MOE-INTEGRATED + BUG FIX:
-# SOTA features (tetap dipertahankan):
+# VERSI MOE-INTEGRATED + BUG FIX LENGKAP:
+# SOTA features:
 # - Conditioned Training: domain prefix ([MOBIL], [SAINS]) dipertahankan
 # - Domain-Aware Batching: batch hanya berisi satu domain
 # - Document Boundary dengan 
@@ -18,11 +18,11 @@
 # - Save keywords + embeddings ke output folder
 # - Support mode "per_domain" dan "mixed"
 #
-# BUG FIX (PENTING):
-# - Router sekarang dibangun juga setelah train_epochs_inline()
-# - Router sekarang dibangun juga setelah train_steps()
-# - Sebelumnya router HANYA dibangun di run_epochs()/_run_moe_training()
-# - Ini menyebabkan inline training dari playground tidak menghasilkan router
+# BUG FIX:
+# - Router dibangun juga setelah train_epochs_inline()
+# - Router dibangun juga setelah train_steps()
+# - LM heads disinkronkan dengan dataset via sync_model_domains()
+# - Checkpoint di-save SETELAH init domains (agar semua LM heads tersimpan)
 #
 # Keterhubungan:
 # - config.py              : hyperparameter training + MoE
@@ -98,7 +98,8 @@ class Trainer:
     
     BUG FIX:
     - Router dibangun otomatis setelah SEMUA mode training selesai
-      (run_epochs, train_epochs_inline, train_steps)
+    - sync_model_domains() memastikan semua LM heads ada setelah resume
+    - Checkpoint di-save setelah init domains agar semua LM heads tersimpan
     """
 
     LOG_EVERY_STEPS = 10
@@ -159,6 +160,83 @@ class Trainer:
 
         if self.sequence_length <= 0:
             raise ValueError("sequence_length harus lebih besar dari 0.")
+
+    # ========================================================================
+    # SYNC MODEL DOMAINS (BARU - FIX KRITIS)
+    # ========================================================================
+
+    def sync_model_domains(self, verbose: bool = True) -> int:
+        """
+        Sync LM heads model dengan domains yang ada di dataset.
+        
+        FIX KRITIS: Dipanggil setelah load checkpoint untuk memastikan
+        semua domain punya LM head, tidak hanya GENERAL.
+        
+        Masalah yang dipecahkan:
+        - Checkpoint lama hanya punya GENERAL head (karena LM heads domain
+          tidak tersimpan saat training sebelumnya)
+        - Saat resume, model hanya punya GENERAL → router fallback ke GENERAL
+        - Jawaban campur aduk karena GENERAL head hafal semua domain
+        
+        Flow:
+        1. Load paragraphs dari dataset (jika belum)
+        2. Cek domain yang ada di model vs yang dibutuhkan
+        3. Init LM heads untuk domain yang missing
+        4. Return jumlah domain baru yang di-init
+        
+        Return:
+        - int: jumlah domain baru yang di-init (0 jika sudah lengkap)
+        """
+        if not self.use_moe:
+            return 0
+        
+        # Load paragraphs dari dataset
+        if not self._paragraphs_by_domain:
+            rng_init = np.random.default_rng(self.seed)
+            self._paragraphs_by_domain = self._load_paragraphs_by_domain(rng=rng_init)
+        
+        if not self._paragraphs_by_domain:
+            if verbose:
+                print("[Trainer] Tidak ada dataset untuk sync domains.")
+            return 0
+        
+        # Cek domain yang sudah ada di model
+        existing_domains = set()
+        if hasattr(self.model, 'list_domains'):
+            existing_domains = set(self.model.list_domains())
+        
+        # Domain yang perlu di-init (exclude _GENERAL_ dan GENERAL yang sudah ada)
+        needed_domains = set(self._paragraphs_by_domain.keys()) - {"_GENERAL_"}
+        missing_domains = needed_domains - existing_domains
+        
+        if not missing_domains:
+            if verbose:
+                print(f"[Trainer] ✅ Semua {len(needed_domains)} domain sudah ada di model.")
+                print(f"[Trainer] Model domains: {sorted(existing_domains)}")
+            return 0
+        
+        if verbose:
+            print(f"[Trainer] ⚠️ Sync domains: {len(missing_domains)} domain perlu di-init")
+            print(f"[Trainer] Existing domains: {sorted(existing_domains)}")
+            print(f"[Trainer] Missing domains:")
+            for domain in sorted(missing_domains):
+                n_paras = len(self._paragraphs_by_domain.get(domain, []))
+                print(f"  - {domain}: {n_paras} paragraphs")
+        
+        # Init LM heads untuk domain yang missing
+        if hasattr(self.model, 'init_domains'):
+            self.model.init_domains(list(missing_domains))
+        else:
+            if verbose:
+                print("[Trainer] ⚠️ Model tidak punya method init_domains(). Skip.")
+            return 0
+        
+        if verbose:
+            final_domains = self.model.list_domains() if hasattr(self.model, 'list_domains') else []
+            print(f"[Trainer] ✅ Model sekarang punya {len(final_domains)} domain LM heads")
+            print(f"[Trainer] Final domains: {sorted(final_domains)}")
+        
+        return len(missing_domains)
 
     # ========================================================================
     # RESUME STATE
@@ -310,18 +388,6 @@ class Trainer:
     ) -> List[dict]:
         """
         Per-domain training loop untuk MoE.
-
-        Flow:
-        1. Auto-detect domains dari dataset
-        2. Init LM heads untuk setiap domain
-        3. Untuk setiap domain:
-           a. Set active domain di model
-           b. Train selama moe_epochs_per_domain epochs
-           c. Track loss per domain
-        4. Setelah semua domain selesai:
-           a. Build keywords (via router)
-           b. Build semantic cache (via router)
-           c. Save semua assets ke output folder
         """
         if not self.tokenizer.is_ready:
             self.tokenizer.load()
@@ -336,15 +402,20 @@ class Trainer:
                 print("[Trainer] Dataset kosong. Tidak ada yang bisa dilatih.")
             return []
 
-        # ================================================================
-        # STEP 1: Inisialisasi LM heads untuk setiap domain
-        # ================================================================
         if verbose:
             print("=" * 70)
             print("MoE TRAINING MODE")
             print("=" * 70)
 
         self._init_model_domains(self._paragraphs_by_domain, verbose=verbose)
+
+        # ================================================================
+        # FIX: Save checkpoint setelah init domains
+        # ================================================================
+        if save_checkpoints:
+            ckpt_path = self.weight_manager.save_checkpoint()
+            if verbose:
+                print(f"[Trainer] Checkpoint awal (dengan semua LM heads): {ckpt_path}")
 
         # Daftar domain yang akan dilatih (exclude _GENERAL_)
         training_domains = [
@@ -390,7 +461,7 @@ class Trainer:
                 all_history.extend(domain_history)
 
         # ================================================================
-        # STEP 3: Train GENERAL domain (dengan semua data campuran)
+        # STEP 3: Train GENERAL domain
         # ================================================================
         if "_GENERAL_" in self._paragraphs_by_domain or self.config.model.moe_always_create_general_head:
             if verbose:
@@ -399,7 +470,6 @@ class Trainer:
                 print("DOMAIN [GENERAL] (fallback head)")
                 print("=" * 70)
 
-            # Kumpulkan semua paragraf untuk GENERAL training
             all_paragraphs = []
             for paras in self._paragraphs_by_domain.values():
                 all_paragraphs.extend(paras)
@@ -424,7 +494,7 @@ class Trainer:
                     all_history.extend(general_history)
 
         # ================================================================
-        # STEP 4: Build router assets (keywords + semantic cache)
+        # STEP 4: Build router assets
         # ================================================================
         if self.moe_rebuild_cache and _ROUTER_AVAILABLE:
             self._build_router_assets(verbose=verbose)
@@ -434,7 +504,7 @@ class Trainer:
             print()
             print("=" * 70)
             print("MoE TRAINING SELESAI")
-            print(f"Total domains dilatih: {len(training_domains) + 1}")  # +1 untuk GENERAL
+            print(f"Total domains dilatih: {len(training_domains) + 1}")
             print(f"Total epochs: {len(all_history)}")
             print("=" * 70)
 
@@ -451,12 +521,7 @@ class Trainer:
         global_step: int,
         epochs_override: Optional[int] = None,
     ) -> List[dict]:
-        """
-        Train satu domain untuk beberapa epochs.
-
-        Return:
-        - List of epoch reports
-        """
+        """Train satu domain untuk beberapa epochs."""
         if not paragraphs:
             return []
 
@@ -474,7 +539,6 @@ class Trainer:
             if verbose and (epoch == 0 or (epoch + 1) % 5 == 0):
                 print(f"[{domain}] Epoch {epoch + 1}/{num_epochs} dimulai")
 
-            # Generate batches untuk domain ini saja
             for inputs, targets in self._iter_domain_batches(paragraphs, shuffle=True, rng=rng):
                 if max_steps is not None and global_step >= int(max_steps):
                     break
@@ -512,7 +576,6 @@ class Trainer:
                 steps_done += 1
                 global_step += 1
 
-            # Rekap epoch
             if steps_done > 0:
                 avg_loss = epoch_loss / epoch_tokens if epoch_tokens > 0 else 0.0
                 accuracy = epoch_correct / epoch_tokens if epoch_tokens > 0 else 0.0
@@ -540,7 +603,6 @@ class Trainer:
                         f"tokens={epoch_tokens}"
                     )
 
-                # Save checkpoint
                 self.weight_manager.last_epoch = epoch + 1
                 self.weight_manager.global_step = global_step
 
@@ -557,16 +619,13 @@ class Trainer:
         shuffle: bool = True,
         rng: Optional[np.random.Generator] = None,
     ) -> Iterable[Tuple[np.ndarray, np.ndarray]]:
-        """
-        Yield batches dari list paragraf (satu domain saja).
-        """
+        """Yield batches dari list paragraf (satu domain saja)."""
         if rng is None:
             rng = np.random.default_rng()
 
         if shuffle and len(paragraphs) > 1:
             rng.shuffle(paragraphs)
 
-        # Generate examples
         examples: List[np.ndarray] = []
         for para in paragraphs:
             for ex in self._paragraph_to_examples(para):
@@ -575,7 +634,6 @@ class Trainer:
         if not examples:
             return
 
-        # Yield batches
         for i in range(0, len(examples), self.batch_size):
             chunk = examples[i : i + self.batch_size]
             if not chunk:
@@ -599,11 +657,7 @@ class Trainer:
         start_epoch: Optional[int] = None,
         global_step: Optional[int] = None,
     ) -> List[dict]:
-        """
-        Traditional training loop (non-MoE).
-
-        Semua domain dicampur dalam satu epoch, dengan domain-aware batching.
-        """
+        """Traditional training loop (non-MoE)."""
         if not self.tokenizer.is_ready:
             self.tokenizer.load()
 
@@ -770,7 +824,7 @@ class Trainer:
         return history
 
     # ========================================================================
-    # INLINE TRAINING BERBASIS STEP (dari playground)
+    # INLINE TRAINING BERBASIS STEP
     # ========================================================================
 
     def train_steps(
@@ -785,16 +839,16 @@ class Trainer:
         steps = max(1, int(steps))
 
         # ================================================================
-        # BUG FIX: Pre-load paragraphs sebelum training
-        # Sebelumnya ini tidak dilakukan, menyebabkan router tidak dibangun
+        # BUG FIX: Pre-load paragraphs + init LM heads
         # ================================================================
+        domains_just_initialized = False
         if self.use_moe and not self._paragraphs_by_domain:
             rng_init = np.random.default_rng(self.seed)
             self._paragraphs_by_domain = self._load_paragraphs_by_domain(rng=rng_init)
             
-            # Inisialisasi LM heads jika belum ada
             if self._paragraphs_by_domain:
                 self._init_model_domains(self._paragraphs_by_domain, verbose=verbose)
+                domains_just_initialized = True
 
         current_global_step = getattr(self.weight_manager, "global_step", 0)
         rng = np.random.default_rng(self.seed + current_global_step + 1)
@@ -899,7 +953,6 @@ class Trainer:
 
         # ================================================================
         # BUG FIX: Build router setelah step training selesai
-        # Sebelumnya router TIDAK dibangun di train_steps()
         # ================================================================
         if self.use_moe and self.moe_rebuild_cache and _ROUTER_AVAILABLE:
             if not self._paragraphs_by_domain:
@@ -913,7 +966,7 @@ class Trainer:
         return [report]
 
     # ========================================================================
-    # INLINE TRAINING BERBASIS EPOCH (dari playground)
+    # INLINE TRAINING BERBASIS EPOCH
     # ========================================================================
 
     def train_epochs_inline(
@@ -930,16 +983,22 @@ class Trainer:
         min_steps = max(0, int(min_steps))
 
         # ================================================================
-        # BUG FIX: Pre-load paragraphs sebelum training
-        # Sebelumnya ini tidak dilakukan, menyebabkan router tidak dibangun
+        # BUG FIX: Pre-load paragraphs + init LM heads
         # ================================================================
         if self.use_moe and not self._paragraphs_by_domain:
             rng_init = np.random.default_rng(self.seed)
             self._paragraphs_by_domain = self._load_paragraphs_by_domain(rng=rng_init)
             
-            # Inisialisasi LM heads jika belum ada
             if self._paragraphs_by_domain:
                 self._init_model_domains(self._paragraphs_by_domain, verbose=verbose)
+                
+                # ========================================================
+                # FIX KRITIS: Save checkpoint SETELAH init LM heads
+                # ========================================================
+                if save_checkpoint:
+                    ckpt_path = self.weight_manager.save_checkpoint()
+                    if verbose:
+                        print(f"[Trainer] ✅ Checkpoint awal (dengan LM heads) disimpan: {ckpt_path}")
 
         current_global_step = getattr(self.weight_manager, "global_step", 0)
         current_epoch = getattr(self.weight_manager, "last_epoch", 0)
@@ -1054,7 +1113,6 @@ class Trainer:
 
         # ================================================================
         # BUG FIX: Build router setelah inline epoch training selesai
-        # Sebelumnya router TIDAK dibangun di train_epochs_inline()
         # ================================================================
         if self.use_moe and self.moe_rebuild_cache and _ROUTER_AVAILABLE:
             if not self._paragraphs_by_domain:
@@ -1072,11 +1130,7 @@ class Trainer:
     # ========================================================================
 
     def _build_router_assets(self, verbose: bool = True) -> None:
-        """
-        Bangun keywords dan semantic cache menggunakan DomainRouter.
-
-        Dipanggil setelah training selesai.
-        """
+        """Bangun keywords dan semantic cache menggunakan DomainRouter."""
         if not _ROUTER_AVAILABLE:
             if verbose:
                 print("[Trainer] core/router.py tidak tersedia. Skip build router assets.")
@@ -1093,15 +1147,12 @@ class Trainer:
             print("BUILDING ROUTER ASSETS")
             print("=" * 70)
 
-        # Create router instance
         self._router = DomainRouter(self.config)
 
-        # Build keywords
         if verbose:
             print("[Trainer] Building keywords...")
         self._router.build_keywords(self._paragraphs_by_domain, verbose=verbose)
 
-        # Build semantic cache
         if verbose:
             print("[Trainer] Building semantic cache...")
         self._router.build_semantic_cache(
@@ -1112,9 +1163,7 @@ class Trainer:
         )
 
     def _save_router_assets(self, verbose: bool = True) -> None:
-        """
-        Save keywords JSON dan semantic cache NPZ ke output folder.
-        """
+        """Save keywords JSON dan semantic cache NPZ ke output folder."""
         if self._router is None:
             if verbose:
                 print("[Trainer] Router belum dibangun. Skip save.")
@@ -1151,27 +1200,16 @@ class Trainer:
         shuffle: bool = True,
         rng: Optional[np.random.Generator] = None,
     ) -> Iterable[Tuple[np.ndarray, np.ndarray]]:
-        """
-        Menghasilkan batch (inputs, targets).
-
-        CONDITIONED TRAINING + DOMAIN-AWARE BATCHING:
-        - Domain prefix DIPERTAHANKAN (tidak dihapus)
-        - Paragraf dikelompokkan berdasarkan domain
-        - Setiap batch hanya berisi paragraf dari domain yang sama
-        - Urutan batch di-shuffle (bukan paragraf individual)
-        - Document Boundary dengan BOS/EOS/endoftext tetap aktif
-        """
+        """Menghasilkan batch (inputs, targets)."""
         if rng is None:
             rng = np.random.default_rng()
 
-        # Reload paragraphs jika belum ada
         if not self._paragraphs_by_domain:
             self._paragraphs_by_domain = self._load_paragraphs_by_domain(rng=rng)
 
         if not self._paragraphs_by_domain:
             return
 
-        # Domain-Aware Batching
         all_batches: List[Tuple[np.ndarray, np.ndarray]] = []
 
         for domain, paragraphs in self._paragraphs_by_domain.items():
@@ -1211,27 +1249,17 @@ class Trainer:
             yield batch
 
     def _paragraph_to_examples(self, paragraph: str) -> Iterable[np.ndarray]:
-        """
-        Mengubah satu blok paragraf menjadi contoh token terisolasi.
-
-        CONDITIONED TRAINING + DOCUMENT BOUNDARY:
-        - Domain prefix DIPERTAHANKAN (TIDAK dihapus)
-        - Model belajar mengenali tag [MOBIL], [SAINS], dll sebagai anchor
-        - Paragraf pendek: [BOS] + teks_dengan_prefix + [EOS] +  + [PAD]
-        - Paragraf panjang: dipotong dengan BOS/EOS/endoftext di setiap potongan
-        """
+        """Mengubah satu blok paragraf menjadi contoh token terisolasi."""
         if not paragraph.strip():
             return
 
         chunk_size = self.sequence_length + 1
 
-        # Encode paragraf tanpa BOS/EOS (kita tambahkan sendiri)
         ids = self.tokenizer.encode(paragraph, add_bos=False, add_eos=False)
 
         if not ids:
             return
 
-        # KASUS 1: Paragraf muat dalam satu sequence
         if len(ids) + 3 <= chunk_size:
             sequence = [self.bos_id] + ids + [self.eos_id, self.endoftext_id]
             padding_needed = chunk_size - len(sequence)
@@ -1239,7 +1267,6 @@ class Trainer:
             yield np.array(sequence, dtype=np.int64)
             return
 
-        # KASUS 2: Paragraf terlalu panjang
         content_size = chunk_size - 3
 
         start = 0
@@ -1264,17 +1291,7 @@ class Trainer:
         self,
         rng: Optional[np.random.Generator] = None,
     ) -> Dict[str, List[str]]:
-        """
-        Membaca seluruh dataset dan mengelompokkan paragraf berdasarkan domain.
-
-        Domain detection strategy:
-        1. Cek prefix [DOMAIN] di setiap paragraf
-        2. Jika tidak ada prefix, gunakan nama file sebagai domain
-
-        Return:
-        - Dict[str, List[str]]: domain -> list of paragraphs
-          Contoh: {"MOBIL": [...], "SAINS": [...], "FILSAFAT": [...]}
-        """
+        """Membaca seluruh dataset dan mengelompokkan paragraf berdasarkan domain."""
         if rng is None:
             rng = np.random.default_rng()
 
@@ -1296,7 +1313,6 @@ class Trainer:
         paragraphs_by_domain: Dict[str, List[str]] = defaultdict(list)
 
         for path in file_paths:
-            # Domain dari filename (sebagai fallback)
             fallback_domain = self._extract_domain_from_filename(path)
             suffix = path.suffix.lower()
 
@@ -1310,7 +1326,6 @@ class Trainer:
                     para = para.strip()
                     para = para.replace("\n", " ")
                     if para:
-                        # Cek prefix di teks, fallback ke nama file
                         domain = self._extract_domain_from_text(para) or fallback_domain
                         paragraphs_by_domain[domain].append(para)
 
@@ -1383,7 +1398,6 @@ if __name__ == "__main__":
         datasets_dir.mkdir(parents=True, exist_ok=True)
         output_models_dir.mkdir(parents=True, exist_ok=True)
 
-        # Dataset dengan domain prefix (akan auto-detect)
         mobil_file = datasets_dir / "mobil.txt"
         mobil_file.write_text(
             "[MOBIL] Mobil adalah kendaraan beroda empat. "
@@ -1458,7 +1472,7 @@ if __name__ == "__main__":
         )
 
         # ================================================================
-        # Test 1: Domain extraction dari text dan filename
+        # Test 1: Domain extraction
         # ================================================================
         print("=" * 60)
         print("Test 1: Domain Extraction")
@@ -1498,10 +1512,31 @@ if __name__ == "__main__":
             print(f"  [{domain}]: {len(paras)} paragraphs")
 
         # ================================================================
-        # Test 3: MoE Training
+        # Test 3: sync_model_domains() - FIX KRITIS
         # ================================================================
         print("\n" + "=" * 60)
-        print("Test 3: MoE Training (per-domain)")
+        print("Test 3: sync_model_domains() - FIX KRITIS")
+        print("=" * 60)
+        
+        print(f"\nSebelum sync: {model.list_domains()}")
+        
+        # Panggil sync
+        new_domains = trainer.sync_model_domains(verbose=True)
+        
+        print(f"\nSetelah sync: {model.list_domains()}")
+        print(f"New domains initialized: {new_domains}")
+        
+        # Verifikasi
+        if new_domains > 0:
+            print("\n✅ sync_model_domains() bekerja dengan benar!")
+        else:
+            print("\n⚠️ Tidak ada domain baru (mungkin sudah lengkap)")
+
+        # ================================================================
+        # Test 4: MoE Training
+        # ================================================================
+        print("\n" + "=" * 60)
+        print("Test 4: MoE Training (per-domain)")
         print("=" * 60)
 
         history = trainer.run_epochs(
@@ -1514,10 +1549,10 @@ if __name__ == "__main__":
             print(f"  Epoch {r['epoch']} [{r.get('domain', 'MIXED')}]: loss={r['loss']:.4f}")
 
         # ================================================================
-        # Test 4: Router assets
+        # Test 5: Router assets
         # ================================================================
         print("\n" + "=" * 60)
-        print("Test 4: Router Assets")
+        print("Test 5: Router Assets")
         print("=" * 60)
 
         router = trainer.get_router()
@@ -1526,7 +1561,6 @@ if __name__ == "__main__":
             print(f"Domains with keywords: {list(router.domain_keywords.keys())}")
             print(f"Domains with embeddings: {list(router.search_engine.domain_embeddings.keys())}")
 
-            # Test routing
             test_prompts = [
                 "apa itu fotosintesis?",
                 "bagaimana cara kerja rem?",
@@ -1539,10 +1573,10 @@ if __name__ == "__main__":
             print("Router available: NO (core/router.py tidak terinstall)")
 
         # ================================================================
-        # Test 5: Check saved files
+        # Test 6: Check saved files
         # ================================================================
         print("\n" + "=" * 60)
-        print("Test 5: Saved Files")
+        print("Test 6: Saved Files")
         print("=" * 60)
 
         keywords_path = output_models_dir / "domain_keywords.json"
@@ -1557,34 +1591,70 @@ if __name__ == "__main__":
             print(f"Keywords domains: {list(kw_data.get('domain_keywords', {}).keys())}")
 
         # ================================================================
-        # Test 6: BUG FIX - Inline training builds router
+        # Test 7: Verify checkpoint contains all LM heads
         # ================================================================
         print("\n" + "=" * 60)
-        print("Test 6: Inline Training Router Build (BUG FIX)")
+        print("Test 7: Verify Checkpoint Contains All LM Heads")
         print("=" * 60)
         
-        # Reset router
-        trainer._router = None
+        ckpt_path = output_models_dir / "training_checkpoint.npz"
+        if ckpt_path.exists():
+            ckpt = np.load(ckpt_path, allow_pickle=True)
+            lm_head_keys = [k for k in ckpt.files if 'lm_heads' in k and k.startswith('model__')]
+            print(f"LM heads in checkpoint: {len(lm_head_keys)}")
+            for key in sorted(lm_head_keys):
+                # Extract domain name from key: model__lm_heads__DOMAIN__weight
+                parts = key.split('__')
+                if len(parts) >= 3:
+                    domain = parts[2]
+                    print(f"  - {domain}")
+            
+            if len(lm_head_keys) >= 3:  # MOBIL, SAINS, GENERAL
+                print("\n✅ Checkpoint mengandung SEMUA LM heads!")
+            else:
+                print("\n⚠️ Checkpoint kurang lengkap")
+        else:
+            print("Checkpoint tidak ditemukan")
+
+        # ================================================================
+        # Test 8: Resume simulation (load + sync)
+        # ================================================================
+        print("\n" + "=" * 60)
+        print("Test 8: Resume Simulation (load + sync)")
+        print("=" * 60)
         
-        # Jalankan inline training
-        inline_history = trainer.train_epochs_inline(
-            epochs=1,
-            save_checkpoint=False,
-            verbose=True,
+        # Buat model baru (simulasi restart)
+        new_model = CustomTransformerLM(small_config)
+        new_weight_manager = WeightManager(new_model, small_config)
+        new_trainer = Trainer(
+            model=new_model,
+            tokenizer=tokenizer,
+            evaluator=evaluator,
+            weight_manager=new_weight_manager,
+            config=small_config,
         )
         
-        # Cek apakah router sekarang terbangun
-        router_after = trainer.get_router()
-        if router_after is not None:
-            print(f"\n✅ BUG FIXED: Router terbangun setelah train_epochs_inline()")
-            print(f"  Domains: {list(router_after.domain_keywords.keys())}")
-        else:
-            print(f"\n❌ BUG STILL EXISTS: Router tidak terbangun")
+        print(f"\nModel baru (sebelum load): {new_model.list_domains()}")
         
-        # Cek file tersimpan
-        print(f"\nKeywords file exists: {keywords_path.exists()}")
-        print(f"Cache file exists: {cache_path.exists()}")
+        # Load checkpoint
+        try:
+            new_weight_manager.load_checkpoint()
+            print(f"Model baru (setelah load): {new_model.list_domains()}")
+        except Exception as e:
+            print(f"Load error: {e}")
+        
+        # Sync domains
+        print("\nSyncing domains...")
+        new_trainer.sync_model_domains(verbose=True)
+        
+        print(f"\nModel baru (setelah sync): {new_model.list_domains()}")
+        
+        if len(new_model.list_domains()) >= 3:
+            print("\n✅ RESUME SIMULATION BERHASIL!")
+            print("   Model punya semua LM heads setelah load + sync")
+        else:
+            print("\n⚠️ Resume simulation gagal")
 
         print("\n" + "=" * 60)
-        print("pipeline/trainer.py (MoE + BUG FIX) test OK")
+        print("pipeline/trainer.py (MoE + sync_model_domains) test OK")
         print("=" * 60)

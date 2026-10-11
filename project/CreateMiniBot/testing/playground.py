@@ -21,9 +21,9 @@
 #   /domain MOBIL          : set domain prefix manual
 #   /domain                : hapus domain prefix manual
 #   /domains               : list semua domain yang tersedia (MoE)
-#   /auto [on|off]         : toggle auto-routing MoE (BARU)
-#   /force DOMAIN          : force domain untuk testing (BARU)
-#   /force                 : hapus force domain (BARU)
+#   /auto [on|off]         : toggle auto-routing MoE
+#   /force DOMAIN          : force domain untuk testing
+#   /force                 : hapus force domain
 #   /exit                  : keluar
 #
 # Semua input tanpa prefix / dianggap sebagai prompt inference.
@@ -79,7 +79,7 @@ class Playground:
     - Top-K/Top-P ketat untuk filtering
     - Stop generation saat 
 
-    Fitur MoE (BARU):
+    Fitur MoE:
     - Auto-routing: otomatis pilih LM head berdasarkan keyword di prompt
     - Semantic context injection: inject paragraf relevan ke prompt
     - Domain info: /domains untuk list domain, /force untuk testing
@@ -105,25 +105,13 @@ class Playground:
     # DEFAULT PARAMETERS - DIOPTIMALKAN UNTUK MODEL 17M
     # ================================================================
     DEFAULT_MAX_NEW_TOKENS = 64
-    
-    # Temperature rendah = lebih deterministik, kurang "liar"
     DEFAULT_TEMPERATURE = 0.3
-    
-    # Top-K ketat = hanya pertimbangkan 20 token teratas
     DEFAULT_TOP_K = 20
-    
-    # Top-P ketat = nucleus sampling lebih fokus
     DEFAULT_TOP_P = 0.85
-
     DEFAULT_REPETITION_PENALTY = 1.3
     DEFAULT_REPETITION_WINDOW = 64
-
     DEFAULT_MIN_NEW_TOKENS = 4
-
-    # Default step untuk /training tanpa argumen
     DEFAULT_INLINE_TRAINING_STEPS = 10
-
-    # Domain fallback jika router tidak bisa menentukan
     FALLBACK_DOMAIN = "GENERAL"
 
     def __init__(self, model, tokenizer, config: Config = CONFIG, trainer=None):
@@ -142,20 +130,17 @@ class Playground:
         self.endoftext_id = int(config.special_tokens.endoftext_id)
 
         self._forbidden_cache: Optional[List[int]] = None
-        
-        # Domain prefix manual untuk domain-aware inference
         self._default_domain: Optional[str] = None
         
         # ============================================================
-        # MoE STATE (BARU)
+        # MoE STATE
         # ============================================================
-        self._router: Optional[object] = None  # DomainRouter instance
+        self._router: Optional[object] = None
         self._auto_routing: bool = bool(getattr(config.model, 'moe_auto_routing', True))
         self._force_domain: Optional[str] = None
         self._use_moe: bool = bool(getattr(config.model, 'use_moe', False))
         self._semantic_top_k: int = int(getattr(config.model, 'moe_semantic_top_k', 2))
         
-        # Routing stats untuk debugging
         self._routing_stats: Dict[str, int] = {}
         
         # Auto-setup router jika tersedia
@@ -179,9 +164,7 @@ class Playground:
         if not self._use_moe:
             return
         
-        # ============================================================
         # Opsi 1: Dari trainer
-        # ============================================================
         if self.trainer is not None:
             router = None
             if hasattr(self.trainer, "get_router"):
@@ -193,9 +176,7 @@ class Playground:
                 print(f"[playground] Domains tersedia: {list(router.domain_keywords.keys())}")
                 return
         
-        # ============================================================
         # Opsi 2: Dari cache file
-        # ============================================================
         try:
             router = DomainRouter(self.config)
             
@@ -219,7 +200,7 @@ class Playground:
             print(f"[playground] Warning: Gagal setup router: {exc}")
 
     # ========================================================================
-    # MoE ROUTING (BARU)
+    # MoE ROUTING
     # ========================================================================
 
     def _route_prompt(self, prompt: str) -> Tuple[str, float]:
@@ -277,7 +258,6 @@ class Playground:
             return (prompt, [])
         
         # Skip semantic search jika prompt sudah sangat panjang
-        # (untuk menghemat context window)
         if len(prompt.split()) > 20:
             return (prompt, [])
         
@@ -312,9 +292,7 @@ class Playground:
             return (prompt, [])
 
     def _set_model_domain(self, domain: Optional[str]) -> None:
-        """
-        Set active domain di model (untuk MoE LM head selection).
-        """
+        """Set active domain di model."""
         if domain is None:
             return
         
@@ -343,9 +321,7 @@ class Playground:
         verbose: bool = True,
         debug_tokens: bool = False,
     ) -> str:
-        """
-        Uji satu prompt dan cetak hasilnya.
-        """
+        """Uji satu prompt dan cetak hasilnya."""
         answer, generated_ids, token_pieces, routing_info = self.generate(
             prompt=prompt,
             max_new_tokens=max_new_tokens,
@@ -362,9 +338,7 @@ class Playground:
             print("-" * 60)
             print("Prompt  :", prompt)
             
-            # ============================================================
             # MoE ROUTING INFO
-            # ============================================================
             if routing_info.get("domain"):
                 domain = routing_info["domain"]
                 confidence = routing_info.get("confidence", 0.0)
@@ -374,9 +348,7 @@ class Playground:
                     n_ctx = len(routing_info["semantic_context"])
                     print(f"Context : {n_ctx} paragraf relevan di-inject")
 
-            # ============================================================
-            # DEBUG MODE: Tampilkan Token IDs dan Token Pieces
-            # ============================================================
+            # DEBUG MODE
             if debug_tokens:
                 print()
                 print("[DEBUG] Token IDs    :")
@@ -448,8 +420,6 @@ class Playground:
         # ================================================================
         actual_prompt = augmented_prompt
         if self._default_domain is not None and not semantic_context:
-            # Hanya tambahkan prefix jika tidak ada semantic context
-            # (untuk menghindari duplikasi)
             if not DOMAIN_PREFIX_PATTERN.match(prompt.strip()):
                 actual_prompt = f"[{self._default_domain}] {augmented_prompt}"
 
@@ -508,11 +478,9 @@ class Playground:
             # ============================================================
             # STOP CONDITIONS
             # ============================================================
-            # Stop jika EOS
             if next_token == self.eos_id:
                 break
             
-            # Stop jika endoftext (document boundary)
             if next_token == self.endoftext_id:
                 break
 
@@ -521,7 +489,7 @@ class Playground:
         generated_ids = current_ids[len(prompt_ids) :]
 
         # ================================================================
-        # DECODE: Token ID → Token String → Final Text
+        # DECODE
         # ================================================================
         token_pieces = self._get_token_pieces(generated_ids)
 
@@ -546,9 +514,7 @@ class Playground:
         return answer_text, generated_ids, token_pieces, routing_info
 
     def _get_token_pieces(self, token_ids: List[int]) -> List[str]:
-        """
-        Ubah daftar token ID menjadi daftar token string (subword).
-        """
+        """Ubah daftar token ID menjadi daftar token string (subword)."""
         pieces = []
         id_to_token = getattr(self.tokenizer, "id_to_token", None)
 
@@ -574,9 +540,7 @@ class Playground:
         min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
         debug_tokens: bool = False,
     ) -> None:
-        """
-        Mode CLI interaktif.
-        """
+        """Mode CLI interaktif."""
         print("=" * 60)
         print("Testing Playground - Inference Engine")
         print("=" * 60)
@@ -702,74 +666,42 @@ class Playground:
         repetition_window: int = DEFAULT_REPETITION_WINDOW,
         min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
     ) -> bool:
-        """
-        Memproses slash command.
-
-        Return:
-        - True jika harus exit, False jika lanjut
-        """
+        """Memproses slash command."""
         parts = command.strip().split()
         cmd = parts[0].lower()
 
-        # ----------------------------------------------------------------
-        # /exit, /quit, /keluar
-        # ----------------------------------------------------------------
         if cmd in {"/exit", "/quit", "/keluar"}:
             print("[playground] Keluar dari playground.")
             return True
 
-        # ----------------------------------------------------------------
-        # /help
-        # ----------------------------------------------------------------
         if cmd in {"/help", "/bantuan", "/h", "/?"}:
             self._print_help()
             return False
 
-        # ----------------------------------------------------------------
-        # /training, /train, /latih
-        # ----------------------------------------------------------------
         if cmd in {"/training", "/train", "/latih"}:
             self._handle_training_command(parts)
             return False
 
-        # ----------------------------------------------------------------
-        # /status
-        # ----------------------------------------------------------------
         if cmd in {"/status", "/info"}:
             self._print_status()
             return False
 
-        # ----------------------------------------------------------------
-        # /domain [NAMA] - Set domain prefix manual
-        # ----------------------------------------------------------------
         if cmd == "/domain":
             self._handle_domain_command(parts)
             return False
 
-        # ----------------------------------------------------------------
-        # /domains - List semua domain yang tersedia (BARU)
-        # ----------------------------------------------------------------
         if cmd == "/domains":
             self._handle_domains_command()
             return False
 
-        # ----------------------------------------------------------------
-        # /auto [on|off] - Toggle auto-routing MoE (BARU)
-        # ----------------------------------------------------------------
         if cmd == "/auto":
             self._handle_auto_command(parts)
             return False
 
-        # ----------------------------------------------------------------
-        # /force DOMAIN - Force domain untuk testing (BARU)
-        # ----------------------------------------------------------------
         if cmd == "/force":
             self._handle_force_command(parts)
             return False
 
-        # ----------------------------------------------------------------
-        # Perintah tidak dikenal
-        # ----------------------------------------------------------------
         print(f"[playground] Perintah tidak dikenal: {cmd}")
         print("[playground] Ketik /help untuk daftar perintah.")
         return False
@@ -779,15 +711,8 @@ class Playground:
     # ========================================================================
 
     def _handle_domain_command(self, parts: List[str]) -> None:
-        """
-        Memproses perintah /domain.
-
-        Format:
-            /domain          → hapus domain default
-            /domain MOBIL    → set domain default ke MOBIL
-        """
+        """Memproses perintah /domain."""
         if len(parts) < 2:
-            # Hapus domain default
             if self._default_domain:
                 print(f"[playground] Domain default dihapus (sebelumnya: [{self._default_domain}])")
                 self._default_domain = None
@@ -797,10 +722,8 @@ class Playground:
                 print("[playground] Atau gunakan /domains untuk lihat domain yang tersedia.")
             return
 
-        # Set domain baru
         domain = parts[1].upper().strip()
         
-        # Validasi: hanya huruf kapital, angka, dan underscore
         if not re.match(r'^[A-Z0-9_]+$', domain):
             print(f"[playground] Domain tidak valid: {domain}")
             print("[playground] Domain harus huruf kapital/angka/underscore (contoh: MOBIL, SAINS)")
@@ -812,11 +735,7 @@ class Playground:
         print(f"[playground] Gunakan /domain untuk menghapus domain default.")
 
     def _handle_domains_command(self) -> None:
-        """
-        Memproses perintah /domains.
-        
-        List semua domain yang tersedia (dari model dan router).
-        """
+        """Memproses perintah /domains."""
         print("=" * 60)
         print("Daftar Domain yang Tersedia")
         print("=" * 60)
@@ -864,16 +783,8 @@ class Playground:
         print("=" * 60)
 
     def _handle_auto_command(self, parts: List[str]) -> None:
-        """
-        Memproses perintah /auto.
-        
-        Format:
-            /auto          → tampilkan status auto-routing
-            /auto on       → aktifkan auto-routing
-            /auto off      → nonaktifkan auto-routing
-        """
+        """Memproses perintah /auto."""
         if len(parts) < 2:
-            # Tampilkan status
             status = "AKTIF" if self._auto_routing else "NONAKTIF"
             print(f"[playground] Auto-routing: {status}")
             print(f"[playground] Gunakan: /auto on atau /auto off")
@@ -894,15 +805,8 @@ class Playground:
             print("[playground] Gunakan: /auto on atau /auto off")
 
     def _handle_force_command(self, parts: List[str]) -> None:
-        """
-        Memproses perintah /force.
-        
-        Format:
-            /force          → hapus force domain
-            /force MOBIL    → force domain ke MOBIL (bypass router)
-        """
+        """Memproses perintah /force."""
         if len(parts) < 2:
-            # Hapus force domain
             if self._force_domain:
                 print(f"[playground] Force domain dihapus (sebelumnya: [{self._force_domain}])")
                 self._force_domain = None
@@ -910,15 +814,12 @@ class Playground:
                 print("[playground] Tidak ada force domain yang aktif.")
             return
         
-        # Set force domain
         domain = parts[1].upper().strip()
         
-        # Validasi
         if not re.match(r'^[A-Z0-9_]+$', domain):
             print(f"[playground] Domain tidak valid: {domain}")
             return
         
-        # Cek apakah domain ada di model
         if hasattr(self.model, "has_domain"):
             try:
                 if not self.model.has_domain(domain):
@@ -938,23 +839,19 @@ class Playground:
     # ========================================================================
 
     def _handle_training_command(self, parts: List[str]) -> None:
-        """
-        Memproses perintah /training dengan berbagai format argumen.
-        """
+        """Memproses perintah /training."""
         if self.trainer is None:
             print("[playground] Trainer tidak tersedia.")
             print("[playground] Pastikan playground dipanggil dengan parameter trainer.")
             return
 
         parsed = self._parse_training_args(parts)
-
         steps = parsed.get("steps")
         epochs = parsed.get("epochs")
 
         print("-" * 60)
 
         if epochs is not None:
-            # MODE EPOCH
             min_steps = steps if steps is not None else 0
 
             print(
@@ -988,7 +885,7 @@ class Playground:
                     print(f"[playground] Accuracy       : {last.get('accuracy', 0.0):.4f}")
                     print("-" * 60)
                     
-                    # Reload router setelah training (karena mungkin sudah di-rebuild)
+                    # Reload router setelah training
                     self._setup_router()
                 else:
                     print("[playground] Training tidak menghasilkan history.")
@@ -998,7 +895,6 @@ class Playground:
                 print(f"[playground] Training gagal: {exc}")
 
         else:
-            # MODE STEP
             if steps is None:
                 steps = self.DEFAULT_INLINE_TRAINING_STEPS
 
@@ -1127,7 +1023,7 @@ class Playground:
         print()
         print("  /help                  : tampilkan bantuan ini")
         print()
-        print("  MoE Commands (BARU):")
+        print("  MoE Commands:")
         print("  /domains               : list semua domain yang tersedia")
         print("  /auto                  : tampilkan status auto-routing")
         print("  /auto on               : aktifkan auto-routing")
@@ -1187,7 +1083,7 @@ class Playground:
             self.pad_id,
             self.unk_id,
             self.bos_id,
-            self.endoftext_id,  # ← PENTING: jangan generate endoftext
+            self.endoftext_id,
         }
 
         if self.tokenizer.is_ready:
@@ -1208,9 +1104,7 @@ class Playground:
         previous_ids: Optional[List[int]] = None,
         repetition_penalty: float = 1.0,
     ) -> int:
-        """
-        Sampling token berikutnya.
-        """
+        """Sampling token berikutnya."""
         logits = np.asarray(logits, dtype=np.float32).copy()
 
         if logits.size == 0:
@@ -1462,7 +1356,6 @@ if __name__ == "__main__":
             checkpoint_path=output_models_dir / "training_checkpoint.npz",
         )
 
-        # CATATAN: dropout_rate ada di TrainingConfig, BUKAN ModelConfig
         small_config = Config(
             paths=paths,
             special_tokens=SpecialTokensConfig(),
@@ -1486,7 +1379,7 @@ if __name__ == "__main__":
                 ffn_hidden_dim=64,
                 train_dtype="float32",
                 export_dtype="float32",
-                use_moe=True,  # Aktifkan MoE untuk test
+                use_moe=True,
             ),
         )
 
