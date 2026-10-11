@@ -2,7 +2,7 @@
 #
 # Trainer / Training Loop Engine untuk Training Pipeline Engine.
 #
-# VERSI MOE-INTEGRATED:
+# VERSI MOE-INTEGRATED + BUG FIX:
 # SOTA features (tetap dipertahankan):
 # - Conditioned Training: domain prefix ([MOBIL], [SAINS]) dipertahankan
 # - Domain-Aware Batching: batch hanya berisi satu domain
@@ -10,7 +10,7 @@
 # - Resume dari epoch terakhir
 # - Early stopping & periodic checkpoint
 #
-# MoE features (BARU):
+# MoE features:
 # - Auto domain detection dari filenames datasets/*.txt
 # - Per-domain training dengan shared backbone
 # - Integrasi dengan core/router.py untuk keyword extraction
@@ -18,11 +18,17 @@
 # - Save keywords + embeddings ke output folder
 # - Support mode "per_domain" dan "mixed"
 #
+# BUG FIX (PENTING):
+# - Router sekarang dibangun juga setelah train_epochs_inline()
+# - Router sekarang dibangun juga setelah train_steps()
+# - Sebelumnya router HANYA dibangun di run_epochs()/_run_moe_training()
+# - Ini menyebabkan inline training dari playground tidak menghasilkan router
+#
 # Keterhubungan:
 # - config.py              : hyperparameter training + MoE
 # - core/tokenizer.py      : encode teks menjadi token ID
 # - core/architecture.py   : model (shared backbone + LM heads)
-# - core/router.py         : keyword extraction + semantic cache (BARU)
+# - core/router.py         : keyword extraction + semantic cache
 # - pipeline/evaluator.py  : menghitung loss dan gradient
 # - pipeline/weight_manager.py : memperbarui bobot
 
@@ -83,12 +89,16 @@ class Trainer:
     - Domain-Aware Batching (batch per domain)
     - Document Boundary dengan 
 
-    Fitur MoE (BARU):
+    Fitur MoE:
     - Auto domain detection dari filenames
     - Per-domain training dengan shared backbone
     - Keyword extraction via core/router.py
     - Semantic cache untuk inference-time retrieval
     - Save all assets ke output folder
+    
+    BUG FIX:
+    - Router dibangun otomatis setelah SEMUA mode training selesai
+      (run_epochs, train_epochs_inline, train_steps)
     """
 
     LOG_EVERY_STEPS = 10
@@ -140,7 +150,7 @@ class Trainer:
             getattr(config.training, 'moe_rebuild_cache_after_training', True)
         )
 
-        # Router instance (BARU)
+        # Router instance
         self._router: Optional['DomainRouter'] = None
         self._paragraphs_by_domain: Dict[str, List[str]] = {}
 
@@ -774,6 +784,18 @@ class Trainer:
 
         steps = max(1, int(steps))
 
+        # ================================================================
+        # BUG FIX: Pre-load paragraphs sebelum training
+        # Sebelumnya ini tidak dilakukan, menyebabkan router tidak dibangun
+        # ================================================================
+        if self.use_moe and not self._paragraphs_by_domain:
+            rng_init = np.random.default_rng(self.seed)
+            self._paragraphs_by_domain = self._load_paragraphs_by_domain(rng=rng_init)
+            
+            # Inisialisasi LM heads jika belum ada
+            if self._paragraphs_by_domain:
+                self._init_model_domains(self._paragraphs_by_domain, verbose=verbose)
+
         current_global_step = getattr(self.weight_manager, "global_step", 0)
         rng = np.random.default_rng(self.seed + current_global_step + 1)
 
@@ -875,6 +897,19 @@ class Trainer:
             if verbose:
                 print(f"[Trainer] Checkpoint disimpan: {ckpt_path}")
 
+        # ================================================================
+        # BUG FIX: Build router setelah step training selesai
+        # Sebelumnya router TIDAK dibangun di train_steps()
+        # ================================================================
+        if self.use_moe and self.moe_rebuild_cache and _ROUTER_AVAILABLE:
+            if not self._paragraphs_by_domain:
+                rng_init = np.random.default_rng(self.seed)
+                self._paragraphs_by_domain = self._load_paragraphs_by_domain(rng=rng_init)
+            
+            if self._paragraphs_by_domain:
+                self._build_router_assets(verbose=verbose)
+                self._save_router_assets(verbose=verbose)
+
         return [report]
 
     # ========================================================================
@@ -893,6 +928,18 @@ class Trainer:
 
         epochs = max(1, int(epochs))
         min_steps = max(0, int(min_steps))
+
+        # ================================================================
+        # BUG FIX: Pre-load paragraphs sebelum training
+        # Sebelumnya ini tidak dilakukan, menyebabkan router tidak dibangun
+        # ================================================================
+        if self.use_moe and not self._paragraphs_by_domain:
+            rng_init = np.random.default_rng(self.seed)
+            self._paragraphs_by_domain = self._load_paragraphs_by_domain(rng=rng_init)
+            
+            # Inisialisasi LM heads jika belum ada
+            if self._paragraphs_by_domain:
+                self._init_model_domains(self._paragraphs_by_domain, verbose=verbose)
 
         current_global_step = getattr(self.weight_manager, "global_step", 0)
         current_epoch = getattr(self.weight_manager, "last_epoch", 0)
@@ -1004,6 +1051,19 @@ class Trainer:
                 f"epochs={len(history)} | "
                 f"total_steps={total_steps_done}"
             )
+
+        # ================================================================
+        # BUG FIX: Build router setelah inline epoch training selesai
+        # Sebelumnya router TIDAK dibangun di train_epochs_inline()
+        # ================================================================
+        if self.use_moe and self.moe_rebuild_cache and _ROUTER_AVAILABLE:
+            if not self._paragraphs_by_domain:
+                rng_init = np.random.default_rng(self.seed)
+                self._paragraphs_by_domain = self._load_paragraphs_by_domain(rng=rng_init)
+            
+            if self._paragraphs_by_domain:
+                self._build_router_assets(verbose=verbose)
+                self._save_router_assets(verbose=verbose)
 
         return history
 
@@ -1349,9 +1409,6 @@ if __name__ == "__main__":
             checkpoint_path=output_models_dir / "training_checkpoint.npz",
         )
 
-        # ================================================================
-        # FIXED: dropout_rate dipindah dari ModelConfig ke TrainingConfig
-        # ================================================================
         small_config = Config(
             paths=paths,
             special_tokens=SpecialTokensConfig(),
@@ -1360,7 +1417,7 @@ if __name__ == "__main__":
                 batch_size=2,
                 epochs=1,
                 sequence_length=16,
-                dropout_rate=0.0,          # ← DI SINI (TrainingConfig)
+                dropout_rate=0.0,
                 weight_decay=0.01,
                 grad_clip_norm=1.0,
                 seed=1337,
@@ -1375,7 +1432,6 @@ if __name__ == "__main__":
                 embedding_dim=32,
                 num_attention_heads=4,
                 num_layers=1,
-                # dropout_rate=0.0,         # ← DIHAPUS (tidak ada di ModelConfig)
                 max_position_embeddings=32,
                 layer_norm_eps=1e-5,
                 ffn_hidden_dim=64,
@@ -1500,6 +1556,35 @@ if __name__ == "__main__":
                 kw_data = json.load(f)
             print(f"Keywords domains: {list(kw_data.get('domain_keywords', {}).keys())}")
 
+        # ================================================================
+        # Test 6: BUG FIX - Inline training builds router
+        # ================================================================
         print("\n" + "=" * 60)
-        print("pipeline/trainer.py (MoE) test OK")
+        print("Test 6: Inline Training Router Build (BUG FIX)")
+        print("=" * 60)
+        
+        # Reset router
+        trainer._router = None
+        
+        # Jalankan inline training
+        inline_history = trainer.train_epochs_inline(
+            epochs=1,
+            save_checkpoint=False,
+            verbose=True,
+        )
+        
+        # Cek apakah router sekarang terbangun
+        router_after = trainer.get_router()
+        if router_after is not None:
+            print(f"\n✅ BUG FIXED: Router terbangun setelah train_epochs_inline()")
+            print(f"  Domains: {list(router_after.domain_keywords.keys())}")
+        else:
+            print(f"\n❌ BUG STILL EXISTS: Router tidak terbangun")
+        
+        # Cek file tersimpan
+        print(f"\nKeywords file exists: {keywords_path.exists()}")
+        print(f"Cache file exists: {cache_path.exists()}")
+
+        print("\n" + "=" * 60)
+        print("pipeline/trainer.py (MoE + BUG FIX) test OK")
         print("=" * 60)
