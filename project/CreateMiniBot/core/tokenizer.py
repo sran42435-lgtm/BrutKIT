@@ -1,25 +1,10 @@
 # core/tokenizer.py
 #
 # Tokenizer custom berbasis Byte-Pair Encoding (BPE) sederhana.
-# Modul ini tidak menggunakan pustaka tokenizer eksternal.
 #
-# Tugas utama:
-# 1. Membaca dataset dari folder datasets/
-# 2. Membangun vocabulary
-# 3. Menyimpan vocab.json
-# 4. Encode teks -> token ID
-# 5. Decode token ID -> teks
-#
-# Perubahan SOTA Batch 5 - Document Boundary:
-# - Menambahkan token  (pemisah dokumen)
-# - Token ini tidak dipecah oleh BPE dan selalu diperlakukan sebagai satu kesatuan
-# - Digunakan untuk mencegah topic drift antar dokumen
-#
-# Keterhubungan:
-# - config.py      : membaca path, vocab size, dan special tokens
-# - trainer.py     : menyiapkan input berbasis token ID
-# - playground.py  : encode prompt dan decode output
-# - model_exporter : menyediakan vocab untuk dikemas ke file model
+# Perbaikan SOTA:
+# - Token  dideteksi dan dipisahkan sebagai special token
+# - Tidak dipecah oleh BPE, selalu menjadi satu token utuh
 
 from __future__ import annotations
 
@@ -30,11 +15,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
-# ============================================================================
-# FIX IMPORT PATH
-# ============================================================================
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
@@ -44,16 +25,11 @@ from config import CONFIG, Config
 class Tokenizer:
     """
     Tokenizer custom dengan algoritma BPE sederhana.
-
-    Desain:
-    - Teks dinormalisasi: whitespace dirapatkan menjadi satu spasi.
-    - Teks dipecah menjadi kata berdasarkan spasi.
-    - Kata pertama dalam satu baris/sequence tidak memakai marker spasi.
-    - Kata berikutnya diawali marker spasi: "▁"
-    - BPE dipelajari dari frekuensi pasangan token dasar.
-    - Vocabulary dipaksa sesuai config.model.vocab_size dengan menambahkan
-      token [UNUSED_x] jika jumlah token hasil training belum mencukupi.
-    -  diperlakukan sebagai special token dan tidak dipecah oleh BPE.
+    
+    Fitur Document Boundary:
+    - Token  dipisahkan dari teks utama
+    - Setiap kemunculan  menjadi satu token utuh
+    - Bagian teks lainnya diproses seperti biasa
     """
 
     SPACE_MARKER = "▁"
@@ -93,9 +69,6 @@ class Tokenizer:
 
     @property
     def vocab_size(self) -> int:
-        """
-        Jumlah token yang benar-benar tersedia di tokenizer.
-        """
         return len(self.token_to_id)
 
     @property
@@ -107,19 +80,10 @@ class Tokenizer:
     # ======================================================================
 
     def train(self) -> "Tokenizer":
-        """
-        Membaca dataset, membangun vocabulary dengan BPE, lalu menyimpan
-        hasil ke vocab.json.
-        """
         self._validate_target_vocab()
 
         word_freq, char_freq = self._build_corpus_statistics()
-
-        # Jika dataset kosong, char_freq akan kosong.
-        # Kita tetap bangun vocab dengan special tokens dan padding.
         token_to_id = self._build_initial_vocab(char_freq)
-
-        # Proyeksikan korpus ke vocab awal. Karakter langka menjadi [UNK].
         word_freq = self._project_word_freq_to_vocab(word_freq, token_to_id)
 
         merges: List[Tuple[str, str]] = []
@@ -141,9 +105,6 @@ class Tokenizer:
         return self
 
     def load(self) -> "Tokenizer":
-        """
-        Memuat vocab.json jika sudah ada.
-        """
         if not self.vocab_path.exists():
             raise FileNotFoundError(
                 f"File vocab tidak ditemukan di: {self.vocab_path}. "
@@ -157,7 +118,6 @@ class Tokenizer:
             token_to_id_raw = payload["token_to_id"]
             merges_raw = payload.get("merges", [])
         else:
-            # Dukungan fallback bila vocab.json hanya berisi mapping token->id.
             token_to_id_raw = payload
             merges_raw = []
 
@@ -165,8 +125,6 @@ class Tokenizer:
             str(token): int(idx) for token, idx in token_to_id_raw.items()
         }
 
-        # Jika vocab lama lebih kecil dari target, tambahkan token unused
-        # agar sesuai dengan config.model.vocab_size.
         if len(token_to_id) < self.target_vocab_size:
             token_to_id = self._pad_vocab(token_to_id)
 
@@ -191,9 +149,6 @@ class Tokenizer:
         return self
 
     def save(self) -> None:
-        """
-        Menyimpan vocabulary dan merge rules ke vocab.json.
-        """
         self.vocab_path.parent.mkdir(parents=True, exist_ok=True)
 
         payload = {
@@ -216,10 +171,6 @@ class Tokenizer:
             json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
 
     def get_vocab(self) -> Dict[str, int]:
-        """
-        Mengembalikan salinan vocabulary token->id.
-        Dipakai oleh model_exporter.py saat mengemas metadata vocab.
-        """
         self._ensure_ready()
         return dict(self.token_to_id)
 
@@ -231,6 +182,8 @@ class Tokenizer:
     ) -> List[int]:
         """
         Mengubah teks menjadi daftar token ID.
+        
+        PENTING: Token  dideteksi dan di-encode sebagai ID khusus.
         """
         self._ensure_ready()
 
@@ -251,7 +204,7 @@ class Tokenizer:
         """
         Mengubah teks menjadi daftar token string sebelum dikonversi ke ID.
 
-        PERUBAHAN SOTA:
+        PERBAIKAN UTAMA:
         - Token  dideteksi dan dipisahkan dari teks utama
         - Setiap kemunculan  menjadi satu token utuh
         - Bagian teks lainnya diproses seperti biasa
@@ -265,6 +218,7 @@ class Tokenizer:
         # ============================================================
         # DETEKSI DAN PISAHKAN 
         # ============================================================
+        # Split teks berdasarkan 
         parts = text.split(self.endoftext_token)
         all_tokens: List[str] = []
 
@@ -317,9 +271,6 @@ class Tokenizer:
         token_ids: Iterable[int],
         skip_special_tokens: bool = True,
     ) -> str:
-        """
-        Mengubah daftar token ID kembali menjadi teks.
-        """
         self._ensure_ready()
 
         pieces: List[str] = []
@@ -349,11 +300,7 @@ class Tokenizer:
         return text
 
     def get_token_pieces(self, token_ids: Iterable[int]) -> List[str]:
-        """
-        Mengubah daftar token ID menjadi daftar token string (subword).
-        Method ini disediakan khusus untuk kompatibilitas dengan
-        debug mode di playground.py.
-        """
+        """Untuk debug mode di playground.py."""
         self._ensure_ready()
 
         pieces: List[str] = []
@@ -751,17 +698,17 @@ if __name__ == "__main__":
     print(f"Decoded           : {decoded}")
 
     # Test dengan 
-    print("\n--- Test dengan  ---")
+    print("\n" + "=" * 60)
+    print("TEST: Document Boundary Token")
+    print("=" * 60)
     test_text = "Mobil adalah kendaraan.  Kucing adalah hewan."
     test_ids = tokenizer.encode(test_text, add_bos=True, add_eos=True)
     test_tokens = tokenizer.encode_to_tokens(test_text)
     test_pieces = tokenizer.get_token_pieces(test_ids)
-    test_decoded = tokenizer.decode(test_ids, skip_special_tokens=True)
-    test_decoded_full = tokenizer.decode(test_ids, skip_special_tokens=False)
 
     print(f"Input text        : {test_text}")
     print(f"Tokens            : {test_tokens}")
     print(f"Token IDs         : {test_ids}")
     print(f"Token Pieces      : {test_pieces}")
-    print(f"Decoded (skip)    : {test_decoded}")
-    print(f"Decoded (full)    : {test_decoded_full}")
+    print(f"endoftext in tokens: {tokenizer.endoftext_token in test_tokens}")
+    print(f"endoftext_id in IDs: {tokenizer.endoftext_id in test_ids}")

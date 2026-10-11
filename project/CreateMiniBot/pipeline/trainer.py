@@ -2,11 +2,12 @@
 #
 # Trainer / Training Loop Engine untuk Training Pipeline Engine.
 #
-# Perubahan SOTA Batch 6 - Domain Prefix + Document Boundary:
-# - Domain prefix ([MOBIL], [SAINS], dll.) dihapus saat training
-# - Domain prefix digunakan sebagai anchor context saat inference
-# - Setiap dokumen diisolasi dengan [BOS]+teks+[EOS]+<|endoftext|>+
-# - Loss masking untuk token pemisah dokumen
+# Perubahan SOTA Batch 7 - Conditioned Training + Domain-Aware Batching:
+# - Domain prefix ([MOBIL], [SAINS], dll.) DIPERTAHANKAN saat training
+# - Model belajar mengenali tag domain sebagai anchor context
+# - Domain-Aware Batching: setiap batch hanya berisi satu domain
+# - Mencegah interferensi gradien lintas domain
+# - Document Boundary dengan  tetap aktif
 #
 # Keterhubungan:
 # - config.py              : hyperparameter training
@@ -20,8 +21,9 @@ from __future__ import annotations
 import json
 import re
 import sys
+from collections import defaultdict
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 # ============================================================================
 # FIX IMPORT PATH
@@ -46,8 +48,8 @@ except ImportError as exc:
 from config import CONFIG, Config
 
 
-# Regex untuk mendeteksi dan menghapus domain prefix
-DOMAIN_PREFIX_PATTERN = re.compile(r'^\[[A-Z]+\]\s*')
+# Regex untuk mendeteksi domain prefix
+DOMAIN_PREFIX_PATTERN = re.compile(r'^\[([A-Z]+)\]\s*')
 
 
 class Trainer:
@@ -60,9 +62,9 @@ class Trainer:
     - Periodic checkpoint
     - Inline training dari playground (berbasis step & epoch)
     - Pembacaan berbasis blok paragraf
-    - Shuffling tingkat blok paragraf
-    - Document Boundary dengan <|endoftext|>
-    - Domain prefix handling untuk anchor context
+    - Conditioned Training (domain prefix dipertahankan)
+    - Domain-Aware Batching (batch per domain)
+    - Document Boundary dengan 
     """
 
     LOG_EVERY_STEPS = 10
@@ -124,29 +126,18 @@ class Trainer:
     # DOMAIN PREFIX HANDLING
     # ========================================================================
 
-    def _strip_domain_prefix(self, text: str) -> str:
+    def _extract_domain_from_text(self, text: str) -> str:
         """
-        Menghapus domain prefix dari teks untuk training.
-
-        Contoh:
-            "[MOBIL] Mobil adalah kendaraan." -> "Mobil adalah kendaraan."
-
-        Domain prefix tetap dipertahankan di dataset untuk digunakan
-        sebagai anchor context saat inference di playground.
-        """
-        return DOMAIN_PREFIX_PATTERN.sub('', text).strip()
-
-    def _extract_domain_from_text(self, text: str) -> Optional[str]:
-        """
-        Mengekstrak domain dari teks jika ada.
+        Mengekstrak domain dari teks.
 
         Contoh:
             "[MOBIL] Mobil adalah kendaraan." -> "MOBIL"
+            "Teks tanpa prefix" -> "_GENERAL_"
         """
-        match = re.match(r'^\[([A-Z]+)\]', text)
+        match = DOMAIN_PREFIX_PATTERN.match(text)
         if match:
             return match.group(1)
-        return None
+        return "_GENERAL_"
 
     # ========================================================================
     # PUBLIC API: FULL TRAINING (MODE PIPELINE)
@@ -578,7 +569,7 @@ class Trainer:
         return history
 
     # ========================================================================
-    # BATCHING - DOCUMENT BOUNDARY + DOMAIN PREFIX
+    # BATCHING - CONDITIONED TRAINING + DOMAIN-AWARE BATCHING
     # ========================================================================
 
     def iter_batches(
@@ -589,70 +580,109 @@ class Trainer:
         """
         Menghasilkan batch (inputs, targets).
 
-        DOCUMENT BOUNDARY + DOMAIN PREFIX:
-        - Domain prefix dihapus sebelum training
-        - Setiap dokumen diisolasi dengan BOS/EOS/endoftext
-        - Batch hanya menumpuk contoh-contoh mandiri
+        CONDITIONED TRAINING + DOMAIN-AWARE BATCHING:
+        - Domain prefix DIPERTAHANKAN (tidak dihapus)
+        - Paragraf dikelompokkan berdasarkan domain
+        - Setiap batch hanya berisi paragraf dari domain yang sama
+        - Urutan batch di-shuffle (bukan paragraf individual)
+        - Document Boundary dengan BOS/EOS/endoftext tetap aktif
         """
         if rng is None:
             rng = np.random.default_rng()
 
-        all_paragraphs: List[str] = self._load_all_paragraphs(rng=rng)
+        # ================================================================
+        # LOAD PARAGRAPHS PER DOMAIN
+        # ================================================================
+        paragraphs_by_domain: Dict[str, List[str]] = self._load_paragraphs_by_domain(rng=rng)
 
-        if not all_paragraphs:
+        if not paragraphs_by_domain:
             return
 
-        if shuffle and len(all_paragraphs) > 1:
-            rng.shuffle(all_paragraphs)
+        # ================================================================
+        # DOMAIN-AWARE BATCHING
+        #
+        # Strategi:
+        # 1. Untuk setiap domain, buat batch-batch dari paragraf domain tersebut
+        # 2. Kumpulkan semua batch dari semua domain
+        # 3. Shuffle urutan batch (bukan paragraf individual)
+        # 4. Yield batch satu per satu
+        #
+        # Hasil: Setiap batch hanya berisi satu domain, tapi urutan batch acak
+        # ================================================================
+        all_batches: List[Tuple[np.ndarray, np.ndarray]] = []
 
-        all_examples: List[np.ndarray] = []
-
-        for paragraph in all_paragraphs:
-            for example in self._paragraph_to_examples(paragraph):
-                all_examples.append(example)
-
-        if not all_examples:
-            return
-
-        for i in range(0, len(all_examples), self.batch_size):
-            chunk = all_examples[i : i + self.batch_size]
-
-            if not chunk:
+        for domain, paragraphs in paragraphs_by_domain.items():
+            if not paragraphs:
                 continue
 
-            stacked = np.stack(chunk, axis=0).astype(np.int64)
+            # Shuffle paragraf dalam domain ini
+            if shuffle and len(paragraphs) > 1:
+                rng.shuffle(paragraphs)
 
-            inputs = stacked[:, :-1]
-            targets = stacked[:, 1:]
+            # Generate examples untuk semua paragraf di domain ini
+            domain_examples: List[np.ndarray] = []
+            for paragraph in paragraphs:
+                for example in self._paragraph_to_examples(paragraph):
+                    domain_examples.append(example)
 
-            yield inputs, targets
+            if not domain_examples:
+                continue
+
+            # Buat batch-batch dari examples domain ini
+            for i in range(0, len(domain_examples), self.batch_size):
+                chunk = domain_examples[i : i + self.batch_size]
+
+                if not chunk:
+                    continue
+
+                stacked = np.stack(chunk, axis=0).astype(np.int64)
+
+                inputs = stacked[:, :-1]
+                targets = stacked[:, 1:]
+
+                all_batches.append((inputs, targets))
+
+        if not all_batches:
+            return
+
+        # Shuffle urutan batch (domain-aware shuffle)
+        if shuffle and len(all_batches) > 1:
+            rng.shuffle(all_batches)
+
+        # Yield batch satu per satu
+        for batch in all_batches:
+            yield batch
 
     def _paragraph_to_examples(self, paragraph: str) -> Iterable[np.ndarray]:
         """
         Mengubah satu blok paragraf menjadi contoh token terisolasi.
 
-        DOCUMENT BOUNDARY + DOMAIN PREFIX:
-        - Domain prefix dihapus sebelum encoding
-        - Paragraf pendek: [BOS] + teks + [EOS] + <|endoftext|> + [PAD]
+        CONDITIONED TRAINING + DOCUMENT BOUNDARY:
+        - Domain prefix DIPERTAHANKAN (TIDAK dihapus)
+        - Model belajar mengenali tag [MOBIL], [SAINS], dll sebagai anchor
+        - Paragraf pendek: [BOS] + teks_dengan_prefix + [EOS] +  + [PAD]
         - Paragraf panjang: dipotong dengan BOS/EOS/endoftext di setiap potongan
         """
-        # Hapus domain prefix sebelum training
-        clean_paragraph = self._strip_domain_prefix(paragraph)
-
-        if not clean_paragraph:
+        # ================================================================
+        # CONDITIONED TRAINING: TIDAK MENGHAPUS DOMAIN PREFIX
+        # Biarkan teks asli dengan prefix [MOBIL], [SAINS], dll
+        # Model akan belajar mengenali tag domain sebagai anchor context
+        # ================================================================
+        if not paragraph.strip():
             return
 
         chunk_size = self.sequence_length + 1
 
         # Encode paragraf tanpa BOS/EOS (kita tambahkan sendiri)
-        ids = self.tokenizer.encode(clean_paragraph, add_bos=False, add_eos=False)
+        # Prefix [MOBIL] tetap ikut di-encode
+        ids = self.tokenizer.encode(paragraph, add_bos=False, add_eos=False)
 
         if not ids:
             return
 
         # ============================================================
         # KASUS 1: Paragraf muat dalam satu sequence
-        # [BOS] + teks + [EOS] +  + [PAD] * sisa
+        # [BOS] + teks_dengan_prefix + [EOS] +  + [PAD]
         # ============================================================
         if len(ids) + 3 <= chunk_size:
             sequence = [self.bos_id] + ids + [self.eos_id, self.endoftext_id]
@@ -682,20 +712,26 @@ class Trainer:
             start += content_size
 
     # ========================================================================
-    # DATASET READING - PARAGRAPH-BASED LOADING
+    # DATASET READING - DOMAIN-AWARE LOADING
     # ========================================================================
 
-    def _load_all_paragraphs(self, rng: Optional[np.random.Generator] = None) -> List[str]:
+    def _load_paragraphs_by_domain(
+        self,
+        rng: Optional[np.random.Generator] = None,
+    ) -> Dict[str, List[str]]:
         """
-        Membaca seluruh dataset dan mengumpulkan blok paragraf.
-        Domain prefix dipertahankan di teks untuk anchor context.
+        Membaca seluruh dataset dan mengelompokkan paragraf berdasarkan domain.
+
+        Return:
+        - Dict[str, List[str]]: domain -> list of paragraphs
+          Contoh: {"MOBIL": [...], "SAINS": [...], "_GENERAL_": [...]}
         """
         if rng is None:
             rng = np.random.default_rng()
 
         if not self.datasets_dir.exists():
             self.datasets_dir.mkdir(parents=True, exist_ok=True)
-            return []
+            return {}
 
         file_paths: List[Path] = []
 
@@ -704,11 +740,13 @@ class Trainer:
                 file_paths.append(path)
 
         if not file_paths:
-            return []
+            return {}
 
+        # Shuffle urutan file
         rng.shuffle(file_paths)
 
-        all_paragraphs: List[str] = []
+        # Kelompokkan paragraf berdasarkan domain
+        paragraphs_by_domain: Dict[str, List[str]] = defaultdict(list)
 
         for path in file_paths:
             suffix = path.suffix.lower()
@@ -723,7 +761,8 @@ class Trainer:
                     para = para.strip()
                     para = para.replace("\n", " ")
                     if para:
-                        all_paragraphs.append(para)
+                        domain = self._extract_domain_from_text(para)
+                        paragraphs_by_domain[domain].append(para)
 
             elif suffix == ".json":
                 try:
@@ -733,7 +772,8 @@ class Trainer:
                     for text in self._extract_json_strings(data):
                         text = text.strip()
                         if text:
-                            all_paragraphs.append(text)
+                            domain = self._extract_domain_from_text(text)
+                            paragraphs_by_domain[domain].append(text)
 
                 except json.JSONDecodeError:
                     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -749,9 +789,10 @@ class Trainer:
                             for text in self._extract_json_strings(obj):
                                 text = text.strip()
                                 if text:
-                                    all_paragraphs.append(text)
+                                    domain = self._extract_domain_from_text(text)
+                                    paragraphs_by_domain[domain].append(text)
 
-        return all_paragraphs
+        return dict(paragraphs_by_domain)
 
     def _extract_json_strings(self, node) -> Iterable[str]:
         if isinstance(node, str):
@@ -798,7 +839,9 @@ if __name__ == "__main__":
             "[MOBIL] Mobil adalah kendaraan beroda empat. "
             "Mobil menggunakan mesin sebagai penggerak utama.\n\n"
             "[SAINS] Air adalah senyawa kimia dengan rumus H2O. "
-            "Air merupakan kebutuhan mendasar bagi makhluk hidup.",
+            "Air merupakan kebutuhan mendasar bagi makhluk hidup.\n\n"
+            "[MOBIL] Rem mobil berfungsi untuk menghentikan kendaraan. "
+            "Keselamatan berkendara sangat penting.",
             encoding="utf-8",
         )
 
@@ -817,20 +860,20 @@ if __name__ == "__main__":
                 learning_rate=3e-4,
                 batch_size=2,
                 epochs=1,
-                sequence_length=4,
+                sequence_length=16,
                 weight_decay=0.01,
                 grad_clip_norm=1.0,
                 seed=1337,
             ),
             model=ModelConfig(
-                vocab_size=64,
-                embedding_dim=16,
-                num_attention_heads=2,
+                vocab_size=128,
+                embedding_dim=32,
+                num_attention_heads=4,
                 num_layers=1,
                 dropout_rate=0.0,
-                max_position_embeddings=16,
+                max_position_embeddings=32,
                 layer_norm_eps=1e-5,
-                ffn_hidden_dim=32,
+                ffn_hidden_dim=64,
                 train_dtype="float32",
                 export_dtype="float32",
             ),
@@ -851,19 +894,48 @@ if __name__ == "__main__":
             config=small_config,
         )
 
-        # Test domain prefix stripping
-        print("Testing domain prefix stripping...")
-        test_text = "[MOBIL] Mobil adalah kendaraan."
-        clean_text = trainer._strip_domain_prefix(test_text)
-        print(f"  Original: {test_text}")
-        print(f"  Cleaned : {clean_text}")
+        # Test domain extraction
+        print("Testing domain extraction...")
+        test_texts = [
+            "[MOBIL] Mobil adalah kendaraan.",
+            "[SAINS] Air adalah H2O.",
+            "Teks tanpa prefix.",
+        ]
+        for text in test_texts:
+            domain = trainer._extract_domain_from_text(text)
+            print(f"  '{text}' -> domain: {domain}")
 
-        # Test paragraph loading
-        print("\nTesting paragraph loading...")
+        # Test paragraph loading by domain
+        print("\nTesting paragraph loading by domain...")
         rng = np.random.default_rng(1337)
-        paragraphs = trainer._load_all_paragraphs(rng=rng)
-        print(f"  Number of paragraphs: {len(paragraphs)}")
-        for i, p in enumerate(paragraphs):
-            print(f"  Paragraph {i+1}: {p[:60]}...")
+        paragraphs_by_domain = trainer._load_paragraphs_by_domain(rng=rng)
+        print(f"  Domains found: {list(paragraphs_by_domain.keys())}")
+        for domain, paragraphs in paragraphs_by_domain.items():
+            print(f"  [{domain}]: {len(paragraphs)} paragraphs")
+            for i, p in enumerate(paragraphs):
+                print(f"    {i+1}. {p[:50]}...")
+
+        # Test conditioned training (domain prefix NOT stripped)
+        print("\nTesting conditioned training (domain prefix preserved)...")
+        test_para = "[MOBIL] Mobil adalah kendaraan beroda empat."
+        examples = list(trainer._paragraph_to_examples(test_para))
+        print(f"  Paragraph: {test_para}")
+        print(f"  Examples generated: {len(examples)}")
+        if examples:
+            ex = examples[0]
+            tokens = tokenizer.get_token_pieces(ex.tolist())
+            print(f"  First example tokens: {tokens[:10]}...")
+            # Check if [MOBIL] or its tokens are in the example
+            has_mobil = any("MOBIL" in t or "mobil" in t.lower() for t in tokens)
+            print(f"  Domain prefix preserved in tokens: {has_mobil}")
+
+        # Test domain-aware batching
+        print("\nTesting domain-aware batching...")
+        batch_count = 0
+        for inputs, targets in trainer.iter_batches(shuffle=True, rng=rng):
+            batch_count += 1
+            if batch_count <= 3:
+                print(f"  Batch {batch_count}: shape={inputs.shape}")
+        print(f"  Total batches: {batch_count}")
 
         print("\npipeline/trainer.py test OK")

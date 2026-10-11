@@ -2,6 +2,14 @@
 #
 # Playground / Inference Testing Engine.
 #
+# Perubahan SOTA Batch 7 - Anti Semantic Drift:
+# - Temperature diturunkan ke 0.3 (lebih deterministik)
+# - Top-K diperketat ke 20 (filtering lebih ketat)
+# - Top-P diperketat ke 0.85 (nucleus sampling lebih fokus)
+# - Stop generation saat encounter 
+# - endoftext_id ditambahkan ke forbidden tokens
+# - Domain-aware inference: command /domain untuk set prefix default
+#
 # Perintah interactive (slash commands):
 #   /help                  : tampilkan bantuan
 #   /training              : latih model (step default dari config)
@@ -10,12 +18,15 @@
 #   /training --epochs 10  : latih model 10 epoch
 #   /training --epochs 10 --steps 50 : latih 10 epoch, minimal 50 step
 #   /status                : tampilkan status model
+#   /domain [NAMA]         : set domain prefix default (contoh: /domain MOBIL)
+#   /domain                : hapus domain prefix default
 #   /exit                  : keluar
 #
 # Semua input tanpa prefix / dianggap sebagai prompt inference.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -43,9 +54,19 @@ except ImportError as exc:
 from config import CONFIG, Config
 
 
+# Regex untuk mendeteksi domain prefix
+DOMAIN_PREFIX_PATTERN = re.compile(r'^\[([A-Z]+)\]\s*')
+
+
 class Playground:
     """
     Tempat testing pertanyaan / inference.
+
+    Fitur Anti Semantic Drift:
+    - Temperature rendah (0.3) untuk determinisme
+    - Top-K/Top-P ketat untuk filtering
+    - Stop generation saat 
+    - Domain-aware inference dengan command /domain
 
     Perintah interactive (slash commands):
         /help                  : tampilkan bantuan
@@ -55,18 +76,29 @@ class Playground:
         /training --epochs 10  : latih model 10 epoch
         /training --epochs 10 --steps 50 : latih 10 epoch, minimal 50 step
         /status                : tampilkan status model
+        /domain MOBIL          : set domain prefix default
+        /domain                : hapus domain prefix default
         /exit                  : keluar
     """
 
-    DEFAULT_MAX_NEW_TOKENS = 48
-    DEFAULT_TEMPERATURE = 0.75
-    DEFAULT_TOP_K = 30
-    DEFAULT_TOP_P = 0.92
+    # ================================================================
+    # DEFAULT PARAMETERS - DIOPTIMALKAN UNTUK MODEL 17M
+    # ================================================================
+    DEFAULT_MAX_NEW_TOKENS = 64
+    
+    # Temperature rendah = lebih deterministik, kurang "liar"
+    DEFAULT_TEMPERATURE = 0.3
+    
+    # Top-K ketat = hanya pertimbangkan 20 token teratas
+    DEFAULT_TOP_K = 20
+    
+    # Top-P ketat = nucleus sampling lebih fokus
+    DEFAULT_TOP_P = 0.85
 
-    DEFAULT_REPETITION_PENALTY = 1.25
+    DEFAULT_REPETITION_PENALTY = 1.3
     DEFAULT_REPETITION_WINDOW = 64
 
-    DEFAULT_MIN_NEW_TOKENS = 8
+    DEFAULT_MIN_NEW_TOKENS = 4
 
     # Default step untuk /training tanpa argumen
     DEFAULT_INLINE_TRAINING_STEPS = 10
@@ -84,8 +116,12 @@ class Playground:
         self.unk_id = int(config.special_tokens.unk_id)
         self.bos_id = int(config.special_tokens.bos_id)
         self.eos_id = int(config.special_tokens.eos_id)
+        self.endoftext_id = int(config.special_tokens.endoftext_id)
 
         self._forbidden_cache: Optional[List[int]] = None
+        
+        # Domain prefix default untuk domain-aware inference
+        self._default_domain: Optional[str] = None
 
     # ========================================================================
     # PUBLIC API
@@ -129,7 +165,6 @@ class Playground:
             if debug_tokens:
                 print()
                 print("[DEBUG] Token IDs    :")
-                # Tampilkan dalam baris per 10 token agar rapi
                 for i in range(0, len(generated_ids), 10):
                     chunk = generated_ids[i : i + 10]
                     print(f"         {i+1:>3}-{i+len(chunk):<3} : {chunk}")
@@ -138,7 +173,6 @@ class Playground:
                 print("[DEBUG] Token Pieces :")
                 for i in range(0, len(token_pieces), 10):
                     chunk = token_pieces[i : i + 10]
-                    # Format agar mudah dibaca
                     formatted = [f"'{p}'" for p in chunk]
                     print(f"         {i+1:>3}-{i+len(chunk):<3} : {formatted}")
 
@@ -165,15 +199,24 @@ class Playground:
         """
         Membuat jawaban/lanjutan teks dari prompt.
 
-        Return:
-        - answer_text   : teks hasil generation
-        - generated_ids : daftar token ID yang dihasilkan (tanpa prompt awal)
-        - token_pieces  : daftar token string/subword (untuk debug)
+        DOMAIN-AWARE INFERENCE:
+        - Jika ada default domain dan prompt tidak memiliki prefix, tambahkan prefix
+        - Stop generation saat encounter 
         """
         self._ensure_tokenizer_ready()
 
+        # ================================================================
+        # DOMAIN-AWARE INFERENCE
+        # Jika ada default domain dan prompt tidak punya prefix, tambahkan
+        # ================================================================
+        actual_prompt = prompt
+        if self._default_domain is not None:
+            # Cek apakah prompt sudah punya domain prefix
+            if not DOMAIN_PREFIX_PATTERN.match(prompt.strip()):
+                actual_prompt = f"[{self._default_domain}] {prompt}"
+
         prompt_ids = self.tokenizer.encode(
-            prompt,
+            actual_prompt,
             add_bos=True,
             add_eos=False,
         )
@@ -199,11 +242,13 @@ class Playground:
 
             step_forbidden = forbidden_ids
 
-            # Jika belum mencapai min_new_tokens, larang EOS
+            # Jika belum mencapai min_new_tokens, larang EOS dan endoftext
             if step < min_new_tokens:
                 step_forbidden = list(forbidden_ids)
                 if self.eos_id not in step_forbidden:
                     step_forbidden.append(self.eos_id)
+                if self.endoftext_id not in step_forbidden:
+                    step_forbidden.append(self.endoftext_id)
 
             generated_so_far = current_ids[len(prompt_ids) :]
 
@@ -222,7 +267,15 @@ class Playground:
                 repetition_penalty=repetition_penalty,
             )
 
+            # ============================================================
+            # STOP CONDITIONS
+            # ============================================================
+            # Stop jika EOS
             if next_token == self.eos_id:
+                break
+            
+            # Stop jika endoftext (document boundary)
+            if next_token == self.endoftext_id:
                 break
 
             current_ids.append(int(next_token))
@@ -247,13 +300,11 @@ class Playground:
     def _get_token_pieces(self, token_ids: List[int]) -> List[str]:
         """
         Ubah daftar token ID menjadi daftar token string (subword).
-        Ini digunakan untuk debug agar user bisa melihat token per token.
         """
         pieces = []
         id_to_token = getattr(self.tokenizer, "id_to_token", None)
 
         if id_to_token is None:
-            # Fallback jika id_to_token tidak tersedia
             for tid in token_ids:
                 pieces.append(f"<{tid}>")
             return pieces
@@ -277,16 +328,6 @@ class Playground:
     ) -> None:
         """
         Mode CLI interaktif.
-
-        Perintah (slash commands):
-            /help                  : tampilkan bantuan
-            /training              : latih model (step default)
-            /training 100          : latih model 100 step
-            /training --steps 100  : latih model 100 step
-            /training --epochs 10  : latih model 10 epoch
-            /training --epochs 10 --steps 50 : 10 epoch, minimal 50 step
-            /status                : tampilkan status model
-            /exit                  : keluar
         """
         print("=" * 60)
         print("Testing Playground - Inference Engine")
@@ -305,6 +346,8 @@ class Playground:
         print(f"min_new_tokens     : {min_new_tokens}")
         print(f"max_new_tokens     : {max_new_tokens}")
         print(f"debug_tokens       : {debug_tokens}")
+        if self._default_domain:
+            print(f"default_domain     : [{self._default_domain}]")
         print("=" * 60)
 
         while True:
@@ -355,7 +398,7 @@ class Playground:
             )
 
             # ============================================================
-            # DEBUG MODE: Tampilkan Token IDs dan Token Pieces
+            # DEBUG MODE
             # ============================================================
             if debug_tokens:
                 print()
@@ -430,11 +473,56 @@ class Playground:
             return False
 
         # ----------------------------------------------------------------
+        # /domain [NAMA] - Set domain prefix default
+        # ----------------------------------------------------------------
+        if cmd == "/domain":
+            self._handle_domain_command(parts)
+            return False
+
+        # ----------------------------------------------------------------
         # Perintah tidak dikenal
         # ----------------------------------------------------------------
         print(f"[playground] Perintah tidak dikenal: {cmd}")
         print("[playground] Ketik /help untuk daftar perintah.")
         return False
+
+    # ========================================================================
+    # DOMAIN COMMAND HANDLER
+    # ========================================================================
+
+    def _handle_domain_command(self, parts: List[str]) -> None:
+        """
+        Memproses perintah /domain.
+
+        Format:
+            /domain          → hapus domain default
+            /domain MOBIL    → set domain default ke MOBIL
+            /domain SAINS    → set domain default ke SAINS
+        """
+        if len(parts) < 2:
+            # Hapus domain default
+            if self._default_domain:
+                print(f"[playground] Domain default dihapus (sebelumnya: [{self._default_domain}])")
+                self._default_domain = None
+            else:
+                print("[playground] Tidak ada domain default yang aktif.")
+                print("[playground] Gunakan: /domain MOBIL, /domain SAINS, /domain FILSAFAT, dll.")
+            return
+
+        # Set domain baru
+        domain = parts[1].upper().strip()
+        
+        # Validasi: hanya huruf kapital
+        if not domain.isalpha():
+            print(f"[playground] Domain tidak valid: {domain}")
+            print("[playground] Domain harus berupa huruf saja (contoh: MOBIL, SAINS, FILSAFAT)")
+            return
+
+        self._default_domain = domain
+        print(f"[playground] Domain default diset ke: [{domain}]")
+        print(f"[playground] Semua prompt akan otomatis di-prefix dengan [{domain}]")
+        print(f"[playground] Contoh: 'mobil adalah' → '[{domain}] mobil adalah'")
+        print(f"[playground] Gunakan /domain untuk menghapus domain default.")
 
     # ========================================================================
     # TRAINING COMMAND HANDLER
@@ -443,16 +531,6 @@ class Playground:
     def _handle_training_command(self, parts: List[str]) -> None:
         """
         Memproses perintah /training dengan berbagai format argumen.
-
-        Format yang didukung:
-            /training                          → step default dari config
-            /training 100                      → 100 step
-            /training --steps 100              → 100 step
-            /training --s 100                  → 100 step
-            /training --epochs 10              → 10 epoch
-            /training --e 10                   → 10 epoch
-            /training --epochs 10 --steps 50   → 10 epoch, minimal 50 step
-            /training --e 10 --s 50            → 10 epoch, minimal 50 step
         """
         if self.trainer is None:
             print("[playground] Trainer tidak tersedia.")
@@ -485,7 +563,6 @@ class Playground:
                         verbose=True,
                     )
                 else:
-                    # Fallback: gunakan run_epochs
                     history = self.trainer.run_epochs(
                         max_steps=None,
                         save_checkpoints=True,
@@ -550,19 +627,13 @@ class Playground:
                 print(f"[playground] Training gagal: {exc}")
 
     def _parse_training_args(self, parts: List[str]) -> Dict[str, Optional[int]]:
-        """
-        Parse argumen perintah /training.
-
-        Return:
-            {"steps": int|None, "epochs": int|None}
-        """
+        """Parse argumen perintah /training."""
         result: Dict[str, Optional[int]] = {"steps": None, "epochs": None}
 
-        i = 1  # skip /training
+        i = 1
         while i < len(parts):
             arg = parts[i].lower()
 
-            # --steps, --s, -s
             if arg in {"--steps", "--s", "-s"}:
                 if i + 1 < len(parts) and parts[i + 1].isdigit():
                     result["steps"] = int(parts[i + 1])
@@ -570,7 +641,6 @@ class Playground:
                 else:
                     i += 1
 
-            # --epochs, --e, -e
             elif arg in {"--epochs", "--e", "-e"}:
                 if i + 1 < len(parts) and parts[i + 1].isdigit():
                     result["epochs"] = int(parts[i + 1])
@@ -578,7 +648,6 @@ class Playground:
                 else:
                     i += 1
 
-            # Angka langsung = step (backward compatible)
             elif arg.isdigit():
                 result["steps"] = int(arg)
                 i += 1
@@ -593,9 +662,7 @@ class Playground:
     # ========================================================================
 
     def _print_status(self) -> None:
-        """
-        Tampilkan status model.
-        """
+        """Tampilkan status model."""
         print("=" * 60)
         print("Status Model")
         print("=" * 60)
@@ -604,6 +671,7 @@ class Playground:
         print(f"  Vocab size      : {self.tokenizer.vocab_size}")
         print(f"  Max context     : {self.max_context}")
         print(f"  Trainer         : {'Tersedia' if self.trainer is not None else 'Tidak tersedia'}")
+        print(f"  Domain default  : {f'[{self._default_domain}]' if self._default_domain else 'Tidak diset'}")
 
         if self.trainer is not None and hasattr(self.trainer, "weight_manager"):
             wm = self.trainer.weight_manager
@@ -619,19 +687,22 @@ class Playground:
     # ========================================================================
 
     def _print_help(self) -> None:
-        """
-        Tampilkan bantuan perintah interactive.
-        """
+        """Tampilkan bantuan perintah interactive."""
         print("=" * 60)
         print("Bantuan Playground")
         print("=" * 60)
         print()
         print("Ketik prompt apa saja untuk inference.")
         print("Contoh: apa itu mobil")
+        print("        [SAINS] jelaskan fotosintesis")
         print()
         print("Perintah (slash commands):")
         print()
         print("  /help                  : tampilkan bantuan ini")
+        print()
+        print("  /domain MOBIL          : set domain default ke MOBIL")
+        print("  /domain SAINS          : set domain default ke SAINS")
+        print("  /domain                : hapus domain default")
         print()
         print("  /training              : latih model (step default)")
         print("  /training 100          : latih model 100 step")
@@ -644,6 +715,12 @@ class Playground:
         print("  /exit                  : keluar dari playground")
         print("  /quit                  : keluar dari playground")
         print("  /keluar                : keluar dari playground")
+        print()
+        print("TIPS DOMAIN-AWARE INFERENCE:")
+        print("  1. Set domain: /domain MOBIL")
+        print("  2. Ketik prompt: mobil adalah")
+        print("  3. Model akan otomatis menambahkan [MOBIL] di depan prompt")
+        print("  4. Jawaban akan tetap di topik mobil, tidak melantur")
         print()
         print("Semua input tanpa prefix / dianggap sebagai prompt inference.")
         print("=" * 60)
@@ -659,6 +736,9 @@ class Playground:
     def _get_forbidden_ids(self) -> List[int]:
         """
         Token yang tidak boleh dihasilkan saat sampling.
+        
+        ANTI SEMANTIC DRIFT:
+        - endoftext_id ditambahkan agar model tidak generate pemisah dokumen
         """
         if self._forbidden_cache is not None:
             return self._forbidden_cache
@@ -667,6 +747,7 @@ class Playground:
             self.pad_id,
             self.unk_id,
             self.bos_id,
+            self.endoftext_id,  # ← PENTING: jangan generate endoftext
         }
 
         if self.tokenizer.is_ready:
@@ -826,9 +907,7 @@ class Playground:
 
     @staticmethod
     def _softmax(logits: np.ndarray) -> np.ndarray:
-        """
-        Softmax numerik stabil.
-        """
+        """Softmax numerik stabil."""
         max_logit = np.max(logits)
 
         if not np.isfinite(max_logit):
@@ -878,7 +957,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=16,
+        default=32,
         help="Jumlah token maksimum yang dihasilkan.",
     )
     parser.add_argument(
@@ -886,6 +965,24 @@ if __name__ == "__main__":
         type=int,
         default=4,
         help="Jumlah token minimum sebelum EOS diperbolehkan.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.3,
+        help="Temperature sampling (lebih rendah = lebih deterministik).",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=20,
+        help="Top-K sampling (lebih kecil = lebih fokus).",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.85,
+        help="Top-P sampling (lebih kecil = lebih fokus).",
     )
     parser.add_argument(
         "--debug-tokens",
@@ -908,10 +1005,10 @@ if __name__ == "__main__":
         sample_file.write_text(
             "\n".join(
                 [
-                    "mobil adalah kendaraan",
-                    "mobil memiliki mesin",
-                    "mobil memakai bahan bakar",
-                    "mesin mobil menghasilkan tenaga",
+                    "[MOBIL] Mobil adalah kendaraan beroda empat.",
+                    "[MOBIL] Mobil menggunakan mesin sebagai penggerak.",
+                    "[SAINS] Air adalah senyawa H2O.",
+                    "[SAINS] Fotosintesis menghasilkan oksigen.",
                 ]
             ),
             encoding="utf-8",
@@ -932,16 +1029,16 @@ if __name__ == "__main__":
                 learning_rate=3e-4,
                 batch_size=2,
                 epochs=1,
-                sequence_length=12,
+                sequence_length=16,
                 dropout_rate=0.0,
                 weight_decay=0.01,
                 grad_clip_norm=1.0,
                 seed=1337,
             ),
             model=ModelConfig(
-                vocab_size=96,
+                vocab_size=128,
                 embedding_dim=32,
-                num_attention_heads=2,
+                num_attention_heads=4,
                 num_layers=1,
                 dropout_rate=0.0,
                 max_position_embeddings=64,
@@ -967,12 +1064,18 @@ if __name__ == "__main__":
         if args.interactive:
             playground.interactive(
                 max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
                 debug_tokens=args.debug_tokens,
             )
         else:
             playground.test_prompt(
                 prompt=args.prompt,
                 max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
                 debug_tokens=args.debug_tokens,
             )
 
