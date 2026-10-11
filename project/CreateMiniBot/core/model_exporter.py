@@ -9,6 +9,8 @@
 # 4. Menulis file model biner tunggal (.safetensors-like).
 # 5. Menyertakan vocab/tokenizer di dalam metadata.
 # 6. Menyediakan fungsi load kembali.
+# 7. Bundle MoE assets (keywords, semantic embeddings, paragraphs)
+# 8. Copy engine_standalone.py ke output folder (untuk deployment)
 #
 # Implementasi:
 # - Tidak memakai pustaka safetensors eksternal.
@@ -19,11 +21,13 @@
 # - config.py            : path output model dan konfigurasi arsitektur
 # - core/architecture.py : model yang akan di-export
 # - core/tokenizer.py    : vocab/tokenizer untuk disertakan ke file model
+# - core/router.py       : MoE assets yang akan di-bundle
 
 from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import struct
 import sys
 from pathlib import Path
@@ -32,12 +36,6 @@ from typing import Dict, Optional, Tuple
 # ============================================================================
 # FIX IMPORT PATH
 # ============================================================================
-# Memastikan project root ada di sys.path, sehingga file di dalam folder core/
-# tetap bisa meng-import config.py meskipun dijalankan langsung:
-#   python core/model_exporter.py
-# atau:
-#   cd core && python model_exporter.py
-
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 if str(_PROJECT_ROOT) not in sys.path:
@@ -56,6 +54,10 @@ except ImportError as exc:
     ) from exc
 
 from config import CONFIG, Config
+
+
+# Prefix untuk tensor semantic cache (disimpan sebagai tensor khusus)
+SEMANTIC_CACHE_TENSOR_PREFIX = "__semantic_embeddings__."
 
 
 # ============================================================================
@@ -222,6 +224,8 @@ def _serialize_tensor(
 def _build_tokenizer_payload(tokenizer, config: Config) -> Optional[dict]:
     """
     Mengambil payload tokenizer/vocab untuk dimasukkan ke metadata file model.
+    
+    Termasuk special token: pad, unk, bos, eos, endoftext.
     """
     if tokenizer is not None:
         try:
@@ -231,6 +235,13 @@ def _build_tokenizer_payload(tokenizer, config: Config) -> Optional[dict]:
             pass
 
         if hasattr(tokenizer, "token_to_id") and hasattr(tokenizer, "merges"):
+            # Ambil endoftext dengan fallback
+            endoftext_token = getattr(tokenizer, "endoftext_token", None)
+            if not endoftext_token:
+                endoftext_token = getattr(config.special_tokens, "endoftext", "")
+            if not endoftext_token:
+                endoftext_token = '<' + '|' + 'endoftext' + '|' + '>'
+            
             return {
                 "version": "1.0",
                 "model": "custom-bpe",
@@ -239,6 +250,7 @@ def _build_tokenizer_payload(tokenizer, config: Config) -> Optional[dict]:
                     "unk": config.special_tokens.unk,
                     "bos": config.special_tokens.bos,
                     "eos": config.special_tokens.eos,
+                    "endoftext": endoftext_token,
                 },
                 "token_to_id": dict(tokenizer.token_to_id),
                 "merges": [
@@ -262,6 +274,103 @@ def _build_tokenizer_payload(tokenizer, config: Config) -> Optional[dict]:
 
 
 # ============================================================================
+# MOE ASSETS LOADER
+# ============================================================================
+
+def _load_moe_assets(config: Config) -> Dict:
+    """
+    Load MoE assets dari output folder (hasil training).
+    
+    Assets yang dicari:
+    - domain_keywords.json → keywords per domain
+    - semantic_cache.npz → embeddings + paragraphs per domain
+    
+    Return:
+    - dict dengan keys: keywords, paragraphs, embeddings
+    """
+    output_dir = Path(config.paths.output_models_dir)
+    
+    assets: Dict = {
+        "keywords": {},
+        "paragraphs": {},
+        "embeddings": {},
+    }
+    
+    # ================================================================
+    # Load domain_keywords.json
+    # ================================================================
+    keywords_path = output_dir / "domain_keywords.json"
+    if keywords_path.exists():
+        try:
+            with open(keywords_path, "r", encoding="utf-8") as f:
+                kw_data = json.load(f)
+            
+            if isinstance(kw_data, dict):
+                # Bisa struktur baru (dengan "domain_keywords" key) atau lama (langsung dict)
+                if "domain_keywords" in kw_data:
+                    assets["keywords"] = kw_data["domain_keywords"]
+                else:
+                    assets["keywords"] = kw_data
+        except Exception as exc:
+            print(f"[Exporter] Warning: Gagal load domain_keywords.json: {exc}")
+    
+    # ================================================================
+    # Load semantic_cache.npz
+    # ================================================================
+    cache_path = output_dir / "semantic_cache.npz"
+    if cache_path.exists():
+        try:
+            with np.load(cache_path, allow_pickle=True) as data:
+                # Load paragraphs dari JSON
+                if "__paragraphs_json__" in data.files:
+                    try:
+                        paragraphs_str = str(data["__paragraphs_json__"][0])
+                        paragraphs_data = json.loads(paragraphs_str)
+                        if isinstance(paragraphs_data, dict):
+                            assets["paragraphs"] = paragraphs_data
+                    except Exception:
+                        pass
+                
+                # Load embeddings per domain
+                for key in data.files:
+                    if key == "__paragraphs_json__":
+                        continue
+                    if key.endswith("__embeddings"):
+                        # Reconstruct domain name dari key
+                        # Format: {safe_domain}__embeddings
+                        domain = key[:-len("__embeddings")]
+                        # Unsanitize domain name (ganti _ kembali ke aslinya)
+                        assets["embeddings"][domain] = data[key]
+        except Exception as exc:
+            print(f"[Exporter] Warning: Gagal load semantic_cache.npz: {exc}")
+    
+    return assets
+
+
+def _copy_engine_standalone(config: Config, output_dir: Path) -> Optional[Path]:
+    """
+    Copy engine_standalone.py ke output folder untuk deployment.
+    
+    Return:
+    - Path ke file yang di-copy, atau None jika gagal
+    """
+    # Cari engine_standalone.py di core/
+    engine_src = Path(__file__).resolve().parent / "engine_standalone.py"
+    
+    if not engine_src.exists():
+        return None
+    
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        engine_dst = output_dir / "otak_engine.py"
+        shutil.copy2(engine_src, engine_dst)
+        return engine_dst
+    except Exception as exc:
+        print(f"[Exporter] Warning: Gagal copy engine_standalone.py: {exc}")
+        return None
+
+
+# ============================================================================
 # MAIN EXPORT FUNCTION
 # ============================================================================
 
@@ -272,9 +381,16 @@ def export_to_safetensors(
     output_filepath: Optional[Path] = None,
     export_dtype: Optional[str] = None,
     include_vocab: bool = True,
+    include_moe_assets: bool = True,
 ) -> Path:
     """
     Mengemas seluruh bobot model menjadi satu file biner tunggal.
+    
+    Jika include_moe_assets=True dan model menggunakan MoE:
+    - Bundle domain keywords ke metadata
+    - Bundle semantic embeddings sebagai tensor khusus
+    - Bundle paragraphs sebagai JSON di metadata
+    - Copy engine_standalone.py ke output folder
 
     Struktur file:
         [8 byte header length]
@@ -303,7 +419,18 @@ def export_to_safetensors(
     offset = 0
     quant_info: Dict[str, dict] = {}
 
+    # ================================================================
+    # Serialize model weights
+    # ================================================================
     for name, arr in state_dict.items():
+        # Skip metadata internal keys
+        if name == "__moe_metadata__":
+            continue
+        
+        # Skip non-array entries
+        if not isinstance(arr, np.ndarray):
+            continue
+
         raw, dtype_str, shape = _serialize_tensor(
             arr=arr,
             export_dtype=export_dtype,
@@ -322,6 +449,11 @@ def export_to_safetensors(
 
     tensor_sha256 = hashlib.sha256(bytes(tensor_bytes)).hexdigest()
 
+    # ================================================================
+    # Build metadata
+    # ================================================================
+    use_moe = bool(getattr(config.model, 'use_moe', False))
+    
     metadata: Dict[str, str] = {
         "format": "pt",
         "producer": "CreateMiniBot-custom-exporter",
@@ -333,8 +465,11 @@ def export_to_safetensors(
         "context_length": str(config.model.max_position_embeddings),
         "export_dtype": export_dtype,
         "tensor_sha256": tensor_sha256,
+        # MoE flags
+        "use_moe": "true" if use_moe else "false",
     }
 
+    # Add tokenizer/vocab
     if include_vocab:
         tokenizer_payload = _build_tokenizer_payload(tokenizer, config)
 
@@ -345,6 +480,7 @@ def export_to_safetensors(
                 separators=(",", ":"),
             )
 
+    # Add quantization info
     if quant_info:
         metadata["quantization"] = json.dumps(
             quant_info,
@@ -352,6 +488,73 @@ def export_to_safetensors(
             separators=(",", ":"),
         )
 
+    # ================================================================
+    # Bundle MoE assets
+    # ================================================================
+    moe_domains: list = []
+    
+    if use_moe and include_moe_assets:
+        moe_assets = _load_moe_assets(config)
+        
+        # Bundle keywords ke metadata
+        if moe_assets["keywords"]:
+            moe_domains = list(moe_assets["keywords"].keys())
+            metadata["moe_domains"] = json.dumps(moe_domains)
+            metadata["moe_keywords"] = json.dumps(
+                moe_assets["keywords"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            print(f"[Exporter] Bundled keywords untuk {len(moe_domains)} domain: {moe_domains}")
+        
+        # Bundle paragraphs ke metadata
+        if moe_assets["paragraphs"]:
+            metadata["moe_paragraphs"] = json.dumps(
+                moe_assets["paragraphs"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            total_paras = sum(len(p) for p in moe_assets["paragraphs"].values())
+            print(f"[Exporter] Bundled {total_paras} paragraphs untuk semantic search")
+        
+        # Bundle embeddings sebagai tensor khusus
+        for domain, emb in moe_assets.get("embeddings", {}).items():
+            if not isinstance(emb, np.ndarray):
+                continue
+            
+            tensor_name = f"{SEMANTIC_CACHE_TENSOR_PREFIX}{domain}"
+            
+            raw, dtype_str, shape = _serialize_tensor(
+                arr=emb,
+                export_dtype=export_dtype,
+                quant_info=quant_info,
+                tensor_name=tensor_name,
+            )
+            
+            tensor_entries[tensor_name] = {
+                "dtype": dtype_str,
+                "shape": shape,
+                "data_offsets": [offset, offset + len(raw)],
+            }
+            
+            tensor_bytes.extend(raw)
+            offset += len(raw)
+            
+            print(f"[Exporter] Bundled semantic embeddings untuk domain {domain}: shape {emb.shape}")
+        
+        # Copy engine_standalone.py ke output folder
+        engine_path = _copy_engine_standalone(config, output_filepath.parent)
+        if engine_path:
+            metadata["engine_standalone"] = engine_path.name
+            print(f"[Exporter] Copied engine: {engine_path.name}")
+    
+    # Recompute SHA-256 setelah semua tensor (termasuk semantic cache) ditambahkan
+    tensor_sha256 = hashlib.sha256(bytes(tensor_bytes)).hexdigest()
+    metadata["tensor_sha256"] = tensor_sha256
+
+    # ================================================================
+    # Build header dan tulis file
+    # ================================================================
     header = dict(tensor_entries)
     header["__metadata__"] = metadata
 
@@ -380,7 +583,7 @@ def load_safetensors(
     Memuat file model biner .safetensors-like.
 
     Return:
-    - state_dict
+    - state_dict (hanya bobot model, tanpa semantic cache tensors)
     - metadata
     """
     filepath = Path(filepath)
@@ -455,6 +658,111 @@ def load_into_model(model, filepath: Path) -> Dict[str, str]:
     return metadata
 
 
+def extract_moe_assets(filepath: Path) -> Dict:
+    """
+    Extract MoE assets dari safetensors file.
+    
+    Berguna untuk deployment: load keywords, paragraphs, dan semantic
+    embeddings tanpa harus load model.
+    
+    Return:
+    - dict dengan keys: keywords, paragraphs, embeddings, domains, use_moe
+    """
+    filepath = Path(filepath)
+    
+    assets: Dict = {
+        "keywords": {},
+        "paragraphs": {},
+        "embeddings": {},
+        "domains": [],
+        "use_moe": False,
+    }
+    
+    # Load full file
+    with open(filepath, "rb") as f:
+        header_len_bytes = f.read(8)
+        if len(header_len_bytes) < 8:
+            return assets
+        
+        header_len = struct.unpack("<Q", header_len_bytes)[0]
+        header_bytes = f.read(header_len)
+        tensor_bytes = f.read()
+    
+    header = json.loads(header_bytes.decode("utf-8"))
+    metadata = header.get("__metadata__", {})
+    
+    # Check MoE flags
+    assets["use_moe"] = metadata.get("use_moe", "false").lower() == "true"
+    
+    if not assets["use_moe"]:
+        return assets
+    
+    # Extract keywords
+    moe_keywords = metadata.get("moe_keywords")
+    if moe_keywords:
+        try:
+            assets["keywords"] = json.loads(moe_keywords)
+        except Exception:
+            pass
+    
+    # Extract domains
+    moe_domains = metadata.get("moe_domains")
+    if moe_domains:
+        try:
+            assets["domains"] = json.loads(moe_domains)
+        except Exception:
+            pass
+    
+    # Extract paragraphs
+    moe_paragraphs = metadata.get("moe_paragraphs")
+    if moe_paragraphs:
+        try:
+            assets["paragraphs"] = json.loads(moe_paragraphs)
+        except Exception:
+            pass
+    
+    # Extract semantic embeddings dari tensors
+    quant_raw = metadata.get("quantization", "{}")
+    try:
+        quant_meta = json.loads(quant_raw) if isinstance(quant_raw, str) else {}
+    except Exception:
+        quant_meta = {}
+    
+    for name, meta in header.items():
+        if name == "__metadata__":
+            continue
+        if not name.startswith(SEMANTIC_CACHE_TENSOR_PREFIX):
+            continue
+        
+        domain = name[len(SEMANTIC_CACHE_TENSOR_PREFIX):]
+        
+        dtype = meta.get("dtype")
+        shape = tuple(meta.get("shape", []))
+        start, end = meta.get("data_offsets", [0, 0])
+        raw = tensor_bytes[start:end]
+        
+        # Deserialize tensor
+        if dtype == "F32":
+            arr = np.frombuffer(raw, dtype=np.dtype("<f4")).astype(np.float32)
+        elif dtype == "F16":
+            arr = np.frombuffer(raw, dtype=np.dtype("<f2")).astype(np.float32)
+        elif dtype == "BF16":
+            arr = _bf16_bytes_to_float32(raw)
+        elif dtype == "I8":
+            q = np.frombuffer(raw, dtype=np.int8)
+            scale = float(quant_meta.get(name, {}).get("scale", 1.0))
+            arr = q.astype(np.float32) * scale
+        elif dtype == "I4":
+            scale = float(quant_meta.get(name, {}).get("scale", 1.0))
+            arr = _unpack_int4(raw, shape, scale)
+        else:
+            continue
+        
+        assets["embeddings"][domain] = arr.reshape(shape).astype(np.float32, copy=False)
+    
+    return assets
+
+
 # ============================================================================
 # EXPORTER CLASS
 # ============================================================================
@@ -475,6 +783,7 @@ class ModelExporter:
         output_path: Optional[Path] = None,
         export_dtype: Optional[str] = None,
         include_vocab: bool = True,
+        include_moe_assets: bool = True,
     ) -> Path:
         """
         Simpan model ke file biner tunggal.
@@ -486,6 +795,7 @@ class ModelExporter:
             output_filepath=output_path,
             export_dtype=export_dtype,
             include_vocab=include_vocab,
+            include_moe_assets=include_moe_assets,
         )
 
     # Alias agar kompatibel dengan penamaan:
@@ -523,11 +833,10 @@ if __name__ == "__main__":
         sample_file.write_text(
             "\n".join(
                 [
-                    "mobil memiliki mesin",
-                    "mobil memakai bahan bakar",
-                    "kecepatan mobil tergantung mesin",
-                    "apa itu mobil",
-                    "mesin mobil perlu dirawat",
+                    "[MOBIL] mobil memiliki mesin",
+                    "[MOBIL] mobil memakai bahan bakar",
+                    "[SAINS] air adalah H2O",
+                    "[SAINS] fotosintesis menghasilkan oksigen",
                 ]
             ),
             encoding="utf-8",
@@ -549,6 +858,7 @@ if __name__ == "__main__":
                 batch_size=2,
                 epochs=1,
                 sequence_length=8,
+                dropout_rate=0.0,
                 weight_decay=0.01,
                 grad_clip_norm=1.0,
                 seed=1337,
@@ -558,12 +868,12 @@ if __name__ == "__main__":
                 embedding_dim=16,
                 num_attention_heads=2,
                 num_layers=1,
-                dropout_rate=0.0,
                 max_position_embeddings=32,
                 layer_norm_eps=1e-5,
                 ffn_hidden_dim=32,
                 train_dtype="float32",
                 export_dtype="float16",
+                use_moe=True,
             ),
         )
 
@@ -571,31 +881,152 @@ if __name__ == "__main__":
         tokenizer.train()
 
         model = CustomTransformerLM(small_config)
+        
+        # Inisialisasi beberapa domain untuk test MoE
+        model.init_domains(["MOBIL", "SAINS"])
 
         exporter = ModelExporter(small_config)
 
+        # ================================================================
+        # Test 1: Export tanpa MoE assets (default)
+        # ================================================================
+        print("=" * 60)
+        print("Test 1: Export Model (tanpa MoE assets)")
+        print("=" * 60)
+        
         model_path = exporter.save(
             model=model,
             tokenizer=tokenizer,
             include_vocab=True,
+            include_moe_assets=False,  # Skip MoE assets
         )
 
         file_size = model_path.stat().st_size
 
-        print("core/model_exporter.py test OK")
         print(f"Model file      : {model_path}")
         print(f"File size       : {file_size:,} bytes")
 
-        # Load kembali
         state_dict, metadata = load_safetensors(model_path)
 
         print(f"Tensors loaded  : {len(state_dict)}")
         print(f"Architecture    : {metadata.get('architecture')}")
         print(f"Export dtype    : {metadata.get('export_dtype')}")
+        print(f"Use MoE         : {metadata.get('use_moe')}")
         print(f"Tensor SHA-256  : {metadata.get('tensor_sha256')}")
 
         # Pastikan state_dict bisa dimasukkan ke model baru
         new_model = CustomTransformerLM(small_config)
-        new_model.load_state_dict(state_dict)
+        result = new_model.load_state_dict(state_dict)
+        print(f"Model load OK: {result}")
 
-        print("Model load_state_dict OK")
+        # Cek LM heads
+        print(f"\nLM heads di model baru: {new_model.list_domains()}")
+
+        # ================================================================
+        # Test 2: Simulasi MoE assets
+        # ================================================================
+        print("\n" + "=" * 60)
+        print("Test 2: Simulasi MoE Assets Bundle")
+        print("=" * 60)
+        
+        # Buat dummy domain_keywords.json
+        keywords_path = output_models_dir / "domain_keywords.json"
+        keywords_data = {
+            "domain_keywords": {
+                "MOBIL": ["mobil", "mesin", "roda", "ban", "bensin"],
+                "SAINS": ["air", "fotosintesis", "atom", "molekul"],
+            },
+        }
+        with open(keywords_path, "w", encoding="utf-8") as f:
+            json.dump(keywords_data, f)
+        print(f"Created: {keywords_path}")
+        
+        # Buat dummy semantic_cache.npz
+        cache_path = output_models_dir / "semantic_cache.npz"
+        dummy_embeddings = {
+            "MOBIL__embeddings": np.random.randn(5, 16).astype(np.float32),
+            "SAINS__embeddings": np.random.randn(4, 16).astype(np.float32),
+            "__paragraphs_json__": np.array(
+                [json.dumps({
+                    "MOBIL": ["paragraf 1", "paragraf 2"],
+                    "SAINS": ["paragraf 3"],
+                })],
+                dtype=object,
+            ),
+        }
+        np.savez_compressed(cache_path, **dummy_embeddings)
+        print(f"Created: {cache_path}")
+
+        # ================================================================
+        # Test 3: Export dengan MoE assets
+        # ================================================================
+        print("\n" + "=" * 60)
+        print("Test 3: Export Model (dengan MoE assets)")
+        print("=" * 60)
+        
+        model_path_moe = exporter.save(
+            model=model,
+            tokenizer=tokenizer,
+            include_vocab=True,
+            include_moe_assets=True,
+        )
+
+        file_size_moe = model_path_moe.stat().st_size
+        print(f"\nModel file      : {model_path_moe}")
+        print(f"File size       : {file_size_moe:,} bytes (sebelum: {file_size:,})")
+        print(f"Size increase   : {file_size_moe - file_size:,} bytes")
+
+        # ================================================================
+        # Test 4: Extract MoE assets dari safetensors
+        # ================================================================
+        print("\n" + "=" * 60)
+        print("Test 4: Extract MoE Assets")
+        print("=" * 60)
+        
+        moe_assets = extract_moe_assets(model_path_moe)
+        
+        print(f"Use MoE         : {moe_assets['use_moe']}")
+        print(f"Domains         : {moe_assets['domains']}")
+        print(f"Keywords count  : {sum(len(v) for v in moe_assets['keywords'].values())}")
+        print(f"Paragraphs count: {sum(len(v) for v in moe_assets['paragraphs'].values())}")
+        print(f"Embeddings:")
+        for domain, emb in moe_assets['embeddings'].items():
+            print(f"  {domain}: shape {emb.shape}, dtype {emb.dtype}")
+
+        # ================================================================
+        # Test 5: Verifikasi model bisa di-load kembali
+        # ================================================================
+        print("\n" + "=" * 60)
+        print("Test 5: Verify Model Reload")
+        print("=" * 60)
+        
+        state_dict_moe, metadata_moe = load_safetensors(model_path_moe)
+        
+        # Filter out semantic cache tensors untuk load ke model
+        model_state = {
+            k: v for k, v in state_dict_moe.items()
+            if not k.startswith(SEMANTIC_CACHE_TENSOR_PREFIX)
+        }
+        
+        new_model_moe = CustomTransformerLM(small_config)
+        result_moe = new_model_moe.load_state_dict(model_state)
+        print(f"Model load OK: missing={len(result_moe['missing'])}, unexpected={len(result_moe['unexpected'])}")
+        print(f"LM heads di model baru: {new_model_moe.list_domains()}")
+
+        # ================================================================
+        # Test 6: Inspect metadata
+        # ================================================================
+        print("\n" + "=" * 60)
+        print("Test 6: Metadata Inspection")
+        print("=" * 60)
+        
+        print("Metadata keys:")
+        for key in sorted(metadata_moe.keys()):
+            value = metadata_moe[key]
+            if len(str(value)) > 100:
+                value = str(value)[:100] + "..."
+            print(f"  {key}: {value}")
+
+        print("\n" + "=" * 60)
+        print("core/model_exporter.py (MoE) test OK")
+        print("=" * 60)
