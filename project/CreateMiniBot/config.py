@@ -197,8 +197,8 @@ class TrainingConfig:
     # Learning rate
     learning_rate: float = 3e-4
     
-    batch_size: int = 2
-    epochs: int = 500
+    batch_size: int = 10
+    epochs: int = 150
     sequence_length: int = 64
     
     # Regularization
