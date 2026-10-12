@@ -2,15 +2,22 @@
 #
 # Tokenizer custom berbasis Byte-Pair Encoding (BPE) sederhana.
 #
-# Perbaikan SOTA:
+# Arsitektur: RAG-ready (Retrieval-Augmented Generation)
+# - Format training: "Konteks: {context} Pertanyaan: {question} Jawaban: {answer}"
+# - Format inference: "Konteks: {context} Pertanyaan: {question} Jawaban:"
+# - Special tokens: [PAD], [UNK], [BOS], [EOS], 
+#
+# Fitur:
 # - Token  dideteksi dan dipisahkan sebagai special token
 # - Tidak dipecah oleh BPE, selalu diperlakukan sebagai satu kesatuan
 # - GUARD: handle endoftext_token kosong (empty separator)
+# - Helper methods untuk QA encoding (RAG-specific)
 #
 # Catatan:
 # - Tokenizer TIDAK otomatis menambah BOS/EOS/endoftext saat encode
-# - Special token ditambahkan oleh trainer._paragraph_to_examples()
-# - Untuk menambah manual: encode(text, add_bos=True, add_eos=True)
+# - Trainer bertanggung jawab menambah special token saat training
+# - Gunakan encode(text, add_bos=True, add_eos=True) untuk manual
+# - Gunakan encode_qa_sample() untuk format QA RAG
 
 from __future__ import annotations
 
@@ -19,7 +26,7 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
@@ -37,6 +44,11 @@ class Tokenizer:
     - Setiap kemunculan  menjadi satu token utuh
     - Bagian teks lainnya diproses seperti biasa
     
+    RAG Helper Methods:
+    - encode_qa_sample(): encode QA pair dengan konteks (untuk training)
+    - format_rag_prompt(): format prompt RAG (untuk inference)
+    - encode_rag_prompt(): encode prompt RAG ke token IDs
+    
     Catatan penting:
     - Tokenizer TIDAK otomatis menambah BOS/EOS/endoftext
     - Trainer bertanggung jawab menambah special token saat training
@@ -44,6 +56,11 @@ class Tokenizer:
     """
 
     SPACE_MARKER = "▁"
+    
+    # RAG Format Templates
+    QA_TRAIN_TEMPLATE = "Konteks: {context} Pertanyaan: {question} Jawaban: {answer}"
+    QA_INFERENCE_TEMPLATE = "Konteks: {context} Pertanyaan: {question} Jawaban:"
+    QA_NO_CONTEXT_TEMPLATE = "Pertanyaan: {question} Jawaban:"  # Untuk context dropout
 
     def __init__(self, config: Config = CONFIG):
         self.config = config
@@ -172,6 +189,7 @@ class Tokenizer:
         payload = {
             "version": "1.0",
             "model": "custom-bpe",
+            "architecture": "rag-single-head",  # NEW: untuk identifikasi
             "target_vocab_size": self.target_vocab_size,
             "space_marker": self.SPACE_MARKER,
             "special_tokens": {
@@ -180,6 +198,11 @@ class Tokenizer:
                 "bos": self.bos_token,
                 "eos": self.eos_token,
                 "endoftext": self.endoftext_token,
+            },
+            "rag_templates": {
+                "qa_train": self.QA_TRAIN_TEMPLATE,
+                "qa_inference": self.QA_INFERENCE_TEMPLATE,
+                "qa_no_context": self.QA_NO_CONTEXT_TEMPLATE,
             },
             "token_to_id": self.token_to_id,
             "merges": [[a, b] for a, b in self.merges],
@@ -191,6 +214,10 @@ class Tokenizer:
     def get_vocab(self) -> Dict[str, int]:
         self._ensure_ready()
         return dict(self.token_to_id)
+
+    # ======================================================================
+    # CORE ENCODE METHODS
+    # ======================================================================
 
     def encode(
         self,
@@ -275,6 +302,202 @@ class Tokenizer:
 
         return all_tokens
 
+    # ======================================================================
+    # RAG-SPECIFIC ENCODING METHODS (BARU)
+    # ======================================================================
+
+    def encode_qa_sample(
+        self,
+        context: str,
+        question: str,
+        answer: str,
+        add_bos: bool = True,
+        add_eos: bool = True,
+    ) -> List[int]:
+        """
+        Encode QA sample untuk training RAG.
+        
+        Format: "Konteks: {context} Pertanyaan: {question} Jawaban: {answer}"
+        
+        Parameter:
+        - context: paragraf konteks (dari retriever)
+        - question: pertanyaan user
+        - answer: jawaban yang diharapkan
+        - add_bos: tambahkan [BOS] di awal
+        - add_eos: tambahkan [EOS] di akhir
+        
+        Return:
+        - List of token IDs
+        
+        Contoh:
+            ids = tokenizer.encode_qa_sample(
+                context="Mobil adalah kendaraan beroda empat.",
+                question="Apa itu mobil?",
+                answer="Mobil adalah kendaraan beroda empat."
+            )
+        """
+        text = self.QA_TRAIN_TEMPLATE.format(
+            context=context,
+            question=question,
+            answer=answer,
+        )
+        return self.encode(text, add_bos=add_bos, add_eos=add_eos)
+
+    def encode_qa_no_context(
+        self,
+        question: str,
+        answer: str = "Maaf, saya tidak memiliki informasi tersebut.",
+        add_bos: bool = True,
+        add_eos: bool = True,
+    ) -> List[int]:
+        """
+        Encode QA sample TANPA konteks (untuk context dropout training).
+        
+        Format: "Pertanyaan: {question} Jawaban: {answer}"
+        
+        Digunakan untuk melatih model agar:
+        - Mengatakan "tidak tahu" jika tidak ada konteks
+        - Tidak hallucinate saat tidak ada informasi
+        
+        Parameter:
+        - question: pertanyaan user
+        - answer: jawaban default (biasanya "tidak tahu")
+        - add_bos: tambahkan [BOS] di awal
+        - add_eos: tambahkan [EOS] di akhir
+        
+        Return:
+        - List of token IDs
+        """
+        text = self.QA_NO_CONTEXT_TEMPLATE.format(
+            question=question,
+        )
+        # Tambah answer secara eksplisit
+        text = f"{text} {answer}"
+        return self.encode(text, add_bos=add_bos, add_eos=add_eos)
+
+    def format_rag_prompt(
+        self,
+        context: str,
+        question: str,
+        include_context: bool = True,
+    ) -> str:
+        """
+        Format prompt untuk RAG inference (text string).
+        
+        Parameter:
+        - context: paragraf konteks dari retriever
+        - question: pertanyaan user
+        - include_context: jika False, abaikan context
+        
+        Return:
+        - Formatted prompt string (belum di-encode)
+        
+        Contoh:
+            prompt = tokenizer.format_rag_prompt(
+                context="Mobil adalah kendaraan beroda empat.",
+                question="Apa itu mobil?"
+            )
+            # Result: "Konteks: Mobil adalah kendaraan beroda empat. 
+            #          Pertanyaan: Apa itu mobil? Jawaban:"
+        """
+        if include_context and context:
+            return self.QA_INFERENCE_TEMPLATE.format(
+                context=context,
+                question=question,
+            )
+        else:
+            # Tanpa context (fallback)
+            return f"Pertanyaan: {question} Jawaban:"
+
+    def encode_rag_prompt(
+        self,
+        context: Optional[str],
+        question: str,
+        add_bos: bool = True,
+    ) -> List[int]:
+        """
+        Encode prompt untuk RAG inference (token IDs).
+        
+        Format: "Konteks: {context} Pertanyaan: {question} Jawaban:"
+        
+        Parameter:
+        - context: paragraf konteks dari retriever (None jika tidak ada)
+        - question: pertanyaan user
+        - add_bos: tambahkan [BOS] di awal
+        
+        Return:
+        - List of token IDs (tanpa EOS, karena model akan generate lanjutannya)
+        
+        Contoh:
+            ids = tokenizer.encode_rag_prompt(
+                context="Mobil adalah kendaraan beroda empat.",
+                question="Apa itu mobil?"
+            )
+            # Model akan generate token selanjutnya (jawaban)
+        """
+        prompt_text = self.format_rag_prompt(
+            context=context,
+            question=question,
+            include_context=context is not None,
+        )
+        return self.encode(prompt_text, add_bos=add_bos, add_eos=False)
+
+    def split_qa_for_training(
+        self,
+        context: str,
+        question: str,
+        answer: str,
+    ) -> Tuple[List[int], List[int]]:
+        """
+        Split QA sample menjadi (input_ids, target_ids) untuk training.
+        
+        Digunakan oleh trainer untuk:
+        - Input: "Konteks: X Pertanyaan: Y Jawaban:" (tanpa answer)
+        - Target: " {answer} [EOS]" (answer + EOS)
+        
+        Parameter:
+        - context: paragraf konteks
+        - question: pertanyaan
+        - answer: jawaban
+        
+        Return:
+        - (input_ids, target_ids) tuple
+        
+        Contoh:
+            input_ids, target_ids = tokenizer.split_qa_for_training(
+                context="Mobil adalah kendaraan.",
+                question="Apa itu mobil?",
+                answer="Kendaraan beroda empat."
+            )
+            # input_ids:  [BOS, Konteks, :, Mobil, ..., Jawaban, :]
+            # target_ids: [Kendaraan, beroda, empat, ., EOS]
+        """
+        # Format lengkap (dengan answer)
+        full_text = self.QA_TRAIN_TEMPLATE.format(
+            context=context,
+            question=question,
+            answer=answer,
+        )
+        
+        # Format input (tanpa answer)
+        input_text = self.QA_INFERENCE_TEMPLATE.format(
+            context=context,
+            question=question,
+        )
+        
+        # Encode keduanya
+        full_ids = self.encode(full_text, add_bos=True, add_eos=True)
+        input_ids = self.encode(input_text, add_bos=True, add_eos=False)
+        
+        # Target = full_ids[len(input_ids):]
+        target_ids = full_ids[len(input_ids):]
+        
+        return input_ids, target_ids
+
+    # ======================================================================
+    # DECODE METHODS
+    # ======================================================================
+
     def _encode_text_part(self, text: str) -> List[str]:
         """
         Encode bagian teks biasa (tanpa ).
@@ -322,6 +545,48 @@ class Tokenizer:
                 tid = int(token_id)
             except (TypeError, ValueError):
                 continue
+
+            token = self.id_to_token.get(tid)
+            if token is None:
+                continue
+
+            if skip_special_tokens:
+                if token in self._special_set:
+                    continue
+                if token.startswith("[UNUSED_"):
+                    continue
+
+            pieces.append(token)
+
+        text = "".join(pieces)
+        text = text.replace(self.SPACE_MARKER, " ")
+        text = re.sub(r"\s+", " ", text).strip()
+
+        return text
+
+    def decode_until_eos(
+        self,
+        token_ids: Iterable[int],
+        skip_special_tokens: bool = True,
+    ) -> str:
+        """
+        Decode token IDs sampai menemukan [EOS].
+        
+        Berguna untuk inference: berhenti decode saat model generate EOS.
+        """
+        self._ensure_ready()
+
+        pieces: List[str] = []
+
+        for token_id in token_ids:
+            try:
+                tid = int(token_id)
+            except (TypeError, ValueError):
+                continue
+
+            # Stop jika ketemu EOS
+            if tid == self.eos_id:
+                break
 
             token = self.id_to_token.get(tid)
             if token is None:
@@ -729,9 +994,9 @@ if __name__ == "__main__":
     tokenizer.train()
 
     # Verifikasi endoftext_token
-    print("=" * 60)
-    print("Tokenizer Verification")
-    print("=" * 60)
+    print("=" * 70)
+    print("Tokenizer Verification (RAG-ready)")
+    print("=" * 70)
     print(f"endoftext_token : {repr(tokenizer.endoftext_token)}")
     print(f"endoftext_id    : {tokenizer.endoftext_id}")
     print(f"Is empty?       : {not tokenizer.endoftext_token}")
@@ -761,9 +1026,9 @@ if __name__ == "__main__":
     # ================================================================
     # Test dengan document boundary
     # ================================================================
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("TEST: Document Boundary Token")
-    print("=" * 60)
+    print("=" * 70)
     
     # Gunakan fallback token jika endoftext kosong
     eot_token = tokenizer.endoftext_token or '<|endoftext|>'
@@ -779,25 +1044,60 @@ if __name__ == "__main__":
     print(f"Token Pieces      : {test_pieces}")
     print(f"endoftext in tokens: {tokenizer.endoftext_token in test_tokens}")
     print(f"endoftext_id in IDs: {tokenizer.endoftext_id in test_ids}")
-    
+
     # ================================================================
-    # Test dengan trainer-style encoding
+    # Test RAG methods (BARU)
     # ================================================================
-    print("\n" + "=" * 60)
-    print("TEST: Trainer-Style Encoding")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("TEST: RAG Encoding Methods")
+    print("=" * 70)
     
-    paragraph = "[MOBIL] Mobil adalah kendaraan beroda empat."
-    ids_no_special = tokenizer.encode(paragraph, add_bos=False, add_eos=False)
-    ids_with_special = tokenizer.encode(paragraph, add_bos=True, add_eos=True, add_endoftext=True)
+    # Test encode_qa_sample (untuk training)
+    context = "Mobil adalah kendaraan beroda empat yang menggunakan mesin."
+    question = "Apa itu mobil?"
+    answer = "Mobil adalah kendaraan beroda empat."
     
-    print(f"Paragraph         : {paragraph}")
-    print(f"IDs (no special)  : {ids_no_special}")
-    print(f"IDs (+BOS/EOS/EOT): {ids_with_special}")
-    print()
-    print("Struktur IDs dengan special tokens:")
-    print(f"  [BOS]       = 2  (di awal)")
-    print(f"  teks        = {ids_no_special[:3]}... (middle)")
-    print(f"  [EOS]       = 3  (di akhir teks)")
-    print(f"  <> = 4  (document boundary)")
-    print(f"  [PAD]       = 0  (akan ditambahkan oleh trainer)")
+    qa_ids = tokenizer.encode_qa_sample(context, question, answer)
+    print(f"\n1. encode_qa_sample():")
+    print(f"   Context  : {context}")
+    print(f"   Question : {question}")
+    print(f"   Answer   : {answer}")
+    print(f"   IDs      : {qa_ids}")
+    print(f"   Decoded  : {tokenizer.decode(qa_ids, skip_special_tokens=False)}")
+    
+    # Test encode_qa_no_context (untuk context dropout training)
+    qa_no_ctx_ids = tokenizer.encode_qa_no_context(question)
+    print(f"\n2. encode_qa_no_context():")
+    print(f"   Question : {question}")
+    print(f"   IDs      : {qa_no_ctx_ids}")
+    print(f"   Decoded  : {tokenizer.decode(qa_no_ctx_ids, skip_special_tokens=False)}")
+    
+    # Test format_rag_prompt (untuk inference)
+    prompt_text = tokenizer.format_rag_prompt(context, question)
+    print(f"\n3. format_rag_prompt():")
+    print(f"   Formatted: {prompt_text}")
+    
+    # Test encode_rag_prompt (untuk inference)
+    prompt_ids = tokenizer.encode_rag_prompt(context, question)
+    print(f"\n4. encode_rag_prompt():")
+    print(f"   IDs      : {prompt_ids}")
+    print(f"   Decoded  : {tokenizer.decode(prompt_ids, skip_special_tokens=False)}")
+    
+    # Test split_qa_for_training (untuk trainer)
+    input_ids, target_ids = tokenizer.split_qa_for_training(context, question, answer)
+    print(f"\n5. split_qa_for_training():")
+    print(f"   Input IDs  ({len(input_ids)}): {input_ids}")
+    print(f"   Target IDs ({len(target_ids)}): {target_ids}")
+    print(f"   Input decoded  : {tokenizer.decode(input_ids, skip_special_tokens=False)}")
+    print(f"   Target decoded : {tokenizer.decode(target_ids, skip_special_tokens=False)}")
+    
+    # Test decode_until_eos
+    test_with_eos = [5, 10, 20, tokenizer.eos_id, 30, 40]
+    decoded_until = tokenizer.decode_until_eos(test_with_eos)
+    print(f"\n6. decode_until_eos():")
+    print(f"   Input IDs : {test_with_eos}")
+    print(f"   Decoded   : '{decoded_until}' (stop at EOS)")
+
+    print("\n" + "=" * 70)
+    print("core/tokenizer.py (RAG-ready) ALL TESTS PASSED")
+    print("=" * 70)

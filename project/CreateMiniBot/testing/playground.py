@@ -1,14 +1,19 @@
 # testing/playground.py
 #
-# Playground / Inference Testing Engine dengan MoE Auto-Routing.
+# Playground / Inference Testing Engine dengan RAG (Retrieval-Augmented Generation).
+#
+# Arsitektur: Single-Head + BM25 Retrieval
+# - Retrieval: BM25 cari paragraf relevan dari corpus
+# - Generation: Single LM head, context-conditioned
+# - Loss ↓ = Presisi ↑ (korelasi langsung, no topic mixing)
 #
 # Fitur Utama:
-# - Anti Semantic Drift: temperature rendah, top-k/top-p ketat
-# - MoE Auto-Routing: otomatis pilih LM head berdasarkan domain
-# - Semantic Context Injection: inject paragraf relevan ke prompt
-# - Domain-Aware Inference: manual prefix via /domain
-# - Stop generation saat  atau [EOS]
-# - Debug mode: tampilkan token IDs dan pieces
+# - BM25 Retrieval: otomatis ambil top-k paragraf relevan
+# - Query expansion fallback: sinonim jika retrieval gagal
+# - Graceful degradation: fallback ke "tidak tahu" jika tidak ada konteks
+# - Context toggle: bisa disable retrieval untuk testing
+# - Debug mode: tampilkan retrieved context, token IDs, token pieces
+# - Sampling: temperature, top-k, top-p, repetition penalty
 #
 # Perintah interactive (slash commands):
 #   /help                  : tampilkan bantuan
@@ -16,14 +21,10 @@
 #   /training 100          : latih model 100 step
 #   /training --steps 100  : latih model 100 step
 #   /training --epochs 10  : latih model 10 epoch
-#   /training --epochs 10 --steps 50 : latih 10 epoch, minimal 50 step
+#   /retrieve              : lihat hasil retrieval tanpa generate
+#   /retrieve apa itu mobil: test retrieval dengan query spesifik
+#   /context [on|off]      : toggle context injection
 #   /status                : tampilkan status model
-#   /domain MOBIL          : set domain prefix manual
-#   /domain                : hapus domain prefix manual
-#   /domains               : list semua domain yang tersedia (MoE)
-#   /auto [on|off]         : toggle auto-routing MoE
-#   /force DOMAIN          : force domain untuk testing
-#   /force                 : hapus force domain
 #   /exit                  : keluar
 #
 # Semua input tanpa prefix / dianggap sebagai prompt inference.
@@ -57,54 +58,36 @@ except ImportError as exc:
 
 from config import CONFIG, Config
 
-# Import DomainRouter untuk MoE auto-routing (optional)
+# Import BM25Retriever untuk RAG (optional)
 try:
-    from core.router import DomainRouter
-    _ROUTER_AVAILABLE = True
+    from core.retriever import BM25Retriever
+    _RETRIEVER_AVAILABLE = True
 except ImportError:
-    DomainRouter = None
-    _ROUTER_AVAILABLE = False
-
-
-# Regex untuk mendeteksi domain prefix
-DOMAIN_PREFIX_PATTERN = re.compile(r'^\[([A-Z]+)\]\s*')
+    BM25Retriever = None
+    _RETRIEVER_AVAILABLE = False
 
 
 class Playground:
     """
-    Tempat testing pertanyaan / inference dengan MoE Auto-Routing.
+    Tempat testing pertanyaan / inference dengan RAG.
 
-    Fitur Anti Semantic Drift:
-    - Temperature rendah (0.3) untuk determinisme
+    Arsitektur:
+    - BM25 retrieval untuk konteks
+    - Single LM head (no domain contamination)
+    - Context-conditioned generation
+
+    Fitur:
+    - Temperature rendah untuk determinisme
     - Top-K/Top-P ketat untuk filtering
-    - Stop generation saat 
-
-    Fitur MoE:
-    - Auto-routing: otomatis pilih LM head berdasarkan keyword di prompt
-    - Semantic context injection: inject paragraf relevan ke prompt
-    - Domain info: /domains untuk list domain, /force untuk testing
-
-    Perintah interactive (slash commands):
-        /help                  : tampilkan bantuan
-        /training              : latih model (step default)
-        /training 100          : latih model 100 step
-        /training --steps 100  : latih model 100 step
-        /training --epochs 10  : latih model 10 epoch
-        /training --epochs 10 --steps 50 : latih 10 epoch, minimal 50 step
-        /status                : tampilkan status model
-        /domain MOBIL          : set domain prefix manual
-        /domain                : hapus domain prefix manual
-        /domains               : list semua domain yang tersedia
-        /auto [on|off]         : toggle auto-routing MoE
-        /force DOMAIN          : force domain untuk testing
-        /force                 : hapus force domain
-        /exit                  : keluar
+    - Repetition penalty untuk cegah pengulangan
+    - Stop generation saat [EOS] atau 
+    - Context toggle untuk testing tanpa retrieval
     """
 
     # ================================================================
-    # DEFAULT PARAMETERS - DIOPTIMALKAN UNTUK MODEL 17M
+    # DEFAULT PARAMETERS - DIOPTIMALKAN UNTUK MODEL RAG
     # ================================================================
-    DEFAULT_MAX_NEW_TOKENS = 64
+    DEFAULT_MAX_NEW_TOKENS = 128
     DEFAULT_TEMPERATURE = 0.3
     DEFAULT_TOP_K = 20
     DEFAULT_TOP_P = 0.85
@@ -112,7 +95,9 @@ class Playground:
     DEFAULT_REPETITION_WINDOW = 64
     DEFAULT_MIN_NEW_TOKENS = 4
     DEFAULT_INLINE_TRAINING_STEPS = 10
-    FALLBACK_DOMAIN = "GENERAL"
+
+    # RAG default
+    NO_CONTEXT_RESPONSE = "Maaf, saya tidak memiliki informasi yang cukup untuk menjawab pertanyaan tersebut."
 
     def __init__(self, model, tokenizer, config: Config = CONFIG, trainer=None):
         self.model = model
@@ -130,179 +115,166 @@ class Playground:
         self.endoftext_id = int(config.special_tokens.endoftext_id)
 
         self._forbidden_cache: Optional[List[int]] = None
-        self._default_domain: Optional[str] = None
         
         # ============================================================
-        # MoE STATE
+        # RAG STATE
         # ============================================================
-        self._router: Optional[object] = None
-        self._auto_routing: bool = bool(getattr(config.model, 'moe_auto_routing', True))
-        self._force_domain: Optional[str] = None
-        self._use_moe: bool = bool(getattr(config.model, 'use_moe', False))
-        self._semantic_top_k: int = int(getattr(config.model, 'moe_semantic_top_k', 2))
+        self._retriever: Optional[object] = None
+        self._context_enabled: bool = True  # Toggle retrieval
+        self._retrieval_stats: Dict[str, int] = {
+            "total_queries": 0,
+            "with_context": 0,
+            "no_context_fallback": 0,
+            "expansion_used": 0,
+        }
         
-        self._routing_stats: Dict[str, int] = {}
-        
-        # Auto-setup router jika tersedia
-        self._setup_router()
+        # Auto-setup retriever jika tersedia
+        self._setup_retriever()
 
     # ========================================================================
-    # MoE SETUP
+    # RETRIEVER SETUP
     # ========================================================================
 
-    def _setup_router(self) -> None:
+    def _setup_retriever(self) -> None:
         """
-        Setup DomainRouter dari trainer (jika tersedia).
+        Setup BM25Retriever.
         
         Urutan pencarian:
-        1. Dari trainer.get_router() (jika sudah di-build saat training)
-        2. Dari cache file di output folder (jika ada)
+        1. Dari trainer.get_retriever() (jika sudah di-build saat training)
+        2. Dari index file di output folder (jika ada)
+        3. Build baru dari corpus (sebagai fallback)
         """
-        if not _ROUTER_AVAILABLE:
+        if not _RETRIEVER_AVAILABLE:
+            print("[playground] ⚠️ core/retriever.py tidak tersedia. RAG disabled.")
             return
         
-        if not self._use_moe:
-            return
-        
+        # ============================================================
         # Opsi 1: Dari trainer
+        # ============================================================
         if self.trainer is not None:
-            router = None
-            if hasattr(self.trainer, "get_router"):
-                router = self.trainer.get_router()
+            retriever = None
+            if hasattr(self.trainer, "get_retriever"):
+                retriever = self.trainer.get_retriever()
             
-            if router is not None:
-                self._router = router
-                print(f"[playground] MoE router dimuat dari trainer.")
-                print(f"[playground] Domains tersedia: {list(router.domain_keywords.keys())}")
+            if retriever is not None:
+                self._retriever = retriever
+                print(f"[playground] ✅ BM25 retriever dimuat dari trainer.")
+                print(f"[playground]    Corpus size: {retriever.total_docs} paragraphs")
                 return
         
-        # Opsi 2: Dari cache file
+        # ============================================================
+        # Opsi 2: Dari index file
+        # ============================================================
         try:
-            router = DomainRouter(self.config)
+            retriever = BM25Retriever(self.config)
+            index_path = Path(self.config.paths.retrieval_index_path)
             
-            keywords_path = Path(self.config.paths.output_models_dir) / "domain_keywords.json"
-            cache_path = Path(self.config.paths.output_models_dir) / "semantic_cache.npz"
-            
-            keywords_loaded = router.load_keywords(keywords_path)
-            cache_loaded = router.load_cache(cache_path)
-            
-            if keywords_loaded:
-                self._router = router
-                domains = list(router.domain_keywords.keys())
-                print(f"[playground] MoE router dimuat dari cache.")
-                print(f"[playground] Domains tersedia: {domains}")
-                if cache_loaded:
-                    print(f"[playground] Semantic cache dimuat: {len(router.search_engine.domain_embeddings)} domain")
-            else:
-                print(f"[playground] MoE router tidak tersedia (keywords belum dibangun).")
-                print(f"[playground] Jalankan training dulu untuk membangun router.")
+            if retriever.load_index(index_path):
+                self._retriever = retriever
+                print(f"[playground] ✅ BM25 retriever dimuat dari cache.")
+                print(f"[playground]    Corpus size: {retriever.total_docs} paragraphs")
+                return
         except Exception as exc:
-            print(f"[playground] Warning: Gagal setup router: {exc}")
+            print(f"[playground] Warning: Gagal load index dari cache: {exc}")
+        
+        # ============================================================
+        # Opsi 3: Build baru dari corpus
+        # ============================================================
+        try:
+            from core.retriever import load_corpus_from_directory
+            
+            datasets_dir = Path(self.config.paths.datasets_dir)
+            if datasets_dir.exists():
+                max_para_len = int(getattr(self.config.retrieval, 'max_paragraph_length', 500))
+                corpus = load_corpus_from_directory(
+                    datasets_dir,
+                    max_paragraph_length=max_para_len,
+                    verbose=False,
+                )
+                
+                if corpus:
+                    retriever = BM25Retriever(self.config)
+                    retriever.build_index(corpus, verbose=False)
+                    
+                    # Save untuk session berikutnya
+                    index_path = Path(self.config.paths.retrieval_index_path)
+                    retriever.save_index(index_path)
+                    
+                    self._retriever = retriever
+                    print(f"[playground] ✅ BM25 retriever dibangun dari corpus.")
+                    print(f"[playground]    Corpus size: {len(corpus)} paragraphs")
+                    print(f"[playground]    Index disimpan ke: {index_path}")
+                    return
+        except Exception as exc:
+            print(f"[playground] Warning: Gagal build retriever dari corpus: {exc}")
+        
+        print("[playground] ⚠️ Retriever tidak tersedia.")
+        print("[playground]    Jalankan training dulu untuk membangun index.")
 
     # ========================================================================
-    # MoE ROUTING
+    # RETRIEVAL
     # ========================================================================
 
-    def _route_prompt(self, prompt: str) -> Tuple[str, float]:
+    def _retrieve_context(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        min_score: Optional[float] = None,
+        verbose: bool = False,
+    ) -> Tuple[Optional[str], List[Tuple[str, float]]]:
         """
-        Route prompt ke domain menggunakan router.
+        Retrieve konteks yang relevan untuk query.
         
-        Return:
-        - (domain, confidence)
-        - Jika router tidak tersedia, return (None, 0.0)
+        Args:
+            query: pertanyaan user
+            top_k: jumlah paragraf (default dari config)
+            min_score: minimum score (default dari config)
+            verbose: print debug info
+        
+        Returns:
+            - (combined_context, results_list)
+            - combined_context: string dengan paragraf digabung, atau None jika gagal
+            - results_list: list of (paragraph, score) tuples
         """
-        # Force domain punya prioritas tertinggi
-        if self._force_domain is not None:
-            return (self._force_domain, 1.0)
+        if self._retriever is None or not self._context_enabled:
+            return None, []
         
-        # Manual domain prefix (untuk backward compat)
-        if self._default_domain is not None:
-            return (self._default_domain, 0.9)
-        
-        # Auto routing via router
-        if self._router is not None and self._auto_routing:
-            available_domains = None
-            if hasattr(self.model, "list_domains"):
-                available_domains = self.model.list_domains()
-            
-            domain, confidence, _ = self._router.route(
-                prompt,
-                available_domains=available_domains,
-            )
-            
-            # Track stats
-            self._routing_stats[domain] = self._routing_stats.get(domain, 0) + 1
-            
-            return (domain, confidence)
-        
-        return (None, 0.0)
-
-    def _inject_semantic_context(self, prompt: str, domain: Optional[str]) -> Tuple[str, List[str]]:
-        """
-        Inject paragraf relevan ke prompt via semantic search.
-        
-        Return:
-        - (augmented_prompt, context_paragraphs)
-        """
-        # Skip jika tidak ada router atau semantic search disabled
-        if self._router is None:
-            return (prompt, [])
-        
-        if self._semantic_top_k <= 0:
-            return (prompt, [])
-        
-        if not hasattr(self._router, "search_engine"):
-            return (prompt, [])
-        
-        if not self._router.search_engine.domain_embeddings:
-            return (prompt, [])
-        
-        # Skip semantic search jika prompt sudah sangat panjang
-        if len(prompt.split()) > 20:
-            return (prompt, [])
+        # Default dari config
+        retrieval_cfg = getattr(self.config, 'retrieval', None)
+        if top_k is None:
+            top_k = getattr(retrieval_cfg, 'top_k', 3) if retrieval_cfg else 3
+        if min_score is None:
+            min_score = getattr(retrieval_cfg, 'min_score', None) if retrieval_cfg else None
         
         try:
-            paragraphs, similarities = self._router.semantic_search(
-                prompt=prompt,
-                model=self.model,
-                tokenizer=self.tokenizer,
-                domain=domain,
-                top_k=self._semantic_top_k,
+            results = self._retriever.retrieve(
+                query=query,
+                top_k=top_k,
+                min_score=min_score,
+                use_dynamic_threshold=True,
+                enable_expansion_fallback=True,
+                verbose=verbose,
             )
             
-            if not paragraphs:
-                return (prompt, [])
+            self._retrieval_stats["total_queries"] += 1
             
-            # Format context injection
-            context_lines = []
-            for para, sim in zip(paragraphs, similarities):
-                # Truncate paragraf jika terlalu panjang
-                para_truncated = para[:200] + "..." if len(para) > 200 else para
-                context_lines.append(f"- {para_truncated}")
+            if not results:
+                self._retrieval_stats["no_context_fallback"] += 1
+                return None, []
             
-            context_text = "\n".join(context_lines)
+            # Gabungkan paragraf dengan separator
+            paragraphs = [para for para, score in results]
+            combined_context = "\n\n".join(paragraphs)
             
-            # Format: context dulu, lalu prompt
-            augmented = f"Berdasarkan informasi berikut:\n{context_text}\n\nJawab pertanyaan: {prompt}"
+            self._retrieval_stats["with_context"] += 1
             
-            return (augmented, paragraphs)
-            
+            return combined_context, results
+        
         except Exception as exc:
-            # Fallback: prompt asli tanpa context
-            return (prompt, [])
-
-    def _set_model_domain(self, domain: Optional[str]) -> None:
-        """Set active domain di model."""
-        if domain is None:
-            return
-        
-        if not hasattr(self.model, "set_active_domain"):
-            return
-        
-        try:
-            self.model.set_active_domain(domain)
-        except Exception:
-            pass
+            if verbose:
+                print(f"[playground] Retrieval error: {exc}")
+            self._retrieval_stats["no_context_fallback"] += 1
+            return None, []
 
     # ========================================================================
     # PUBLIC API
@@ -320,9 +292,10 @@ class Playground:
         min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
         verbose: bool = True,
         debug_tokens: bool = False,
+        debug_retrieval: bool = True,
     ) -> str:
         """Uji satu prompt dan cetak hasilnya."""
-        answer, generated_ids, token_pieces, routing_info = self.generate(
+        answer, generated_ids, token_pieces, rag_info = self.generate(
             prompt=prompt,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -338,17 +311,24 @@ class Playground:
             print("-" * 60)
             print("Prompt  :", prompt)
             
-            # MoE ROUTING INFO
-            if routing_info.get("domain"):
-                domain = routing_info["domain"]
-                confidence = routing_info.get("confidence", 0.0)
-                print(f"Domain  : [{domain}] (confidence: {confidence:.2%})")
+            # ============================================================
+            # RAG INFO
+            # ============================================================
+            if debug_retrieval:
+                context = rag_info.get("context")
+                retrieval_results = rag_info.get("retrieval_results", [])
                 
-                if routing_info.get("semantic_context"):
-                    n_ctx = len(routing_info["semantic_context"])
-                    print(f"Context : {n_ctx} paragraf relevan di-inject")
-
+                if context:
+                    print(f"Context : {len(retrieval_results)} paragraf retrieved")
+                    for i, (para, score) in enumerate(retrieval_results, 1):
+                        preview = para[:80] + "..." if len(para) > 80 else para
+                        print(f"  [{i}] score={score:.3f}: {preview}")
+                else:
+                    print(f"Context : (tidak ditemukan, menggunakan fallback)")
+            
+            # ============================================================
             # DEBUG MODE
+            # ============================================================
             if debug_tokens:
                 print()
                 print("[DEBUG] Token IDs    :")
@@ -384,45 +364,55 @@ class Playground:
         return_debug: bool = False,
     ) -> Tuple[str, List[int], List[str], Dict]:
         """
-        Membuat jawaban/lanjutan teks dari prompt.
+        Membuat jawaban/lanjutan teks dari prompt dengan RAG.
 
-        MoE INFERENCE FLOW:
-        1. Route prompt ke domain (auto atau manual)
-        2. Set active LM head di model
-        3. Inject semantic context (jika tersedia)
+        RAG INFERENCE FLOW:
+        1. Retrieve top-k paragraf relevan dari corpus
+        2. Format prompt: "Konteks: {context} Pertanyaan: {prompt} Jawaban:"
+        3. Jika tidak ada konteks, gunakan "tidak tahu" response
         4. Generate dengan sampling parameters
         5. Stop saat EOS atau 
         """
         self._ensure_tokenizer_ready()
 
         # ================================================================
-        # MoE ROUTING
+        # RAG RETRIEVAL
         # ================================================================
-        domain, confidence = self._route_prompt(prompt)
-        
-        # Set active domain di model (untuk MoE LM head)
-        if domain is not None:
-            self._set_model_domain(domain)
+        context, retrieval_results = self._retrieve_context(
+            query=prompt,
+            verbose=False,
+        )
 
         # ================================================================
-        # SEMANTIC CONTEXT INJECTION
+        # FORMAT PROMPT (RAG style)
         # ================================================================
-        augmented_prompt = prompt
-        semantic_context: List[str] = []
-        
-        if self._use_moe and domain is not None and self._auto_routing:
-            augmented_prompt, semantic_context = self._inject_semantic_context(
-                prompt, domain
+        if context:
+            # Dengan konteks
+            actual_prompt = self.tokenizer.format_rag_prompt(
+                context=context,
+                question=prompt,
+                include_context=True,
             )
+        else:
+            # Tanpa konteks → langsung return fallback response
+            rag_info = {
+                "context": None,
+                "retrieval_results": [],
+                "used_fallback": True,
+            }
+            
+            if return_debug:
+                return (
+                    self.NO_CONTEXT_RESPONSE,
+                    [],
+                    [],
+                    rag_info,
+                )
+            return self.NO_CONTEXT_RESPONSE, [], [], rag_info
 
         # ================================================================
-        # DOMAIN PREFIX (untuk backward compat)
+        # ENCODE PROMPT
         # ================================================================
-        actual_prompt = augmented_prompt
-        if self._default_domain is not None and not semantic_context:
-            if not DOMAIN_PREFIX_PATTERN.match(prompt.strip()):
-                actual_prompt = f"[{self._default_domain}] {augmented_prompt}"
-
         prompt_ids = self.tokenizer.encode(
             actual_prompt,
             add_bos=True,
@@ -442,8 +432,8 @@ class Playground:
         # GENERATION LOOP
         # ================================================================
         for step in range(max_new_tokens):
-            context = current_ids[-self.max_context :]
-            input_ids = np.array([context], dtype=np.int64)
+            context_window = current_ids[-self.max_context :]
+            input_ids = np.array([context_window], dtype=np.int64)
 
             logits = self.model.forward(input_ids, training=False)
             next_logits = np.asarray(logits[0, -1, :], dtype=np.float32)
@@ -493,25 +483,26 @@ class Playground:
         # ================================================================
         token_pieces = self._get_token_pieces(generated_ids)
 
-        answer_text = self.tokenizer.decode(
+        # Decode sampai EOS (jika ada)
+        answer_text = self.tokenizer.decode_until_eos(
             generated_ids,
             skip_special_tokens=True,
         )
 
         # ================================================================
-        # ROUTING INFO (untuk debug)
+        # RAG INFO (untuk debug)
         # ================================================================
-        routing_info = {
-            "domain": domain,
-            "confidence": confidence,
-            "semantic_context": semantic_context,
-            "auto_routing": self._auto_routing,
+        rag_info = {
+            "context": context,
+            "retrieval_results": retrieval_results,
+            "used_fallback": False,
+            "formatted_prompt": actual_prompt,
         }
 
         if return_debug:
-            return answer_text, generated_ids, token_pieces, routing_info
+            return answer_text, generated_ids, token_pieces, rag_info
 
-        return answer_text, generated_ids, token_pieces, routing_info
+        return answer_text, generated_ids, token_pieces, rag_info
 
     def _get_token_pieces(self, token_ids: List[int]) -> List[str]:
         """Ubah daftar token ID menjadi daftar token string (subword)."""
@@ -539,21 +530,25 @@ class Playground:
         repetition_window: int = DEFAULT_REPETITION_WINDOW,
         min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
         debug_tokens: bool = False,
+        debug_retrieval: bool = True,
     ) -> None:
         """Mode CLI interaktif."""
-        print("=" * 60)
-        print("Testing Playground - Inference Engine")
-        print("=" * 60)
+        print("=" * 70)
+        print("RAG Playground - Retrieval-Augmented Generation Engine")
+        print("=" * 70)
         print("Ketik prompt untuk inference.")
         print("Ketik /help untuk daftar perintah.")
+        print()
 
         if debug_tokens:
             print(">>> DEBUG MODE AKTIF: Token IDs & Pieces akan ditampilkan <<<")
-        
-        if self._use_moe:
-            print(f">>> MoE AKTIF: auto-routing = {self._auto_routing} <<<")
 
-        print("=" * 60)
+        if self._retriever is not None:
+            print(f">>> RAG AKTIF: BM25 retriever dengan {self._retriever.total_docs} paragraf <<<")
+        else:
+            print(">>> RAG DISABLE: Retriever tidak tersedia <<<")
+
+        print("=" * 70)
         print(f"temperature        : {temperature}")
         print(f"top_k              : {top_k}")
         print(f"top_p              : {top_p}")
@@ -561,17 +556,15 @@ class Playground:
         print(f"min_new_tokens     : {min_new_tokens}")
         print(f"max_new_tokens     : {max_new_tokens}")
         print(f"debug_tokens       : {debug_tokens}")
-        print(f"use_moe            : {self._use_moe}")
-        print(f"auto_routing       : {self._auto_routing}")
-        if self._default_domain:
-            print(f"default_domain     : [{self._default_domain}]")
-        if self._force_domain:
-            print(f"force_domain       : [{self._force_domain}]")
-        print("=" * 60)
+        print(f"debug_retrieval    : {debug_retrieval}")
+        print(f"context_enabled    : {self._context_enabled}")
+        if self._retriever:
+            print(f"retriever corpus   : {self._retriever.total_docs} paragraphs")
+        print("=" * 70)
 
         while True:
             try:
-                user_input = input("prompt> ")
+                user_input = input("\nprompt> ")
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
@@ -604,7 +597,8 @@ class Playground:
             # ================================================================
             # PROMPT INFERENCE
             # ================================================================
-            answer, generated_ids, token_pieces, routing_info = self.generate(
+            print()
+            answer, generated_ids, token_pieces, rag_info = self.generate(
                 prompt=stripped,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -617,16 +611,23 @@ class Playground:
             )
 
             # ============================================================
-            # MoE ROUTING INFO
+            # RAG INFO
             # ============================================================
-            if routing_info.get("domain"):
-                domain = routing_info["domain"]
-                confidence = routing_info.get("confidence", 0.0)
-                print(f"[Router] Domain: [{domain}] (confidence: {confidence:.2%})")
+            if debug_retrieval:
+                context = rag_info.get("context")
+                retrieval_results = rag_info.get("retrieval_results", [])
+                used_fallback = rag_info.get("used_fallback", False)
                 
-                if routing_info.get("semantic_context"):
-                    n_ctx = len(routing_info["semantic_context"])
-                    print(f"[Router] Context: {n_ctx} paragraf relevan di-inject")
+                if used_fallback:
+                    print("[RAG] ⚠️  Tidak ada konteks relevan. Menggunakan fallback response.")
+                elif context:
+                    print(f"[RAG] ✅ Retrieved {len(retrieval_results)} paragraphs:")
+                    for i, (para, score) in enumerate(retrieval_results, 1):
+                        preview = para[:100] + "..." if len(para) > 100 else para
+                        preview = preview.replace('\n', ' ')
+                        print(f"  [{i}] score={score:.3f}: {preview}")
+                else:
+                    print("[RAG] Context disabled (gunakan /context on untuk aktifkan)")
 
             # ============================================================
             # DEBUG MODE
@@ -647,9 +648,10 @@ class Playground:
 
                 print()
 
-            print("Jawaban :", answer if answer else "(kosong)")
+            print()
+            print("Jawaban:", answer if answer else "(kosong)")
             print(f"[{len(generated_ids)} token dihasilkan]")
-            print("-" * 60)
+            print("-" * 70)
 
     # ========================================================================
     # COMMAND HANDLER
@@ -686,20 +688,12 @@ class Playground:
             self._print_status()
             return False
 
-        if cmd == "/domain":
-            self._handle_domain_command(parts)
+        if cmd == "/retrieve":
+            self._handle_retrieve_command(parts)
             return False
 
-        if cmd == "/domains":
-            self._handle_domains_command()
-            return False
-
-        if cmd == "/auto":
-            self._handle_auto_command(parts)
-            return False
-
-        if cmd == "/force":
-            self._handle_force_command(parts)
+        if cmd == "/context":
+            self._handle_context_command(parts)
             return False
 
         print(f"[playground] Perintah tidak dikenal: {cmd}")
@@ -707,132 +701,85 @@ class Playground:
         return False
 
     # ========================================================================
-    # DOMAIN COMMAND HANDLER
+    # RETRIEVE COMMAND (BARU)
     # ========================================================================
 
-    def _handle_domain_command(self, parts: List[str]) -> None:
-        """Memproses perintah /domain."""
-        if len(parts) < 2:
-            if self._default_domain:
-                print(f"[playground] Domain default dihapus (sebelumnya: [{self._default_domain}])")
-                self._default_domain = None
-            else:
-                print("[playground] Tidak ada domain default yang aktif.")
-                print("[playground] Gunakan: /domain MOBIL, /domain SAINS, /domain FILSAFAT, dll.")
-                print("[playground] Atau gunakan /domains untuk lihat domain yang tersedia.")
-            return
-
-        domain = parts[1].upper().strip()
+    def _handle_retrieve_command(self, parts: List[str]) -> None:
+        """
+        Memproses perintah /retrieve.
         
-        if not re.match(r'^[A-Z0-9_]+$', domain):
-            print(f"[playground] Domain tidak valid: {domain}")
-            print("[playground] Domain harus huruf kapital/angka/underscore (contoh: MOBIL, SAINS)")
+        Format:
+            /retrieve              → test retrieval dengan query terakhir
+            /retrieve [query]      → test retrieval dengan query spesifik
+        """
+        if self._retriever is None:
+            print("[playground] ⚠️ Retriever tidak tersedia.")
             return
-
-        self._default_domain = domain
-        print(f"[playground] Domain default diset ke: [{domain}]")
-        print(f"[playground] Semua prompt akan otomatis di-prefix dengan [{domain}]")
-        print(f"[playground] Gunakan /domain untuk menghapus domain default.")
-
-    def _handle_domains_command(self) -> None:
-        """Memproses perintah /domains."""
-        print("=" * 60)
-        print("Daftar Domain yang Tersedia")
-        print("=" * 60)
         
-        # Dari model (LM heads)
-        model_domains = []
-        if hasattr(self.model, "list_domains"):
+        # Ambil query dari args atau minta input
+        if len(parts) >= 2:
+            query = " ".join(parts[1:])
+        else:
             try:
-                model_domains = self.model.list_domains()
-            except Exception:
-                model_domains = []
+                query = input("Masukkan query untuk retrieval: ").strip()
+                if not query:
+                    print("[playground] Query kosong. Dibatalkan.")
+                    return
+            except (EOFError, KeyboardInterrupt):
+                return
         
-        if model_domains:
-            print(f"\nModel LM heads ({len(model_domains)}):")
-            for domain in model_domains:
-                marker = " ← aktif" if self._force_domain == domain else ""
-                marker += " ← default" if self._default_domain == domain else ""
-                print(f"  [{domain}]{marker}")
+        print(f"\n[playground] Retrieving untuk query: '{query}'")
+        print("-" * 70)
+        
+        context, results = self._retrieve_context(query, verbose=True)
+        
+        if not results:
+            print("[playground] ❌ Tidak ada hasil retrieval.")
         else:
-            print("\nModel LM heads: (tidak ada / MoE tidak aktif)")
+            print(f"\n[playground] ✅ Ditemukan {len(results)} paragraf:")
+            for i, (para, score) in enumerate(results, 1):
+                print(f"\n--- Hasil {i} (score: {score:.3f}) ---")
+                print(para)
         
-        # Dari router (keywords)
-        if self._router is not None:
-            router_domains = list(self._router.domain_keywords.keys())
-            if router_domains:
-                print(f"\nRouter keywords ({len(router_domains)}):")
-                for domain in router_domains:
-                    n_keywords = len(self._router.domain_keywords.get(domain, []))
-                    print(f"  [{domain}]: {n_keywords} keywords")
-            else:
-                print("\nRouter keywords: (belum dibangun)")
-        else:
-            print("\nRouter: (tidak tersedia)")
-            print("  Jalankan training dulu untuk membangun router.")
-        
-        # Routing stats
-        if self._routing_stats:
-            print(f"\nRouting statistics (sesi ini):")
-            for domain, count in sorted(
-                self._routing_stats.items(),
-                key=lambda x: -x[1]
-            ):
-                print(f"  [{domain}]: {count}x")
-        
-        print("=" * 60)
+        print("-" * 70)
 
-    def _handle_auto_command(self, parts: List[str]) -> None:
-        """Memproses perintah /auto."""
+    # ========================================================================
+    # CONTEXT COMMAND (BARU)
+    # ========================================================================
+
+    def _handle_context_command(self, parts: List[str]) -> None:
+        """
+        Memproses perintah /context.
+        
+        Format:
+            /context          → tampilkan status
+            /context on       → aktifkan retrieval
+            /context off      → nonaktifkan retrieval
+        """
         if len(parts) < 2:
-            status = "AKTIF" if self._auto_routing else "NONAKTIF"
-            print(f"[playground] Auto-routing: {status}")
-            print(f"[playground] Gunakan: /auto on atau /auto off")
+            status = "AKTIF" if self._context_enabled else "NONAKTIF"
+            print(f"[playground] Context injection: {status}")
+            print(f"[playground] Gunakan: /context on atau /context off")
+            
+            # Print stats
+            print(f"\n[playground] Retrieval statistics:")
+            for key, value in self._retrieval_stats.items():
+                print(f"  {key}: {value}")
             return
         
         mode = parts[1].lower().strip()
         
         if mode in {"on", "1", "true", "aktif"}:
-            self._auto_routing = True
-            print("[playground] Auto-routing MoE: AKTIF")
-            print("[playground] Router akan otomatis memilih LM head berdasarkan prompt.")
+            self._context_enabled = True
+            print("[playground] ✅ Context injection: AKTIF")
+            print("[playground] Retriever akan menyediakan konteks untuk setiap query.")
         elif mode in {"off", "0", "false", "nonaktif", "mati"}:
-            self._auto_routing = False
-            print("[playground] Auto-routing MoE: NONAKTIF")
-            print("[playground] Gunakan /domain untuk set domain manual.")
+            self._context_enabled = False
+            print("[playground] ⚠️ Context injection: NONAKTIF")
+            print("[playground] Model akan generate tanpa konteks (seperti language model biasa).")
         else:
             print(f"[playground] Mode tidak valid: {mode}")
-            print("[playground] Gunakan: /auto on atau /auto off")
-
-    def _handle_force_command(self, parts: List[str]) -> None:
-        """Memproses perintah /force."""
-        if len(parts) < 2:
-            if self._force_domain:
-                print(f"[playground] Force domain dihapus (sebelumnya: [{self._force_domain}])")
-                self._force_domain = None
-            else:
-                print("[playground] Tidak ada force domain yang aktif.")
-            return
-        
-        domain = parts[1].upper().strip()
-        
-        if not re.match(r'^[A-Z0-9_]+$', domain):
-            print(f"[playground] Domain tidak valid: {domain}")
-            return
-        
-        if hasattr(self.model, "has_domain"):
-            try:
-                if not self.model.has_domain(domain):
-                    print(f"[playground] Warning: Domain [{domain}] tidak ada di model.")
-                    print(f"[playground] Domain yang tersedia: {self.model.list_domains()}")
-            except Exception:
-                pass
-        
-        self._force_domain = domain
-        self._set_model_domain(domain)
-        print(f"[playground] Force domain diset ke: [{domain}]")
-        print(f"[playground] Router akan di-bypass, semua prompt pakai LM head [{domain}].")
-        print(f"[playground] Gunakan /force untuk menghapus force domain.")
+            print("[playground] Gunakan: /context on atau /context off")
 
     # ========================================================================
     # TRAINING COMMAND HANDLER
@@ -849,16 +796,18 @@ class Playground:
         steps = parsed.get("steps")
         epochs = parsed.get("epochs")
 
-        print("-" * 60)
+        print("-" * 70)
 
         if epochs is not None:
+            # MODE EPOCH
             min_steps = steps if steps is not None else 0
 
             print(
                 f"[playground] Training mode EPOCH: {epochs} epoch"
                 + (f", minimal {min_steps} step" if min_steps > 0 else "")
             )
-            print("-" * 60)
+            print("[playground] Mode: RAG context-conditioned training")
+            print("-" * 70)
 
             try:
                 if hasattr(self.trainer, "train_epochs_inline"):
@@ -877,29 +826,34 @@ class Playground:
 
                 if history:
                     last = history[-1]
-                    print("-" * 60)
+                    print("-" * 70)
                     print("[playground] Training epoch selesai.")
                     print(f"[playground] Epoch terakhir : {last.get('epoch', 0)}")
+                    print(f"[playground] Stage          : {last.get('stage', 'N/A')}")
                     print(f"[playground] Loss           : {last.get('loss', 0.0):.6f}")
                     print(f"[playground] Perplexity     : {last.get('perplexity', 0.0):.4f}")
                     print(f"[playground] Accuracy       : {last.get('accuracy', 0.0):.4f}")
-                    print("-" * 60)
+                    print("-" * 70)
                     
-                    # Reload router setelah training
-                    self._setup_router()
+                    # Reload retriever setelah training
+                    self._setup_retriever()
                 else:
                     print("[playground] Training tidak menghasilkan history.")
-                    print("[playground] Pastikan folder datasets/ berisi data.")
+                    print("[playground] Pastikan QA dataset ada di output_models/qa_dataset.json")
+                    print("[playground] Jalankan: python scripts/convert_dataset.py")
 
             except Exception as exc:
                 print(f"[playground] Training gagal: {exc}")
+                import traceback
+                traceback.print_exc()
 
         else:
+            # MODE STEP
             if steps is None:
                 steps = self.DEFAULT_INLINE_TRAINING_STEPS
 
             print(f"[playground] Training mode STEP: {steps} step")
-            print("-" * 60)
+            print("-" * 70)
 
             try:
                 if hasattr(self.trainer, "train_steps"):
@@ -917,7 +871,7 @@ class Playground:
 
                 if history:
                     report = history[-1]
-                    print("-" * 60)
+                    print("-" * 70)
                     print("[playground] Training step selesai.")
                     print(f"[playground] Steps          : {report.get('steps', 0)}")
                     print(f"[playground] Loss           : {report.get('loss', 0.0):.6f}")
@@ -926,10 +880,12 @@ class Playground:
                     epochs_trav = report.get("epochs_traversed", 0)
                     if epochs_trav:
                         print(f"[playground] Epochs traversed : {epochs_trav}")
-                    print("-" * 60)
+                    print("-" * 70)
+                    
+                    # Reload retriever setelah training
+                    self._setup_retriever()
                 else:
                     print("[playground] Training tidak menghasilkan update.")
-                    print("[playground] Pastikan folder datasets/ berisi data.")
 
             except Exception as exc:
                 print(f"[playground] Training gagal: {exc}")
@@ -971,30 +927,22 @@ class Playground:
 
     def _print_status(self) -> None:
         """Tampilkan status model."""
-        print("=" * 60)
-        print("Status Model")
-        print("=" * 60)
+        print("=" * 70)
+        print("Status Model (RAG)")
+        print("=" * 70)
 
         print(f"  Parameter count : {self.model.parameter_count():,}")
         print(f"  Vocab size      : {self.tokenizer.vocab_size}")
         print(f"  Max context     : {self.max_context}")
         print(f"  Trainer         : {'Tersedia' if self.trainer is not None else 'Tidak tersedia'}")
-        print(f"  Use MoE         : {self._use_moe}")
-        print(f"  Auto-routing    : {self._auto_routing}")
-        print(f"  Domain default  : {f'[{self._default_domain}]' if self._default_domain else 'Tidak diset'}")
-        print(f"  Force domain    : {f'[{self._force_domain}]' if self._force_domain else 'Tidak diset'}")
-        print(f"  Router          : {'Tersedia' if self._router is not None else 'Tidak tersedia'}")
+        print(f"  Retriever       : {'Tersedia' if self._retriever is not None else 'Tidak tersedia'}")
+        print(f"  Context enabled : {self._context_enabled}")
         
-        # LM heads info
-        if hasattr(self.model, "list_domains"):
-            try:
-                domains = self.model.list_domains()
-                print(f"  LM heads        : {len(domains)} domain")
-                for domain in domains:
-                    active_marker = " ← aktif" if self._force_domain == domain else ""
-                    print(f"    [{domain}]{active_marker}")
-            except Exception:
-                pass
+        if self._retriever is not None:
+            stats = self._retriever.get_corpus_stats()
+            print(f"  Corpus docs     : {stats.get('total_docs', 0)}")
+            print(f"  Corpus terms    : {stats.get('total_terms', 0)}")
+            print(f"  Avg doc length  : {stats.get('avg_doc_length', 0):.1f} tokens")
 
         if self.trainer is not None and hasattr(self.trainer, "weight_manager"):
             wm = self.trainer.weight_manager
@@ -1003,7 +951,16 @@ class Playground:
             print(f"  Last epoch      : {getattr(wm, 'last_epoch', 0)}")
             print(f"  Learning rate   : {wm.learning_rate:.2e}")
 
-        print("=" * 60)
+        # QA samples info
+        if self.trainer is not None and hasattr(self.trainer, "qa_samples"):
+            print(f"  QA samples      : {len(self.trainer.qa_samples)}")
+
+        # Retrieval stats
+        print(f"\n  Retrieval statistics (sesi ini):")
+        for key, value in self._retrieval_stats.items():
+            print(f"    {key}: {value}")
+
+        print("=" * 70)
 
     # ========================================================================
     # HELP
@@ -1011,55 +968,53 @@ class Playground:
 
     def _print_help(self) -> None:
         """Tampilkan bantuan perintah interactive."""
-        print("=" * 60)
-        print("Bantuan Playground")
-        print("=" * 60)
+        print("=" * 70)
+        print("Bantuan RAG Playground")
+        print("=" * 70)
         print()
-        print("Ketik prompt apa saja untuk inference.")
-        print("Contoh: apa itu mobil")
-        print("        [SAINS] jelaskan fotosintesis")
+        print("Ketik prompt apa saja untuk inference dengan RAG.")
+        print("Sistem akan otomatis mencari konteks relevan dari corpus,")
+        print("lalu generate jawaban berdasarkan konteks tersebut.")
+        print()
+        print("Contoh:")
+        print("  apa itu mobil")
+        print("  jelaskan tentang fotosintesis")
+        print("  bagaimana cara kerja rem?")
         print()
         print("Perintah (slash commands):")
         print()
         print("  /help                  : tampilkan bantuan ini")
         print()
-        print("  MoE Commands:")
-        print("  /domains               : list semua domain yang tersedia")
-        print("  /auto                  : tampilkan status auto-routing")
-        print("  /auto on               : aktifkan auto-routing")
-        print("  /auto off              : nonaktifkan auto-routing")
-        print("  /force MOBIL           : force domain ke MOBIL (bypass router)")
-        print("  /force                 : hapus force domain")
-        print()
-        print("  Domain Commands (manual):")
-        print("  /domain MOBIL          : set domain default ke MOBIL")
-        print("  /domain SAINS          : set domain default ke SAINS")
-        print("  /domain                : hapus domain default")
+        print("  RAG Commands:")
+        print("  /retrieve              : test retrieval dengan query interaktif")
+        print("  /retrieve [query]      : test retrieval dengan query spesifik")
+        print("  /context               : tampilkan status context injection")
+        print("  /context on            : aktifkan retrieval (default)")
+        print("  /context off           : nonaktifkan retrieval (no-context mode)")
         print()
         print("  Training Commands:")
         print("  /training              : latih model (step default)")
         print("  /training 100          : latih model 100 step")
         print("  /training --steps 100  : latih model 100 step")
         print("  /training --epochs 10  : latih model 10 epoch")
-        print("  /training --epochs 10 --steps 50")
-        print("                         : latih 10 epoch, minimal 50 step")
         print()
         print("  Lainnya:")
-        print("  /status                : tampilkan status model")
+        print("  /status                : tampilkan status model & retriever")
         print("  /exit                  : keluar dari playground")
         print("  /quit                  : keluar dari playground")
-        print("  /keluar                : keluar dari playground")
         print()
-        print("TIPS MoE INFERENCE:")
-        print("  1. Pastikan training sudah dilakukan (router auto-built)")
-        print("  2. Auto-routing aktif by default (/auto on)")
-        print("  3. Ketik prompt biasa: 'fotosintesis adalah'")
-        print("  4. Router otomatis pilih LM head SAINS")
-        print("  5. Gunakan /domains untuk lihat domain yang tersedia")
-        print("  6. Gunakan /force MOBIL untuk test domain spesifik")
+        print("TIPS RAG INFERENCE:")
+        print("  1. Pastikan training sudah dilakukan (retriever auto-built)")
+        print("  2. Context injection aktif by default")
+        print("  3. Gunakan /retrieve untuk inspect hasil retrieval")
+        print("  4. Gunakan /context off untuk test model tanpa konteks")
+        print("  5. Loss rendah + retrieval akurat = jawaban presisi")
+        print()
+        print("FLOW INFERENCE:")
+        print("  Query → BM25 Retrieval → Context → Model → Jawaban")
         print()
         print("Semua input tanpa prefix / dianggap sebagai prompt inference.")
-        print("=" * 60)
+        print("=" * 70)
 
     # ========================================================================
     # INTERNAL HELPERS
@@ -1271,6 +1226,7 @@ if __name__ == "__main__":
         PathsConfig,
         SpecialTokensConfig,
         TrainingConfig,
+        RetrievalConfig,
     )
     from core.tokenizer import Tokenizer
     from core.architecture import CustomTransformerLM
@@ -1285,13 +1241,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompt",
         type=str,
-        default="mobil adalah",
+        default="apa itu mobil",
         help="Prompt untuk mode non-interaktif.",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=32,
+        default=64,
         help="Jumlah token maksimum yang dihasilkan.",
     )
     parser.add_argument(
@@ -1323,6 +1279,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Tampilkan Token IDs dan Token Pieces secara detail.",
     )
+    parser.add_argument(
+        "--no-debug-retrieval",
+        action="store_true",
+        help="Jangan tampilkan info retrieval.",
+    )
 
     args = parser.parse_args()
 
@@ -1335,16 +1296,15 @@ if __name__ == "__main__":
         datasets_dir.mkdir(parents=True, exist_ok=True)
         output_models_dir.mkdir(parents=True, exist_ok=True)
 
+        # Sample corpus
         sample_file = datasets_dir / "sample.txt"
         sample_file.write_text(
-            "\n".join(
-                [
-                    "[MOBIL] Mobil adalah kendaraan beroda empat.",
-                    "[MOBIL] Mobil menggunakan mesin sebagai penggerak.",
-                    "[SAINS] Air adalah senyawa H2O.",
-                    "[SAINS] Fotosintesis menghasilkan oksigen.",
-                ]
-            ),
+            "Mobil adalah kendaraan beroda empat yang menggunakan mesin sebagai penggerak utama.\n\n"
+            "Rem mobil berfungsi untuk mengurangi kecepatan dan menghentikan kendaraan.\n\n"
+            "Bahan bakar mobil bisa berupa bensin atau diesel.\n\n"
+            "Air adalah senyawa kimia dengan rumus H2O yang penting bagi kehidupan.\n\n"
+            "Fotosintesis adalah proses pembuatan makanan oleh tumbuhan menggunakan cahaya matahari.\n\n"
+            "Fotosintesis menghasilkan oksigen dan glukosa sebagai produk.",
             encoding="utf-8",
         )
 
@@ -1354,6 +1314,8 @@ if __name__ == "__main__":
             vocab_path=tmp_path / "vocab.json",
             final_model_path=output_models_dir / "otak_model.safetensors",
             checkpoint_path=output_models_dir / "training_checkpoint.npz",
+            retrieval_index_path=output_models_dir / "retrieval_index.json",
+            qa_dataset_path=output_models_dir / "qa_dataset.json",
         )
 
         small_config = Config(
@@ -1363,11 +1325,14 @@ if __name__ == "__main__":
                 learning_rate=3e-4,
                 batch_size=2,
                 epochs=1,
-                sequence_length=16,
+                sequence_length=32,
                 dropout_rate=0.0,
                 weight_decay=0.01,
                 grad_clip_norm=1.0,
                 seed=1337,
+                context_dropout_rate=0.2,
+                context_perturbation_rate=0.3,
+                progressive_stages=2,
             ),
             model=ModelConfig(
                 vocab_size=128,
@@ -1379,7 +1344,17 @@ if __name__ == "__main__":
                 ffn_hidden_dim=64,
                 train_dtype="float32",
                 export_dtype="float32",
-                use_moe=True,
+                use_rope=True,
+                use_weight_tying=True,
+                attention_logit_cap=30.0,
+                final_logit_cap=50.0,
+                drop_path_rate=0.1,
+            ),
+            retrieval=RetrievalConfig(
+                top_k=2,
+                bm25_k1=1.5,
+                bm25_b=0.75,
+                max_paragraph_length=500,
             ),
         )
 
@@ -1402,6 +1377,7 @@ if __name__ == "__main__":
                 top_k=args.top_k,
                 top_p=args.top_p,
                 debug_tokens=args.debug_tokens,
+                debug_retrieval=not args.no_debug_retrieval,
             )
         else:
             playground.test_prompt(
@@ -1411,6 +1387,7 @@ if __name__ == "__main__":
                 top_k=args.top_k,
                 top_p=args.top_p,
                 debug_tokens=args.debug_tokens,
+                debug_retrieval=not args.no_debug_retrieval,
             )
 
-        print("testing/playground.py test OK")
+        print("\ntesting/playground.py (RAG) test OK")

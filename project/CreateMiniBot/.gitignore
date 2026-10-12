@@ -1,0 +1,12 @@
+# Folder
+__pycache__/
+venv/
+node_modules/
+output_models/
+
+# File
+*.pyc
+*.npz
+*.pth
+*.pt
+.env

@@ -1,45 +1,49 @@
 #!/usr/bin/env python3
 # main.py
 #
-# Entry point utama dan orkestrator pipeline.
+# Entry point utama dan orkestrator pipeline untuk RAG Architecture.
+#
+# Arsitektur: Single-Head + BM25 Retrieval
+# - Context-conditioned training
+# - Loss ↓ = Presisi ↑ (korelasi langsung, no topic mixing)
+# - Retrieval-based context injection saat inference
 #
 # Mode operasi:
 # 1. MODE PIPELINE (default):
-#    Tokenizer -> Training -> Eval -> Test -> Export
+#    Tokenizer → Convert Dataset → Training → Eval → Test → Export
 #
 # 2. MODE INTERACTIVE (--interactive):
-#    Tokenizer -> Load Model -> Playground
+#    Tokenizer → Load Model → Playground (dengan RAG inference)
 #    Training dilakukan via perintah 'training' di playground.
 #
 # Flag penting:
-# --resume        : muat checkpoint dan lanjutkan dari epoch terakhir
-# --interactive   : langsung masuk playground, training via perintah di dalam
-# --skip-training : lewati training (mode pipeline)
-# --skip-eval     : lewati evaluasi
-# --skip-test     : lewati test prompt
-# --skip-export   : lewati export model
-# --debug-tokens  : tampilkan Token IDs dan Token Pieces saat inference
-#
-# BUG FIX:
-# - sync_model_domains() dipanggil setelah resume untuk memastikan
-#   semua LM heads (domain-specific) ada di model, tidak hanya GENERAL
-# - Sampling parameters dari CLI (temperature, top_k, dll) benar-benar
-#   dipass ke playground.interactive()
+# --resume           : muat checkpoint dan lanjutkan dari epoch terakhir
+# --interactive      : langsung masuk playground, training via perintah di dalam
+# --skip-training    : lewati training (mode pipeline)
+# --skip-eval        : lewati evaluasi
+# --skip-test        : lewati test prompt
+# --skip-export      : lewati export model
+# --skip-convert     : lewati konversi dataset (jika qa_dataset.json sudah ada)
+# --debug-tokens     : tampilkan Token IDs dan Token Pieces saat inference
 #
 # Keterhubungan:
 # - config.py              : konfigurasi global
-# - core/tokenizer.py      : tokenizer BPE
-# - core/architecture.py   : model transformer
-# - core/model_exporter.py : export ke safetensors
-# - pipeline/trainer.py    : training loop (dengan sync_model_domains)
+# - core/tokenizer.py      : tokenizer BPE dengan RAG templates
+# - core/architecture.py   : model transformer (single LM head)
+# - core/retriever.py      : BM25 retrieval engine
+# - core/model_exporter.py : export ke safetensors + RAG assets
+# - pipeline/trainer.py    : context-conditioned training
 # - pipeline/evaluator.py  : evaluasi model
 # - pipeline/weight_manager.py : load/save checkpoint
-# - testing/playground.py  : inference testing
+# - scripts/convert_dataset.py : konversi dataset ke QA format
+# - testing/playground.py  : RAG inference testing
 
 from __future__ import annotations
 
 import argparse
 import copy
+import json
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -49,6 +53,7 @@ from config import (
     Config,
     ModelConfig,
     PathsConfig,
+    RetrievalConfig,
     SpecialTokensConfig,
     TrainingConfig,
 )
@@ -76,13 +81,16 @@ def print_section(title: str) -> None:
 
 
 def print_config_summary(config: Config) -> None:
-    print_section("KONFIGURASI PIPELINE")
+    """Print summary dari config, termasuk RAG parameters."""
+    print_section("KONFIGURASI PIPELINE (RAG Architecture)")
 
-    print(f"Datasets dir       : {config.paths.datasets_dir}")
-    print(f"Output models dir  : {config.paths.output_models_dir}")
-    print(f"Vocab path         : {config.paths.vocab_path}")
-    print(f"Final model path   : {config.paths.final_model_path}")
-    print(f"Checkpoint path    : {config.paths.checkpoint_path}")
+    print(f"Datasets dir         : {config.paths.datasets_dir}")
+    print(f"Output models dir    : {config.paths.output_models_dir}")
+    print(f"Vocab path           : {config.paths.vocab_path}")
+    print(f"Final model path     : {config.paths.final_model_path}")
+    print(f"Checkpoint path      : {config.paths.checkpoint_path}")
+    print(f"QA dataset path      : {config.paths.qa_dataset_path}")
+    print(f"Retrieval index path : {config.paths.retrieval_index_path}")
 
     print()
     print("Model:")
@@ -94,7 +102,8 @@ def print_config_summary(config: Config) -> None:
     print(f"  max_position_embeddings : {config.model.max_position_embeddings}")
     print(f"  train_dtype             : {config.model.train_dtype}")
     print(f"  export_dtype            : {config.model.export_dtype}")
-    print(f"  use_moe                 : {getattr(config.model, 'use_moe', False)}")
+    print(f"  use_rope                : {config.model.use_rope}")
+    print(f"  use_weight_tying        : {config.model.use_weight_tying}")
 
     print()
     print("Training:")
@@ -106,12 +115,120 @@ def print_config_summary(config: Config) -> None:
     print(f"  weight_decay                 : {config.training.weight_decay}")
     print(f"  grad_clip_norm               : {config.training.grad_clip_norm}")
     print(f"  lr_warmup_steps              : {config.training.lr_warmup_steps}")
-    print(f"  lr_decay_steps               : {config.training.lr_decay_steps}")
-    print(f"  lr_decay_factor              : {config.training.lr_decay_factor}")
-    print(f"  lr_min                       : {config.training.lr_min}")
-    print(f"  gradient_accumulation_steps  : {config.training.gradient_accumulation_steps}")
     print(f"  early_stopping_patience      : {config.training.early_stopping_patience}")
     print(f"  inline_training_steps        : {config.training.inline_training_steps}")
+
+    print()
+    print("RAG Training:")
+    print(f"  context_dropout_rate         : {config.training.context_dropout_rate:.1%}")
+    print(f"  context_perturbation_rate    : {config.training.context_perturbation_rate:.1%}")
+    print(f"  progressive_stages           : {config.training.progressive_stages}")
+    print(f"  max_context_paragraphs       : {config.training.max_context_paragraphs}")
+    print(f"  augmentation_factor          : {config.training.augmentation_factor}")
+
+    print()
+    print("Retrieval (BM25):")
+    print(f"  top_k                        : {config.retrieval.top_k}")
+    print(f"  bm25_k1                      : {config.retrieval.bm25_k1}")
+    print(f"  bm25_b                       : {config.retrieval.bm25_b}")
+    print(f"  dynamic_threshold_ratio      : {config.retrieval.dynamic_threshold_ratio}")
+    print(f"  query_expansion_count        : {config.retrieval.query_expansion_count}")
+    print(f"  max_paragraph_length         : {config.retrieval.max_paragraph_length}")
+
+
+# ============================================================================
+# DATASET CONVERSION HELPER
+# ============================================================================
+
+def convert_dataset(
+    config: Config,
+    augmentation_factor: Optional[int] = None,
+    preview: int = 0,
+    verbose: bool = True,
+) -> bool:
+    """
+    Jalankan script konversi dataset mentah ke format QA.
+
+    Memanggil scripts/convert_dataset.py sebagai subprocess.
+
+    Args:
+        config: Config object
+        augmentation_factor: override augmentation factor (default dari config)
+        preview: jumlah samples untuk preview (0 = no preview)
+        verbose: print progress
+
+    Returns:
+        True jika sukses, False jika gagal
+    """
+    script_path = Path(__file__).resolve().parent / "scripts" / "convert_dataset.py"
+
+    if not script_path.exists():
+        if verbose:
+            print(f"[main] ⚠️ Script konversi tidak ditemukan: {script_path}")
+            print(f"[main]    Buat script atau konversi manual ke format QA.")
+        return False
+
+    # Build command
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--datasets-dir", str(config.paths.datasets_dir),
+        "--output", str(config.paths.qa_dataset_path),
+    ]
+
+    if augmentation_factor is not None:
+        cmd.extend(["--augmentation-factor", str(augmentation_factor)])
+    else:
+        cmd.extend(["--augmentation-factor", str(config.training.augmentation_factor)])
+
+    if preview > 0:
+        cmd.extend(["--preview", str(preview)])
+
+    if verbose:
+        print(f"[main] Menjalankan konversi dataset...")
+        print(f"[main] Command: {' '.join(cmd)}")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=not verbose,
+            text=True,
+            check=True,
+        )
+        
+        if verbose and result.stdout:
+            print(result.stdout)
+        
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        
+        # Verifikasi output
+        qa_path = Path(config.paths.qa_dataset_path)
+        if qa_path.exists():
+            with open(qa_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            n_samples = len(data.get("samples", []))
+            if verbose:
+                print(f"[main] ✅ Konversi sukses: {n_samples} QA samples")
+            return True
+        else:
+            if verbose:
+                print(f"[main] ❌ File output tidak dibuat: {qa_path}")
+            return False
+    
+    except subprocess.CalledProcessError as exc:
+        if verbose:
+            print(f"[main] ❌ Konversi dataset gagal: {exc}")
+            if exc.stdout:
+                print(exc.stdout)
+            if exc.stderr:
+                print(exc.stderr, file=sys.stderr)
+        return False
+    
+    except Exception as exc:
+        if verbose:
+            print(f"[main] ❌ Error saat konversi dataset: {exc}")
+        return False
 
 
 # ============================================================================
@@ -125,7 +242,12 @@ def limited_batches(trainer: Trainer, limit: int | None):
     if limit is not None and limit <= 0:
         limit = None
 
-    for i, batch in enumerate(trainer.iter_batches(shuffle=False)):
+    # Load QA dataset jika belum
+    if not trainer.qa_samples:
+        trainer.load_qa_dataset(verbose=False)
+
+    # iter_batches butuh epoch dan total_epochs
+    for i, batch in enumerate(trainer.iter_batches(epoch=0, total_epochs=1, shuffle=False)):
         if limit is not None and i >= limit:
             break
         yield batch
@@ -167,8 +289,11 @@ def export_model(
 ) -> None:
     """
     Menentukan apakah model layak di-export, lalu menjalankannya.
+
+    Untuk RAG: export akan copy retrieval_index.json + otak_engine.py
+    sebagai file terpisah di output folder.
     """
-    print_section("EXPORT MODEL")
+    print_section("EXPORT MODEL (RAG)")
 
     should_export = True
     reason = "Export dijalankan."
@@ -211,56 +336,30 @@ def export_model(
         output_path=args.export_path,
         export_dtype=args.export_dtype,
         include_vocab=True,
-        include_moe_assets=True,
+        include_rag_assets=True,  # Copy retrieval index + engine
+        verbose=True,
     )
 
     file_size = Path(output_path).stat().st_size
 
-    print(f"[main] {reason}")
+    print()
+    print(f"[main] ✅ {reason}")
     print(f"[main] Model berhasil di-export ke:")
     print(f"       {output_path}")
-    print(f"[main] Ukuran file: {file_size:,} bytes")
+    print(f"[main] Ukuran file: {file_size:,} bytes ({file_size / 1024 / 1024:.2f} MB)")
 
-
-# ============================================================================
-# SYNC MODEL DOMAINS HELPER (BARU)
-# ============================================================================
-
-def sync_and_save_domains(
-    trainer: Trainer,
-    weight_manager: WeightManager,
-    verbose: bool = True,
-) -> int:
-    """
-    Sync LM heads dengan dataset, lalu save checkpoint.
-    
-    FIX KRITIS: Memastikan semua domain punya LM head setelah resume.
-    
-    Return:
-    - int: jumlah domain baru yang di-init (0 jika sudah lengkap)
-    """
-    if not hasattr(trainer, 'sync_model_domains'):
-        if verbose:
-            print("[main] ⚠️ Trainer tidak punya sync_model_domains(). Skip.")
-        return 0
-    
-    if verbose:
-        print("[main] Syncing model domains dengan dataset...")
-    
-    new_domains = trainer.sync_model_domains(verbose=verbose)
-    
-    if new_domains > 0:
-        # Save ulang checkpoint dengan semua LM heads
-        if verbose:
-            print(f"[main] Saving checkpoint dengan {new_domains} LM heads baru...")
-        ckpt_path = weight_manager.save_checkpoint()
-        if verbose:
-            print(f"[main] ✅ Checkpoint updated: {ckpt_path}")
-    else:
-        if verbose:
-            print("[main] ✅ Semua LM heads sudah lengkap, tidak perlu update checkpoint.")
-    
-    return new_domains
+    # Inspect hasil export
+    info = exporter.inspect(output_path)
+    print()
+    print(f"[main] Model info:")
+    print(f"  Architecture   : {info['architecture']}")
+    print(f"  Tensor count   : {info['tensor_count']}")
+    print(f"  Has tokenizer  : {info['has_tokenizer']}")
+    print(f"  Has index      : {info['has_retrieval_index']}")
+    if info['retrieval_index_stats']:
+        stats = info['retrieval_index_stats']
+        print(f"    - Docs       : {stats.get('total_docs', 0)}")
+        print(f"    - Terms      : {stats.get('total_terms', 0)}")
 
 
 # ============================================================================
@@ -269,14 +368,14 @@ def sync_and_save_domains(
 
 def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     """
-    Menjalankan pipeline.
+    Menjalankan pipeline RAG.
 
     MODE INTERACTIVE (--interactive):
-        Tokenizer -> Load Model -> Sync Domains -> Playground
+        Tokenizer → Load Model → Playground (dengan RAG inference)
         Training dilakukan via perintah 'training' di playground.
 
     MODE PIPELINE (default):
-        Tokenizer -> Training -> Eval -> Test -> Export
+        Tokenizer → Convert Dataset → Training → Eval → Test → Export
     """
     config.ensure_dirs()
     print_config_summary(config)
@@ -298,14 +397,42 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
         print(f"[main] Vocab size: {tokenizer.vocab_size}")
 
     # --------------------------------------------------------------------
+    # 1.5 DATASET CONVERSION (opsional)
+    # --------------------------------------------------------------------
+    if not args.skip_convert and not args.interactive:
+        print_section("TAHAP 1.5: DATASET CONVERSION")
+
+        qa_path = Path(config.paths.qa_dataset_path)
+
+        if qa_path.exists() and not args.force_convert:
+            print(f"[main] QA dataset sudah ada: {qa_path}")
+            print(f"[main] Lewati konversi. Gunakan --force-convert untuk rebuild.")
+            
+            # Load untuk validasi
+            try:
+                with open(qa_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                n_samples = len(data.get("samples", []))
+                print(f"[main] ✅ Loaded {n_samples} existing QA samples")
+            except Exception as exc:
+                print(f"[main] ⚠️ Gagal load existing dataset: {exc}")
+                print(f"[main] Akan coba generate baru...")
+                convert_dataset(config, verbose=True)
+        else:
+            convert_dataset(config, preview=3, verbose=True)
+
+    # --------------------------------------------------------------------
     # 2. MODEL
     # --------------------------------------------------------------------
-    print_section("TAHAP 2: ARSITEKTUR MODEL")
+    print_section("TAHAP 2: ARSITEKTUR MODEL (RAG Single-Head)")
 
     model = CustomTransformerLM(config)
 
     print(f"[main] Model dibuat.")
     print(f"[main] Parameter count: {model.parameter_count():,}")
+    print(f"[main] Architecture   : Single LM head (no domain contamination)")
+    print(f"[main] Weight tying   : {model.use_weight_tying}")
+    print(f"[main] RoPE           : {model.use_rope}")
 
     # --------------------------------------------------------------------
     # 3. EVALUATOR & WEIGHT MANAGER
@@ -368,45 +495,35 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     if args.interactive:
         # ----------------------------------------------------------------
         # MODE INTERACTIVE
-        # Langsung masuk playground.
+        # Langsung masuk playground dengan RAG inference.
         # Training dilakukan via perintah 'training' di playground.
         # ----------------------------------------------------------------
-        print_section("PLAYGROUND INTERACTIVE")
+        print_section("PLAYGROUND INTERACTIVE (RAG)")
 
         if resumed:
             print(f"[main] Model dimuat dari checkpoint (epoch {start_epoch}, step {global_step}).")
-            
-            # ============================================================
-            # FIX KRITIS: Sync LM heads dengan dataset
-            # ============================================================
-            # Pastikan semua domain punya LM head (tidak hanya GENERAL)
-            sync_and_save_domains(
-                trainer=trainer,
-                weight_manager=weight_manager,
-                verbose=True,
-            )
-            
-            print("[main] Gunakan perintah '/training' untuk melatih lebih lanjut.")
         else:
             print("[main] Model baru dibuat (belum dilatih).")
-            
-            # Init domains untuk model baru juga
-            use_moe = bool(getattr(config.model, 'use_moe', False))
-            if use_moe:
-                print("[main] Menginisialisasi domain LM heads...")
-                sync_and_save_domains(
-                    trainer=trainer,
-                    weight_manager=weight_manager,
-                    verbose=True,
-                )
-            
-            print("[main] Gunakan perintah '/training' untuk melatih.")
+
+        # Load QA dataset untuk trainer (untuk inline training)
+        qa_path = Path(config.paths.qa_dataset_path)
+        if qa_path.exists():
+            n_loaded = trainer.load_qa_dataset(verbose=True)
+            if n_loaded > 0:
+                print(f"[main] ✅ {n_loaded} QA samples siap untuk inline training.")
+            else:
+                print(f"[main] ⚠️ QA dataset kosong. Jalankan konversi dulu atau training via pipeline.")
+        else:
+            print(f"[main] ⚠️ QA dataset belum ada: {qa_path}")
+            print(f"[main]    Jalankan: python scripts/convert_dataset.py")
+            print(f"[main]    Atau jalankan tanpa --interactive untuk pipeline lengkap.")
 
         print()
+        print("[main] Gunakan perintah '/training' untuk melatih lebih lanjut.")
+        print("[main] Gunakan '/retrieve' untuk test retrieval.")
+        print("[main] Ketik prompt biasa untuk RAG inference.")
 
-        # ============================================================
-        # BUG FIX: Pass sampling parameters dari CLI ke playground
-        # ============================================================
+        # Buat playground
         playground = Playground(
             model=model,
             tokenizer=tokenizer,
@@ -422,6 +539,7 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
             repetition_penalty=args.repetition_penalty,
             min_new_tokens=args.min_new_tokens,
             debug_tokens=args.debug_tokens,
+            debug_retrieval=not args.no_debug_retrieval,
         )
 
         # Setelah keluar dari playground, export jika diminta
@@ -443,16 +561,16 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
 
         # TRAINING
         if not args.skip_training:
-            print_section("TRAINING")
-            
-            # Untuk MoE, sync domains dulu sebelum training (jika belum)
-            use_moe = bool(getattr(config.model, 'use_moe', False))
-            if use_moe and not resumed:
-                sync_and_save_domains(
-                    trainer=trainer,
-                    weight_manager=weight_manager,
-                    verbose=True,
-                )
+            print_section("TRAINING (RAG Context-Conditioned)")
+
+            # Pastikan QA dataset ada
+            if not trainer.qa_samples:
+                n_loaded = trainer.load_qa_dataset(verbose=True)
+                if n_loaded == 0:
+                    print("[main] ❌ QA dataset tidak ditemukan.")
+                    print("[main]    Jalankan dengan --skip-training=false tanpa --skip-convert")
+                    print("[main]    Atau: python scripts/convert_dataset.py")
+                    return
 
             history = trainer.run_epochs(
                 max_steps=args.max_steps,
@@ -466,14 +584,15 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
                 report = history[-1]
 
                 print()
-                print("[main] Training selesai.")
+                print("[main] ✅ Training selesai.")
                 print(f"[main] Epoch terakhir : {report.get('epoch')}")
+                print(f"[main] Stage          : {report.get('stage', 'N/A')}")
                 print(f"[main] Loss           : {report.get('loss'):.6f}")
                 print(f"[main] Perplexity     : {report.get('perplexity'):.4f}")
                 print(f"[main] Accuracy       : {report.get('accuracy'):.4f}")
                 print(f"[main] Valid tokens   : {report.get('num_valid_tokens')}")
             else:
-                print("[main] Training tidak menghasilkan history.")
+                print("[main] ⚠️ Training tidak menghasilkan history.")
         else:
             print_section("TRAINING")
             print("[main] Training dilewati karena --skip-training.")
@@ -500,14 +619,14 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
                 print(f"[main] Eval batches    : {eval_report['num_batches']}")
             else:
                 print("[main] Audit evaluasi tidak menghasilkan token valid.")
-                print("[main] Pastikan folder datasets/ berisi data teks.")
+                print("[main] Pastikan QA dataset sudah di-generate.")
         else:
             print_section("EVALUATOR AUDIT")
             print("[main] Evaluasi dilewati karena --skip-eval.")
 
-        # PLAYGROUND TEST (non-interactive)
+        # PLAYGROUND TEST (non-interactive dengan RAG)
         if not args.skip_test:
-            print_section("PLAYGROUND TEST")
+            print_section("PLAYGROUND TEST (RAG Inference)")
 
             playground = Playground(
                 model=model,
@@ -526,6 +645,7 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
                 min_new_tokens=args.min_new_tokens,
                 verbose=True,
                 debug_tokens=args.debug_tokens,
+                debug_retrieval=not args.no_debug_retrieval,
             )
         else:
             print_section("PLAYGROUND TEST")
@@ -555,8 +675,14 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
 def run_demo(args: argparse.Namespace) -> None:
     """
     Menjalankan pipeline demo kecil memakai folder sementara.
+
+    Demo ini menunjukkan flow RAG:
+    - Corpus mentah (tanpa prefix domain)
+    - Auto konversi ke QA format
+    - Training dengan context conditioning
+    - Inference dengan BM25 retrieval
     """
-    print_section("MODE DEMO")
+    print_section("MODE DEMO (RAG)")
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -567,23 +693,33 @@ def run_demo(args: argparse.Namespace) -> None:
         datasets_dir.mkdir(parents=True, exist_ok=True)
         output_models_dir.mkdir(parents=True, exist_ok=True)
 
-        # Dataset demo dengan multi-domain
+        # Dataset demo (tanpa domain prefix - RAG style)
         mobil_file = datasets_dir / "mobil.txt"
         mobil_file.write_text(
-            "[MOBIL] Mobil adalah kendaraan beroda empat.\n\n"
-            "[MOBIL] Mobil menggunakan mesin sebagai penggerak utama.\n\n"
-            "[MOBIL] Rem mobil berfungsi untuk menghentikan kendaraan.\n\n"
-            "[MOBIL] Bahan bakar mobil bisa berupa bensin atau diesel.\n\n"
-            "[MOBIL] Transmisi mobil mengatur perpindahan gigi.",
+            "Mobil adalah kendaraan beroda empat yang menggunakan mesin sebagai penggerak utama.\n\n"
+            "Rem mobil berfungsi untuk mengurangi kecepatan dan menghentikan kendaraan dengan aman.\n\n"
+            "Bahan bakar mobil bisa berupa bensin, diesel, atau listrik untuk kendaraan elektrik.\n\n"
+            "Transmisi mobil mengatur perpindahan gigi untuk efisiensi tenaga mesin.\n\n"
+            "Sistem kemudi mobil menggunakan setir yang terhubung ke roda depan.",
             encoding="utf-8",
         )
 
         sains_file = datasets_dir / "sains.txt"
         sains_file.write_text(
-            "[SAINS] Air adalah senyawa kimia dengan rumus H2O.\n\n"
-            "[SAINS] Fotosintesis menghasilkan oksigen dari CO2.\n\n"
-            "[SAINS] Matahari adalah bintang terdekat dengan Bumi.\n\n"
-            "[SAINS] Atom terdiri dari proton, neutron, dan elektron.",
+            "Air adalah senyawa kimia dengan rumus H2O yang penting bagi kehidupan.\n\n"
+            "Fotosintesis adalah proses pembuatan makanan oleh tumbuhan menggunakan cahaya matahari.\n\n"
+            "Matahari adalah bintang terdekat dengan Bumi yang menjadi sumber energi utama.\n\n"
+            "Atom terdiri dari proton, neutron, dan elektron yang membentuk struktur materi.\n\n"
+            "Gravitasi adalah gaya tarik menarik antara dua benda yang memiliki massa.",
+            encoding="utf-8",
+        )
+
+        biologi_file = datasets_dir / "biologi.txt"
+        biologi_file.write_text(
+            "Sel adalah unit terkecil dari makhluk hidup yang memiliki fungsi spesifik.\n\n"
+            "DNA adalah materi genetik yang menyimpan informasi keturunan dalam sel.\n\n"
+            "Metamorfosis adalah proses perubahan bentuk tubuh hewan dari tahap muda ke dewasa.\n\n"
+            "Ekosistem adalah hubungan timbal balik antara makhluk hidup dengan lingkungannya.",
             encoding="utf-8",
         )
 
@@ -593,6 +729,8 @@ def run_demo(args: argparse.Namespace) -> None:
             vocab_path=tmp_path / "vocab.json",
             final_model_path=output_models_dir / "otak_model.safetensors",
             checkpoint_path=output_models_dir / "training_checkpoint.npz",
+            retrieval_index_path=output_models_dir / "retrieval_index.json",
+            qa_dataset_path=output_models_dir / "qa_dataset.json",
         )
 
         demo_config = Config(
@@ -601,26 +739,37 @@ def run_demo(args: argparse.Namespace) -> None:
             training=TrainingConfig(
                 learning_rate=3e-4,
                 batch_size=2,
-                epochs=1,
-                sequence_length=16,
-                dropout_rate=0.0,
+                epochs=2,
+                sequence_length=48,
+                dropout_rate=0.1,
                 weight_decay=0.01,
                 grad_clip_norm=1.0,
                 seed=1337,
-                moe_train_mode="per_domain",
-                moe_epochs_per_domain=1,
+                # RAG parameters
+                context_dropout_rate=0.2,
+                context_perturbation_rate=0.3,
+                progressive_stages=2,
+                max_context_paragraphs=2,
+                augmentation_factor=2,
             ),
             model=ModelConfig(
-                vocab_size=128,
-                embedding_dim=32,
+                vocab_size=256,
+                embedding_dim=64,
                 num_attention_heads=4,
-                num_layers=1,
-                max_position_embeddings=64,
+                num_layers=2,
+                max_position_embeddings=128,
                 layer_norm_eps=1e-5,
-                ffn_hidden_dim=64,
+                ffn_hidden_dim=128,
                 train_dtype="float32",
                 export_dtype="float32",
-                use_moe=True,
+                use_rope=True,
+                use_weight_tying=True,
+            ),
+            retrieval=RetrievalConfig(
+                top_k=2,
+                bm25_k1=1.5,
+                bm25_b=0.75,
+                max_paragraph_length=300,
             ),
         )
 
@@ -629,14 +778,16 @@ def run_demo(args: argparse.Namespace) -> None:
         demo_args.resume = False
         demo_args.export_path = None
         demo_args.interactive = False
+        demo_args.skip_convert = False
+        demo_args.force_convert = True
 
         if demo_args.max_steps is None:
-            demo_args.max_steps = 10
+            demo_args.max_steps = None  # Run full epochs
 
         if demo_args.eval_batches != 0:
             demo_args.eval_batches = 2
 
-        print("[main] Menjalankan demo pipeline dengan folder sementara:")
+        print("[main] Menjalankan demo pipeline RAG dengan folder sementara:")
         print(f"[main] {tmp_path}")
         print()
 
@@ -649,10 +800,10 @@ def run_demo(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="CreateMiniBot Pipeline",
+        prog="CreateMiniBot RAG Pipeline",
         description=(
-            "Orkestrator pipeline training: tokenizer, trainer, evaluator, "
-            "playground, dan model exporter."
+            "Orkestrator pipeline RAG (Retrieval-Augmented Generation): "
+            "tokenizer, dataset converter, trainer, evaluator, playground, dan exporter."
         ),
     )
 
@@ -672,7 +823,7 @@ def parse_args() -> argparse.Namespace:
         "--interactive",
         action="store_true",
         help=(
-            "Masuk langsung ke playground interaktif. "
+            "Masuk langsung ke playground interaktif dengan RAG inference. "
             "Training dilakukan via perintah 'training' di playground."
         ),
     )
@@ -702,6 +853,18 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--skip-convert",
+        action="store_true",
+        help="Lewati konversi dataset (asumsikan qa_dataset.json sudah ada).",
+    )
+
+    parser.add_argument(
+        "--force-convert",
+        action="store_true",
+        help="Paksa konversi dataset meskipun qa_dataset.json sudah ada.",
+    )
+
+    parser.add_argument(
         "--prompt",
         type=str,
         default="Apa itu mobil?",
@@ -712,14 +875,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=32,
+        default=128,
         help="Jumlah maksimum token baru saat testing.",
     )
 
     parser.add_argument(
         "--min-new-tokens",
         type=int,
-        default=8,
+        default=4,
         help="Jumlah minimum token sebelum EOS diperbolehkan.",
     )
 
@@ -727,7 +890,7 @@ def parse_args() -> argparse.Namespace:
         "--temperature",
         type=float,
         default=0.3,
-        help="Temperature sampling untuk playground (default: 0.3 untuk model kecil).",
+        help="Temperature sampling untuk playground (default: 0.3 untuk determinisme).",
     )
 
     parser.add_argument(
@@ -755,6 +918,12 @@ def parse_args() -> argparse.Namespace:
         "--debug-tokens",
         action="store_true",
         help="Tampilkan Token IDs dan Token Pieces secara detail saat inference.",
+    )
+
+    parser.add_argument(
+        "--no-debug-retrieval",
+        action="store_true",
+        help="Jangan tampilkan info retrieval saat inference.",
     )
 
     # ---- TRAINING CONTROL ----
