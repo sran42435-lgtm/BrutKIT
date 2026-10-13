@@ -195,15 +195,15 @@ class TrainingConfig:
     """
     
     # Learning rate
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     
-    batch_size: int = 10
-    epochs: int = 150
+    batch_size: int = 2
+    epochs: int = 50
     sequence_length: int = 64
     
     # Regularization
-    dropout_rate: float = 0.5
-    weight_decay: float = 0.3
+    dropout_rate: float = 0.2
+    weight_decay: float = 0.01
     
     # Gradient clipping
     grad_clip_norm: float = 1.0
@@ -223,7 +223,7 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 1
     
     # Early stopping
-    early_stopping_patience: int = 20
+    early_stopping_patience: int = 5
 
     # Evaluasi dan checkpoint
     eval_every_n_steps: int = 0
@@ -243,20 +243,20 @@ class TrainingConfig:
     # 0.0 = selalu dengan konteks
     # 0.2 = 20% waktu tanpa konteks (recommended)
     # Mitigasi risiko: model hallucinate tanpa konteks
-    context_dropout_rate: float = 0.3
+    context_dropout_rate: float = 0.15
     
     # Context perturbation (probabilitas shuffle kalimat dalam konteks)
     # 0.0 = konteks selalu dalam urutan asli
     # 0.3 = 30% waktu kalimat di-shuffle (recommended)
     # Mitigasi risiko: model hafal urutan kata
-    context_perturbation_rate: float = 0.4
+    context_perturbation_rate: float = 0.3
     
     # Progressive training stages (0 = disable)
     # Jika > 0, training dibagi menjadi N stages dengan difficulty meningkat
     # Stage 1: single context, simple questions
     # Stage 2: multi context, complex questions
     # Stage 3: context dropout + noise injection
-    progressive_stages: int = 3
+    progressive_stages: int = 2
     
     # Multi-context: jumlah paragraf yang digabung sebagai konteks
     # 1 = single paragraph context
@@ -285,10 +285,10 @@ class ModelConfig:
     - testing/playground.py
     """
     
-    vocab_size: int = 4096
-    embedding_dim: int = 768
-    num_attention_heads: int = 12
-    num_layers: int = 12
+    vocab_size: int = 512
+    embedding_dim: int = 96
+    num_attention_heads: int = 4
+    num_layers: int = 3
     
     # Context length maksimal
     max_position_embeddings: int = 96
@@ -297,7 +297,7 @@ class ModelConfig:
     layer_norm_eps: float = 1e-5
     
     # Dimensi Feed-Forward Network
-    ffn_hidden_dim: int = 3072
+    ffn_hidden_dim: int = 192
     
     # Presisi saat training dan export
     train_dtype: str = "float32"
