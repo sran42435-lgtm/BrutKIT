@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 # main.py
 #
-# Entry point utama dan orkestrator pipeline untuk RAG Architecture.
+# Entry point utama dan orkestrator pipeline untuk RAG Architecture + SOTA Training.
 #
-# Arsitektur: Single-Head + BM25 Retrieval
+# Arsitektur: Single-Head + BM25 Retrieval + Cross-Attention + Constrained Generation
 # - Context-conditioned training
 # - Loss ↓ = Presisi ↑ (korelasi langsung, no topic mixing)
 # - Retrieval-based context injection saat inference
 #
+# 🎯 SOTA Training Techniques:
+# - Cosine Annealing LR + Warmup
+# - Label Smoothing
+# - Focal Loss
+# - Token Importance Weighting
+# - Adaptive Gradient Clipping (AGC)
+# - Loss Spike Detection + Auto-Recovery
+# - Curriculum Learning (easy → hard)
+# - Self-Correction Loop
+# - EMA Weights (Polyak Averaging)
+#
 # Mode operasi:
 # 1. MODE PIPELINE (default):
-#    Tokenizer → Convert Dataset → Training → Eval → Test → Export
+#    Tokenizer → Load/Convert Dataset → SOTA Training → Eval → Test → Export
 #
 # 2. MODE INTERACTIVE (--interactive):
 #    Tokenizer → Load Model → Playground (dengan RAG inference)
@@ -23,19 +34,21 @@
 # --skip-eval        : lewati evaluasi
 # --skip-test        : lewati test prompt
 # --skip-export      : lewati export model
-# --skip-convert     : lewati konversi dataset (jika qa_dataset.json sudah ada)
+# --skip-convert     : lewati konversi dataset (jika dataset sudah ada)
+# --force-convert    : paksa rebuild dataset meskipun sudah ada
 # --debug-tokens     : tampilkan Token IDs dan Token Pieces saat inference
 #
 # Keterhubungan:
-# - config.py              : konfigurasi global
+# - config.py              : konfigurasi global + SOTA parameters
 # - core/tokenizer.py      : tokenizer BPE dengan RAG templates
-# - core/architecture.py   : model transformer (single LM head)
+# - core/architecture.py   : model transformer + cross-attention + constrained gen
 # - core/retriever.py      : BM25 retrieval engine
 # - core/model_exporter.py : export ke safetensors + RAG assets
-# - pipeline/trainer.py    : context-conditioned training
-# - pipeline/evaluator.py  : evaluasi model
-# - pipeline/weight_manager.py : load/save checkpoint
-# - scripts/convert_dataset.py : konversi dataset ke QA format
+# - pipeline/trainer.py    : SOTA context-conditioned training
+# - pipeline/evaluator.py  : SOTA loss computation (focal, label smoothing, etc.)
+# - pipeline/weight_manager.py : load/save checkpoint + EMA support
+# - scripts/prepare_datasets.py : prepare SQuAD + custom datasets
+# - scripts/convert_dataset.py  : convert custom dataset (fallback)
 # - testing/playground.py  : RAG inference testing
 
 from __future__ import annotations
@@ -47,6 +60,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 from config import (
     CONFIG,
@@ -81,8 +95,8 @@ def print_section(title: str) -> None:
 
 
 def print_config_summary(config: Config) -> None:
-    """Print summary dari config, termasuk RAG parameters."""
-    print_section("KONFIGURASI PIPELINE (RAG Architecture)")
+    """Print summary dari config, termasuk SOTA parameters."""
+    print_section("KONFIGURASI PIPELINE (RAG + SOTA)")
 
     print(f"Datasets dir         : {config.paths.datasets_dir}")
     print(f"Output models dir    : {config.paths.output_models_dir}")
@@ -90,11 +104,12 @@ def print_config_summary(config: Config) -> None:
     print(f"Final model path     : {config.paths.final_model_path}")
     print(f"Checkpoint path      : {config.paths.checkpoint_path}")
     print(f"QA dataset path      : {config.paths.qa_dataset_path}")
+    print(f"Merged train path    : {config.paths.merged_qa_train_path}")
     print(f"Retrieval index path : {config.paths.retrieval_index_path}")
 
     print()
     print("Model:")
-    print(f"  vocab_size              : {config.model.vocab_size}")
+    print(f"  vocab_size              : {config.model.vocab_size:,}")
     print(f"  embedding_dim           : {config.model.embedding_dim}")
     print(f"  num_attention_heads     : {config.model.num_attention_heads}")
     print(f"  num_layers              : {config.model.num_layers}")
@@ -116,7 +131,32 @@ def print_config_summary(config: Config) -> None:
     print(f"  grad_clip_norm               : {config.training.grad_clip_norm}")
     print(f"  lr_warmup_steps              : {config.training.lr_warmup_steps}")
     print(f"  early_stopping_patience      : {config.training.early_stopping_patience}")
-    print(f"  inline_training_steps        : {config.training.inline_training_steps}")
+
+    print()
+    print("🎯 SOTA Training Techniques:")
+    use_cosine = getattr(config.training, 'use_cosine_schedule', True)
+    use_focal = getattr(config.training, 'use_focal_loss', True)
+    use_agc = getattr(config.training, 'use_agc', True)
+    use_curriculum = getattr(config.training, 'use_curriculum', True)
+    use_self_corr = getattr(config.training, 'use_self_correction', True)
+    use_ema = getattr(config.training, 'use_ema', True)
+    use_token_weight = getattr(config.training, 'use_token_weighting', True)
+    use_spike_det = getattr(config.training, 'use_loss_spike_detection', True)
+    
+    label_smooth = getattr(config.training, 'label_smoothing', 0.1)
+    focal_gamma = getattr(config.training, 'focal_gamma', 2.0)
+    answer_weight = getattr(config.training, 'answer_token_weight', 3.0)
+    ema_decay = getattr(config.training, 'ema_decay', 0.999)
+    
+    print(f"  Cosine LR + Warmup       : {use_cosine}")
+    print(f"  Label Smoothing (ε={label_smooth})  : {label_smooth > 0}")
+    print(f"  Focal Loss (γ={focal_gamma})        : {use_focal}")
+    print(f"  Token Weighting (×{answer_weight})  : {use_token_weight}")
+    print(f"  AGC (Adaptive Clip)      : {use_agc}")
+    print(f"  Loss Spike Detection     : {use_spike_det}")
+    print(f"  Curriculum Learning      : {use_curriculum}")
+    print(f"  Self-Correction Loop     : {use_self_corr}")
+    print(f"  EMA Weights (decay={ema_decay}) : {use_ema}")
 
     print()
     print("RAG Training:")
@@ -137,8 +177,180 @@ def print_config_summary(config: Config) -> None:
 
 
 # ============================================================================
-# DATASET CONVERSION HELPER
+# DATASET LOADING HELPERS
 # ============================================================================
+
+def load_dataset_info(config: Config) -> dict:
+    """
+    Detect dataset yang tersedia dan return info.
+    
+    Priority:
+    1. Merged SQuAD dataset (dari prepare_datasets.py)
+    2. Custom QA dataset (dari convert_dataset.py)
+    3. Raw .txt files (perlu convert)
+    """
+    info = {
+        "has_merged": False,
+        "has_custom_qa": False,
+        "has_raw_txt": False,
+        "merged_samples": 0,
+        "custom_samples": 0,
+        "raw_files": 0,
+        "best_source": None,
+    }
+    
+    # Check merged dataset (SQuAD)
+    merged_path = Path(config.paths.merged_qa_train_path)
+    if merged_path.exists():
+        try:
+            with open(merged_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            info["has_merged"] = True
+            info["merged_samples"] = len(data.get("samples", []))
+        except Exception:
+            pass
+    
+    # Check custom QA dataset
+    qa_path = Path(config.paths.qa_dataset_path)
+    if qa_path.exists():
+        try:
+            with open(qa_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            info["has_custom_qa"] = True
+            info["custom_samples"] = len(data.get("samples", []))
+        except Exception:
+            pass
+    
+    # Check raw .txt files
+    datasets_dir = Path(config.paths.datasets_dir)
+    if datasets_dir.exists():
+        skip_dirs = {"squad", "tydi", "indoqa", "merged"}
+        txt_files = [
+            f for f in datasets_dir.glob("*.txt")
+            if f.parent.name not in skip_dirs
+        ]
+        info["has_raw_txt"] = len(txt_files) > 0
+        info["raw_files"] = len(txt_files)
+    
+    # Determine best source
+    if info["has_merged"] and info["merged_samples"] > 1000:
+        info["best_source"] = "merged"
+    elif info["has_custom_qa"] and info["custom_samples"] > 0:
+        info["best_source"] = "custom"
+    elif info["has_raw_txt"]:
+        info["best_source"] = "raw"
+    else:
+        info["best_source"] = None
+    
+    return info
+
+
+def print_dataset_info(info: dict) -> None:
+    """Print dataset availability info."""
+    print()
+    print("📚 Dataset Status:")
+    
+    if info["has_merged"]:
+        print(f"  ✅ Merged SQuAD      : {info['merged_samples']:,} samples")
+    else:
+        print(f"  ❌ Merged SQuAD      : not found")
+    
+    if info["has_custom_qa"]:
+        print(f"  ✅ Custom QA         : {info['custom_samples']:,} samples")
+    else:
+        print(f"  ⚠️  Custom QA         : not found")
+    
+    if info["has_raw_txt"]:
+        print(f"  📄 Raw .txt files    : {info['raw_files']} files")
+    else:
+        print(f"  ❌ Raw .txt files    : none")
+    
+    print(f"\n  🎯 Best source       : {info['best_source'] or 'NONE'}")
+
+
+def prepare_dataset(
+    config: Config,
+    force: bool = False,
+    verbose: bool = True,
+) -> bool:
+    """
+    Prepare dataset: gunakan merged jika ada, atau convert raw files.
+    
+    Returns:
+        True jika dataset siap, False jika gagal
+    """
+    info = load_dataset_info(config)
+    
+    # Jika merged dataset ada dan tidak force convert, pakai itu
+    if info["has_merged"] and not force:
+        if verbose:
+            print(f"[main] ✅ Using merged SQuAD dataset: {info['merged_samples']:,} samples")
+            print(f"[main]    Source: {config.paths.merged_qa_train_path}")
+        
+        # Copy merged train ke qa_dataset_path untuk kompatibilitas trainer
+        merged_path = Path(config.paths.merged_qa_train_path)
+        qa_path = Path(config.paths.qa_dataset_path)
+        
+        if merged_path != qa_path:
+            import shutil
+            try:
+                shutil.copy2(merged_path, qa_path)
+                if verbose:
+                    print(f"[main]    Copied to: {qa_path}")
+            except Exception as exc:
+                if verbose:
+                    print(f"[main] ⚠️ Failed to copy: {exc}")
+        
+        return True
+    
+    # Jika custom QA ada dan tidak force, pakai itu
+    if info["has_custom_qa"] and not force:
+        if verbose:
+            print(f"[main] ✅ Using custom QA dataset: {info['custom_samples']:,} samples")
+        return True
+    
+    # Coba jalankan prepare_datasets.py (untuk SQuAD)
+    prepare_script = Path(__file__).resolve().parent / "scripts" / "prepare_datasets.py"
+    if prepare_script.exists() and info["has_merged"] is False:
+        # Check if raw SQuAD files exist
+        squad_dir = Path(config.paths.datasets_dir) / "squad"
+        if squad_dir.exists() and any(squad_dir.glob("*.json")):
+            if verbose:
+                print(f"[main] 📥 Running prepare_datasets.py untuk merge SQuAD...")
+            
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(prepare_script)],
+                    capture_output=not verbose,
+                    text=True,
+                    check=True,
+                )
+                if verbose and result.stdout:
+                    print(result.stdout)
+                
+                # Reload info
+                info = load_dataset_info(config)
+                if info["has_merged"]:
+                    if verbose:
+                        print(f"[main] ✅ SQuAD prepared: {info['merged_samples']:,} samples")
+                    return prepare_dataset(config, force=False, verbose=verbose)
+            except Exception as exc:
+                if verbose:
+                    print(f"[main] ⚠️ prepare_datasets.py failed: {exc}")
+    
+    # Fallback: convert_dataset.py (untuk raw .txt files)
+    if info["has_raw_txt"]:
+        return convert_dataset(config, verbose=verbose)
+    
+    if verbose:
+        print("[main] ❌ No dataset available.")
+        print("[main]    Options:")
+        print("[main]    1. Run: python scripts/download_datasets.py")
+        print("[main]    2. Run: python scripts/prepare_datasets.py")
+        print("[main]    3. Add .txt files ke datasets/ folder")
+    
+    return False
+
 
 def convert_dataset(
     config: Config,
@@ -150,25 +362,14 @@ def convert_dataset(
     Jalankan script konversi dataset mentah ke format QA.
 
     Memanggil scripts/convert_dataset.py sebagai subprocess.
-
-    Args:
-        config: Config object
-        augmentation_factor: override augmentation factor (default dari config)
-        preview: jumlah samples untuk preview (0 = no preview)
-        verbose: print progress
-
-    Returns:
-        True jika sukses, False jika gagal
     """
     script_path = Path(__file__).resolve().parent / "scripts" / "convert_dataset.py"
 
     if not script_path.exists():
         if verbose:
             print(f"[main] ⚠️ Script konversi tidak ditemukan: {script_path}")
-            print(f"[main]    Buat script atau konversi manual ke format QA.")
         return False
 
-    # Build command
     cmd = [
         sys.executable,
         str(script_path),
@@ -186,7 +387,6 @@ def convert_dataset(
 
     if verbose:
         print(f"[main] Menjalankan konversi dataset...")
-        print(f"[main] Command: {' '.join(cmd)}")
 
     try:
         result = subprocess.run(
@@ -202,14 +402,13 @@ def convert_dataset(
         if result.stderr:
             print(result.stderr, file=sys.stderr)
         
-        # Verifikasi output
         qa_path = Path(config.paths.qa_dataset_path)
         if qa_path.exists():
             with open(qa_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             n_samples = len(data.get("samples", []))
             if verbose:
-                print(f"[main] ✅ Konversi sukses: {n_samples} QA samples")
+                print(f"[main] ✅ Konversi sukses: {n_samples:,} QA samples")
             return True
         else:
             if verbose:
@@ -235,18 +434,14 @@ def convert_dataset(
 # EVALUATION HELPER
 # ============================================================================
 
-def limited_batches(trainer: Trainer, limit: int | None):
-    """
-    Generator untuk membatasi jumlah batch evaluasi.
-    """
+def limited_batches(trainer: Trainer, limit: Optional[int]):
+    """Generator untuk membatasi jumlah batch evaluasi."""
     if limit is not None and limit <= 0:
         limit = None
 
-    # Load QA dataset jika belum
     if not trainer.qa_samples:
         trainer.load_qa_dataset(verbose=False)
 
-    # iter_batches butuh epoch dan total_epochs
     for i, batch in enumerate(trainer.iter_batches(epoch=0, total_epochs=1, shuffle=False)):
         if limit is not None and i >= limit:
             break
@@ -257,11 +452,9 @@ def evaluate_model(
     model,
     trainer: Trainer,
     evaluator: Evaluator,
-    max_batches: int | None,
-) -> dict | None:
-    """
-    Menjalankan audit evaluasi memakai evaluator.audit().
-    """
+    max_batches: Optional[int],
+) -> Optional[dict]:
+    """Menjalankan audit evaluasi memakai evaluator.audit()."""
     batch_generator = limited_batches(trainer, max_batches)
 
     report = evaluator.audit(
@@ -284,14 +477,11 @@ def export_model(
     tokenizer,
     evaluator: Evaluator,
     config: Config,
-    report: dict | None,
+    report: Optional[dict],
     args: argparse.Namespace,
 ) -> None:
     """
     Menentukan apakah model layak di-export, lalu menjalankannya.
-
-    Untuk RAG: export akan copy retrieval_index.json + otak_engine.py
-    sebagai file terpisah di output folder.
     """
     print_section("EXPORT MODEL (RAG)")
 
@@ -336,7 +526,7 @@ def export_model(
         output_path=args.export_path,
         export_dtype=args.export_dtype,
         include_vocab=True,
-        include_rag_assets=True,  # Copy retrieval index + engine
+        include_rag_assets=True,
         verbose=True,
     )
 
@@ -348,7 +538,6 @@ def export_model(
     print(f"       {output_path}")
     print(f"[main] Ukuran file: {file_size:,} bytes ({file_size / 1024 / 1024:.2f} MB)")
 
-    # Inspect hasil export
     info = exporter.inspect(output_path)
     print()
     print(f"[main] Model info:")
@@ -368,17 +557,16 @@ def export_model(
 
 def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     """
-    Menjalankan pipeline RAG.
-
-    MODE INTERACTIVE (--interactive):
-        Tokenizer → Load Model → Playground (dengan RAG inference)
-        Training dilakukan via perintah 'training' di playground.
-
-    MODE PIPELINE (default):
-        Tokenizer → Convert Dataset → Training → Eval → Test → Export
+    Menjalankan pipeline RAG dengan SOTA training.
     """
     config.ensure_dirs()
     print_config_summary(config)
+
+    # --------------------------------------------------------------------
+    # 0. DATASET DETECTION
+    # --------------------------------------------------------------------
+    info = load_dataset_info(config)
+    print_dataset_info(info)
 
     # --------------------------------------------------------------------
     # 1. TOKENIZER
@@ -390,59 +578,57 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     if args.resume and config.paths.vocab_path.exists():
         tokenizer.load()
         print(f"[main] Tokenizer dimuat dari: {config.paths.vocab_path}")
+        print(f"[main] Vocab size: {tokenizer.vocab_size:,}")
     else:
         tokenizer.train()
         print(f"[main] Tokenizer trained.")
         print(f"[main] Vocab disimpan di: {config.paths.vocab_path}")
-        print(f"[main] Vocab size: {tokenizer.vocab_size}")
+        print(f"[main] Vocab size: {tokenizer.vocab_size:,}")
 
     # --------------------------------------------------------------------
-    # 1.5 DATASET CONVERSION (opsional)
+    # 1.5 DATASET PREPARATION
     # --------------------------------------------------------------------
     if not args.skip_convert and not args.interactive:
-        print_section("TAHAP 1.5: DATASET CONVERSION")
-
-        qa_path = Path(config.paths.qa_dataset_path)
-
-        if qa_path.exists() and not args.force_convert:
-            print(f"[main] QA dataset sudah ada: {qa_path}")
-            print(f"[main] Lewati konversi. Gunakan --force-convert untuk rebuild.")
-            
-            # Load untuk validasi
-            try:
-                with open(qa_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                n_samples = len(data.get("samples", []))
-                print(f"[main] ✅ Loaded {n_samples} existing QA samples")
-            except Exception as exc:
-                print(f"[main] ⚠️ Gagal load existing dataset: {exc}")
-                print(f"[main] Akan coba generate baru...")
-                convert_dataset(config, verbose=True)
-        else:
-            convert_dataset(config, preview=3, verbose=True)
+        print_section("TAHAP 1.5: DATASET PREPARATION")
+        
+        force_convert = getattr(args, 'force_convert', False)
+        
+        if not prepare_dataset(config, force=force_convert, verbose=True):
+            print("[main] ❌ Dataset tidak tersedia. Training tidak bisa dilanjutkan.")
+            print("[main]    Jalankan: python scripts/download_datasets.py")
+            print("[main]    Atau tambahkan file .txt ke datasets/")
+            return
 
     # --------------------------------------------------------------------
     # 2. MODEL
     # --------------------------------------------------------------------
-    print_section("TAHAP 2: ARSITEKTUR MODEL (RAG Single-Head)")
+    print_section("TAHAP 2: ARSITEKTUR MODEL (RAG + Cross-Attention)")
 
     model = CustomTransformerLM(config)
 
     print(f"[main] Model dibuat.")
     print(f"[main] Parameter count: {model.parameter_count():,}")
-    print(f"[main] Architecture   : Single LM head (no domain contamination)")
+    print(f"[main] Architecture   : Single LM head + Cross-Attention")
     print(f"[main] Weight tying   : {model.use_weight_tying}")
     print(f"[main] RoPE           : {model.use_rope}")
+    
+    # Print cross-attention info
+    if hasattr(model, 'cross_attention_layer_indices'):
+        n_cross = len(model.cross_attention_layer_indices)
+        print(f"[main] Cross-Attention: {n_cross} layers ({sorted(model.cross_attention_layer_indices)})")
+    
+    if hasattr(model, 'use_constrained_generation'):
+        print(f"[main] Constrained Gen: {model.use_constrained_generation}")
 
     # --------------------------------------------------------------------
     # 3. EVALUATOR & WEIGHT MANAGER
     # --------------------------------------------------------------------
-    print_section("TAHAP 3: EVALUATOR & WEIGHT MANAGER")
+    print_section("TAHAP 3: EVALUATOR & WEIGHT MANAGER (SOTA)")
 
     evaluator = Evaluator(config)
     weight_manager = WeightManager(model, config)
 
-    print("[main] Evaluator siap.")
+    print("[main] Evaluator siap (dengan SOTA loss functions).")
     print("[main] WeightManager siap.")
 
     trainer = Trainer(
@@ -474,6 +660,14 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
 
             print(f"[main] Last epoch: {last_epoch}")
             print(f"[main] Global step: {global_step}")
+            
+            # Load EMA weights jika tersedia
+            if hasattr(weight_manager, 'load_ema_weights'):
+                try:
+                    weight_manager.load_ema_weights()
+                    print("[main] ✅ EMA weights loaded")
+                except Exception:
+                    pass
         except FileNotFoundError:
             print("[main] Checkpoint tidak ditemukan. Mulai dari awal.")
             resumed = False
@@ -486,7 +680,7 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
         trainer.set_resume_state(start_epoch=start_epoch, global_step=global_step)
 
     # Variabel report untuk export
-    report: dict | None = None
+    report: Optional[dict] = None
 
     # ====================================================================
     # MODE INTERACTIVE vs MODE PIPELINE
@@ -495,10 +689,8 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     if args.interactive:
         # ----------------------------------------------------------------
         # MODE INTERACTIVE
-        # Langsung masuk playground dengan RAG inference.
-        # Training dilakukan via perintah 'training' di playground.
         # ----------------------------------------------------------------
-        print_section("PLAYGROUND INTERACTIVE (RAG)")
+        print_section("🎮 PLAYGROUND INTERACTIVE (RAG + SOTA)")
 
         if resumed:
             print(f"[main] Model dimuat dari checkpoint (epoch {start_epoch}, step {global_step}).")
@@ -506,24 +698,23 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
             print("[main] Model baru dibuat (belum dilatih).")
 
         # Load QA dataset untuk trainer (untuk inline training)
-        qa_path = Path(config.paths.qa_dataset_path)
-        if qa_path.exists():
-            n_loaded = trainer.load_qa_dataset(verbose=True)
-            if n_loaded > 0:
-                print(f"[main] ✅ {n_loaded} QA samples siap untuk inline training.")
-            else:
-                print(f"[main] ⚠️ QA dataset kosong. Jalankan konversi dulu atau training via pipeline.")
+        n_loaded = trainer.load_qa_dataset(verbose=True)
+        if n_loaded > 0:
+            print(f"[main] ✅ {n_loaded:,} QA samples siap untuk inline training.")
         else:
-            print(f"[main] ⚠️ QA dataset belum ada: {qa_path}")
-            print(f"[main]    Jalankan: python scripts/convert_dataset.py")
-            print(f"[main]    Atau jalankan tanpa --interactive untuk pipeline lengkap.")
+            print(f"[main] ⚠️ QA dataset kosong. Jalankan konversi dulu atau training via pipeline.")
 
         print()
-        print("[main] Gunakan perintah '/training' untuk melatih lebih lanjut.")
-        print("[main] Gunakan '/retrieve' untuk test retrieval.")
+        print("[main] 📚 Commands yang tersedia:")
+        print("  /training --epochs N   : Latih model N epochs dengan SOTA techniques")
+        print("  /training --steps N    : Latih model N steps")
+        print("  /retrieve [query]      : Test retrieval (BM25)")
+        print("  /context [on|off]      : Toggle context injection")
+        print("  /status                : Lihat SOTA training stats")
+        print("  /help                  : Bantuan lengkap")
+        print()
         print("[main] Ketik prompt biasa untuk RAG inference.")
 
-        # Buat playground
         playground = Playground(
             model=model,
             tokenizer=tokenizer,
@@ -542,7 +733,6 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
             debug_retrieval=not args.no_debug_retrieval,
         )
 
-        # Setelah keluar dari playground, export jika diminta
         if not args.skip_export:
             export_model(
                 model=model,
@@ -556,21 +746,32 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     else:
         # ----------------------------------------------------------------
         # MODE PIPELINE
-        # Training -> Eval -> Test -> Export
         # ----------------------------------------------------------------
 
         # TRAINING
         if not args.skip_training:
-            print_section("TRAINING (RAG Context-Conditioned)")
+            print_section("🎯 TRAINING (RAG + SOTA Techniques)")
 
-            # Pastikan QA dataset ada
             if not trainer.qa_samples:
                 n_loaded = trainer.load_qa_dataset(verbose=True)
                 if n_loaded == 0:
                     print("[main] ❌ QA dataset tidak ditemukan.")
-                    print("[main]    Jalankan dengan --skip-training=false tanpa --skip-convert")
-                    print("[main]    Atau: python scripts/convert_dataset.py")
+                    print("[main]    Jalankan: python scripts/download_datasets.py")
+                    print("[main]    Lalu: python scripts/prepare_datasets.py")
                     return
+
+            print(f"\n[main] Starting SOTA training dengan {len(trainer.qa_samples):,} samples...")
+            print(f"[main] Model parameters: {model.parameter_count():,}")
+            
+            # Calculate training time estimate
+            steps_per_epoch = len(trainer.qa_samples) // config.training.batch_size
+            total_steps = steps_per_epoch * config.training.epochs
+            est_time_hours = (total_steps * 0.3) / 3600  # ~300ms per step
+            
+            print(f"[main] Steps per epoch: {steps_per_epoch:,}")
+            print(f"[main] Total steps    : {total_steps:,}")
+            print(f"[main] Est. time      : {est_time_hours:.1f} hours")
+            print()
 
             history = trainer.run_epochs(
                 max_steps=args.max_steps,
@@ -584,13 +785,24 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
                 report = history[-1]
 
                 print()
-                print("[main] ✅ Training selesai.")
-                print(f"[main] Epoch terakhir : {report.get('epoch')}")
-                print(f"[main] Stage          : {report.get('stage', 'N/A')}")
-                print(f"[main] Loss           : {report.get('loss'):.6f}")
-                print(f"[main] Perplexity     : {report.get('perplexity'):.4f}")
-                print(f"[main] Accuracy       : {report.get('accuracy'):.4f}")
-                print(f"[main] Valid tokens   : {report.get('num_valid_tokens')}")
+                print_section("📊 TRAINING RESULTS")
+                print(f"[main] ✅ Training selesai.")
+                print(f"  Epoch terakhir     : {report.get('epoch')}")
+                print(f"  Stage              : {report.get('stage', 'N/A')}")
+                print(f"  Loss               : {report.get('loss'):.6f}")
+                print(f"  Perplexity         : {report.get('perplexity'):.4f}")
+                print(f"  Accuracy           : {report.get('accuracy'):.4f}")
+                print(f"  Top-5 Accuracy     : {report.get('top5_accuracy', 'N/A')}")
+                print(f"  Valid tokens       : {report.get('num_valid_tokens'):,}")
+                
+                # SOTA stats
+                if hasattr(trainer, 'get_sota_stats'):
+                    stats = trainer.get_sota_stats()
+                    print()
+                    print("  🎯 SOTA Statistics:")
+                    print(f"    Spikes detected     : {stats.get('spikes_detected', 0)}")
+                    print(f"    Self-corrections    : {stats.get('corrections_applied', 0)}")
+                    print(f"    Hard samples retrain: {stats.get('hard_samples_retrained', 0)}")
             else:
                 print("[main] ⚠️ Training tidak menghasilkan history.")
         else:
@@ -599,7 +811,7 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
 
         # EVALUATOR AUDIT
         if not args.skip_eval:
-            print_section("EVALUATOR AUDIT")
+            print_section("📈 EVALUATOR AUDIT")
 
             eval_report = evaluate_model(
                 model=model,
@@ -611,22 +823,21 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
             if eval_report is not None:
                 report = eval_report
 
-                print("[main] Audit evaluasi selesai.")
-                print(f"[main] Eval loss       : {eval_report['loss']:.6f}")
-                print(f"[main] Eval perplexity : {eval_report['perplexity']:.4f}")
-                print(f"[main] Eval accuracy   : {eval_report['accuracy']:.4f}")
-                print(f"[main] Valid tokens    : {eval_report['num_valid_tokens']}")
-                print(f"[main] Eval batches    : {eval_report['num_batches']}")
+                print("[main] ✅ Audit evaluasi selesai.")
+                print(f"  Eval loss       : {eval_report['loss']:.6f}")
+                print(f"  Eval perplexity : {eval_report['perplexity']:.4f}")
+                print(f"  Eval accuracy   : {eval_report['accuracy']:.4f}")
+                print(f"  Valid tokens    : {eval_report['num_valid_tokens']:,}")
+                print(f"  Eval batches    : {eval_report['num_batches']}")
             else:
                 print("[main] Audit evaluasi tidak menghasilkan token valid.")
-                print("[main] Pastikan QA dataset sudah di-generate.")
         else:
             print_section("EVALUATOR AUDIT")
             print("[main] Evaluasi dilewati karena --skip-eval.")
 
-        # PLAYGROUND TEST (non-interactive dengan RAG)
+        # PLAYGROUND TEST
         if not args.skip_test:
-            print_section("PLAYGROUND TEST (RAG Inference)")
+            print_section("🧪 PLAYGROUND TEST (RAG Inference)")
 
             playground = Playground(
                 model=model,
@@ -665,7 +876,7 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
             print_section("EXPORT MODEL")
             print("[main] Export dilewati karena --skip-export.")
 
-    print_section("PIPELINE SELESAI")
+    print_section("✅ PIPELINE SELESAI")
 
 
 # ============================================================================
@@ -674,15 +885,9 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
 
 def run_demo(args: argparse.Namespace) -> None:
     """
-    Menjalankan pipeline demo kecil memakai folder sementara.
-
-    Demo ini menunjukkan flow RAG:
-    - Corpus mentah (tanpa prefix domain)
-    - Auto konversi ke QA format
-    - Training dengan context conditioning
-    - Inference dengan BM25 retrieval
+    Menjalankan pipeline demo kecil dengan SOTA training.
     """
-    print_section("MODE DEMO (RAG)")
+    print_section("MODE DEMO (RAG + SOTA)")
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -693,7 +898,7 @@ def run_demo(args: argparse.Namespace) -> None:
         datasets_dir.mkdir(parents=True, exist_ok=True)
         output_models_dir.mkdir(parents=True, exist_ok=True)
 
-        # Dataset demo (tanpa domain prefix - RAG style)
+        # Dataset demo
         mobil_file = datasets_dir / "mobil.txt"
         mobil_file.write_text(
             "Mobil adalah kendaraan beroda empat yang menggunakan mesin sebagai penggerak utama.\n\n"
@@ -711,15 +916,6 @@ def run_demo(args: argparse.Namespace) -> None:
             "Matahari adalah bintang terdekat dengan Bumi yang menjadi sumber energi utama.\n\n"
             "Atom terdiri dari proton, neutron, dan elektron yang membentuk struktur materi.\n\n"
             "Gravitasi adalah gaya tarik menarik antara dua benda yang memiliki massa.",
-            encoding="utf-8",
-        )
-
-        biologi_file = datasets_dir / "biologi.txt"
-        biologi_file.write_text(
-            "Sel adalah unit terkecil dari makhluk hidup yang memiliki fungsi spesifik.\n\n"
-            "DNA adalah materi genetik yang menyimpan informasi keturunan dalam sel.\n\n"
-            "Metamorfosis adalah proses perubahan bentuk tubuh hewan dari tahap muda ke dewasa.\n\n"
-            "Ekosistem adalah hubungan timbal balik antara makhluk hidup dengan lingkungannya.",
             encoding="utf-8",
         )
 
@@ -745,6 +941,15 @@ def run_demo(args: argparse.Namespace) -> None:
                 weight_decay=0.01,
                 grad_clip_norm=1.0,
                 seed=1337,
+                # SOTA parameters (aktif semua)
+                use_cosine_schedule=True,
+                use_focal_loss=True,
+                use_agc=True,
+                use_curriculum=True,
+                use_self_correction=True,
+                use_ema=True,
+                label_smoothing=0.1,
+                focal_gamma=2.0,
                 # RAG parameters
                 context_dropout_rate=0.2,
                 context_perturbation_rate=0.3,
@@ -774,7 +979,6 @@ def run_demo(args: argparse.Namespace) -> None:
         )
 
         demo_args = copy.copy(args)
-
         demo_args.resume = False
         demo_args.export_path = None
         demo_args.interactive = False
@@ -782,12 +986,12 @@ def run_demo(args: argparse.Namespace) -> None:
         demo_args.force_convert = True
 
         if demo_args.max_steps is None:
-            demo_args.max_steps = None  # Run full epochs
+            demo_args.max_steps = None
 
         if demo_args.eval_batches != 0:
             demo_args.eval_batches = 2
 
-        print("[main] Menjalankan demo pipeline RAG dengan folder sementara:")
+        print("[main] Menjalankan demo pipeline RAG + SOTA:")
         print(f"[main] {tmp_path}")
         print()
 
@@ -800,10 +1004,10 @@ def run_demo(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="CreateMiniBot RAG Pipeline",
+        prog="CreateMiniBot RAG+SOTA Pipeline",
         description=(
-            "Orkestrator pipeline RAG (Retrieval-Augmented Generation): "
-            "tokenizer, dataset converter, trainer, evaluator, playground, dan exporter."
+            "Orkestrator pipeline RAG (Retrieval-Augmented Generation) dengan SOTA training: "
+            "tokenizer, dataset preparation, SOTA trainer, evaluator, playground, dan exporter."
         ),
     )
 
@@ -855,13 +1059,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-convert",
         action="store_true",
-        help="Lewati konversi dataset (asumsikan qa_dataset.json sudah ada).",
+        help="Lewati preparation dataset (asumsikan sudah ada).",
     )
 
     parser.add_argument(
         "--force-convert",
         action="store_true",
-        help="Paksa konversi dataset meskipun qa_dataset.json sudah ada.",
+        help="Paksa rebuild dataset meskipun sudah ada.",
     )
 
     parser.add_argument(
@@ -890,34 +1094,34 @@ def parse_args() -> argparse.Namespace:
         "--temperature",
         type=float,
         default=0.3,
-        help="Temperature sampling untuk playground (default: 0.3 untuk determinisme).",
+        help="Temperature sampling untuk playground.",
     )
 
     parser.add_argument(
         "--top-k",
         type=int,
         default=20,
-        help="Top-K sampling untuk playground (default: 20 untuk fokus).",
+        help="Top-K sampling untuk playground.",
     )
 
     parser.add_argument(
         "--top-p",
         type=float,
         default=0.85,
-        help="Top-P sampling untuk playground (default: 0.85).",
+        help="Top-P sampling untuk playground.",
     )
 
     parser.add_argument(
         "--repetition-penalty",
         type=float,
         default=1.3,
-        help="Repetition penalty. Nilai > 1 mengurangi pengulangan (default: 1.3).",
+        help="Repetition penalty.",
     )
 
     parser.add_argument(
         "--debug-tokens",
         action="store_true",
-        help="Tampilkan Token IDs dan Token Pieces secara detail saat inference.",
+        help="Tampilkan Token IDs dan Token Pieces secara detail.",
     )
 
     parser.add_argument(
@@ -931,7 +1135,7 @@ def parse_args() -> argparse.Namespace:
         "--max-steps",
         type=int,
         default=None,
-        help="Batasi jumlah step training global (berguna untuk testing).",
+        help="Batasi jumlah step training global.",
     )
 
     parser.add_argument(
@@ -953,14 +1157,14 @@ def parse_args() -> argparse.Namespace:
         "--max-export-ppl",
         type=float,
         default=None,
-        help="Threshold perplexity maksimum agar model boleh di-export.",
+        help="Threshold perplexity maksimum.",
     )
 
     parser.add_argument(
         "--min-export-accuracy",
         type=float,
         default=None,
-        help="Threshold accuracy minimum agar model boleh di-export.",
+        help="Threshold accuracy minimum.",
     )
 
     parser.add_argument(
@@ -980,10 +1184,7 @@ def parse_args() -> argparse.Namespace:
         "--export-dtype",
         type=str,
         default=None,
-        help=(
-            "Presisi export: float32, float16, bfloat16, int8, atau int4. "
-            "Jika tidak diisi, memakai config.model.export_dtype."
-        ),
+        help="Presisi export: float32, float16, bfloat16, int8, atau int4.",
     )
 
     return parser.parse_args()
@@ -1019,13 +1220,7 @@ def main() -> None:
             print("Saran:")
             print("1. Jalankan mode demo:      python main.py --demo")
             print("2. Kurangi ukuran model di  config.py")
-            print("   - vocab_size")
-            print("   - embedding_dim")
-            print("   - num_layers")
-            print("   - ffn_hidden_dim")
-            print("3. Atau nonaktifkan batas aman dengan:")
-            print("   CustomTransformerLM.MAX_PARAMS = None")
-            print("   (tidak disarankan untuk CPU / implementasi custom)")
+            print("3. Atau set CustomTransformerLM.MAX_PARAMS = None")
 
         sys.exit(1)
 
