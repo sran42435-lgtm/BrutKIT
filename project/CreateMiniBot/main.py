@@ -27,8 +27,13 @@
 #    Tokenizer → Load Model → Playground (dengan RAG inference)
 #    Training dilakukan via perintah 'training' di playground.
 #
+# 🆕 v2.3 Features:
+# - Auto-Continue: --resume otomatis lanjutkan sisa epochs (tidak perlu --interactive)
+# - Metrics Display: tampilkan loss, PPL, accuracy dari checkpoint terakhir
+# - Resume Info: tampilkan sisa epochs + instruksi jelas
+#
 # Flag penting:
-# --resume           : muat checkpoint dan lanjutkan dari epoch terakhir
+# --resume           : muat checkpoint dan AUTO-CONTINUE training (v2.3)
 # --interactive      : langsung masuk playground, training via perintah di dalam
 # --skip-training    : lewati training (mode pipeline)
 # --skip-eval        : lewati evaluasi
@@ -44,9 +49,9 @@
 # - core/architecture.py   : model transformer + cross-attention + constrained gen
 # - core/retriever.py      : BM25 retrieval engine
 # - core/model_exporter.py : export ke safetensors + RAG assets
-# - pipeline/trainer.py    : SOTA context-conditioned training
+# - pipeline/trainer.py    : SOTA context-conditioned training (v2.3)
 # - pipeline/evaluator.py  : SOTA loss computation (focal, label smoothing, etc.)
-# - pipeline/weight_manager.py : load/save checkpoint + EMA support
+# - pipeline/weight_manager.py : load/save checkpoint + EMA + metrics (v2.3)
 # - scripts/prepare_datasets.py : prepare SQuAD + custom datasets
 # - scripts/convert_dataset.py  : convert custom dataset (fallback)
 # - testing/playground.py  : RAG inference testing
@@ -60,7 +65,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from config import (
     CONFIG,
@@ -431,6 +436,112 @@ def convert_dataset(
 
 
 # ============================================================================
+# 🆕 RESUME INFO HELPER (v2.3)
+# ============================================================================
+
+def interpret_metrics(loss: float, accuracy: float) -> Dict[str, str]:
+    """
+    Interpretasi kualitas metrics.
+    
+    Returns:
+        Dict dengan keys: loss_status, acc_status, loss_emoji, acc_emoji
+    """
+    # Interpretasi loss
+    if loss <= 0.0:
+        loss_status = "Not trained yet"
+        loss_emoji = "⚪"
+    elif loss < 0.5:
+        loss_status = "Excellent"
+        loss_emoji = "✅"
+    elif loss < 1.0:
+        loss_status = "Good"
+        loss_emoji = "✅"
+    elif loss < 2.0:
+        loss_status = "Fair"
+        loss_emoji = "⚠️"
+    else:
+        loss_status = "Poor (need more training)"
+        loss_emoji = "❌"
+    
+    # Interpretasi accuracy
+    if accuracy <= 0.0:
+        acc_status = "Not trained yet"
+        acc_emoji = "⚪"
+    elif accuracy > 0.8:
+        acc_status = "Excellent"
+        acc_emoji = "✅"
+    elif accuracy > 0.6:
+        acc_status = "Good"
+        acc_emoji = "✅"
+    elif accuracy > 0.4:
+        acc_status = "Fair"
+        acc_emoji = "⚠️"
+    else:
+        acc_status = "Poor (need more training)"
+        acc_emoji = "❌"
+    
+    return {
+        "loss_status": loss_status,
+        "acc_status": acc_status,
+        "loss_emoji": loss_emoji,
+        "acc_emoji": acc_emoji,
+    }
+
+
+def print_resume_info(resume_info: Dict, config: Config) -> None:
+    """
+    Print informasi resume dengan metrics lengkap.
+    
+    Args:
+        resume_info: dict dari trainer.get_resume_info()
+        config: Config object untuk akses total epochs
+    """
+    print_section("🔄 RESUME INFO (dari checkpoint terakhir)")
+    
+    start_epoch = resume_info.get("start_epoch", 0)
+    global_step = resume_info.get("global_step", 0)
+    last_metrics = resume_info.get("last_metrics", {})
+    total_epochs = resume_info.get("total_epochs_configured", config.training.epochs)
+    remaining_epochs = resume_info.get("remaining_epochs", 0)
+    has_more = resume_info.get("has_more_to_train", False)
+    auto_stop = resume_info.get("auto_stop_triggered", False)
+    
+    # Position info
+    print(f"  📍 Current Position:")
+    print(f"    Last epoch      : {start_epoch} / {total_epochs}")
+    print(f"    Global step     : {global_step:,}")
+    
+    # Metrics info
+    loss = last_metrics.get("loss", 0.0)
+    ppl = last_metrics.get("perplexity", 1.0)
+    acc = last_metrics.get("accuracy", 0.0)
+    
+    interp = interpret_metrics(loss, acc)
+    
+    print()
+    print(f"  📈 Last Training Metrics:")
+    print(f"    {interp['loss_emoji']} Loss       : {loss:.6f} ({interp['loss_status']})")
+    print(f"    📊 Perplexity : {ppl:.4f}")
+    print(f"    {interp['acc_emoji']} Accuracy   : {acc:.4f} ({interp['acc_status']})")
+    
+    # Remaining training
+    print()
+    print(f"  🎯 Remaining Training:")
+    if auto_stop:
+        print(f"    Status          : ✅ AUTO-STOP (target sudah tercapai)")
+        print(f"    Remaining epochs: 0 (training completed)")
+    elif has_more:
+        print(f"    Status          : 🔄 Incomplete (akan dilanjutkan)")
+        print(f"    Remaining epochs: {remaining_epochs}")
+        print(f"    Next epoch      : {start_epoch + 1}")
+    else:
+        print(f"    Status          : ✅ Completed (semua epochs selesai)")
+        print(f"    Remaining epochs: 0")
+    
+    print("=" * 70)
+
+
+# ============================================================================
 # EVALUATION HELPER
 # ============================================================================
 
@@ -558,6 +669,8 @@ def export_model(
 def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     """
     Menjalankan pipeline RAG dengan SOTA training.
+    
+    🆕 v2.3: Auto-continue training saat --resume digunakan.
     """
     config.ensure_dirs()
     print_config_summary(config)
@@ -645,6 +758,7 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
     start_epoch = 0
     global_step = 0
     resumed = False
+    resume_info = None  # 🆕 v2.3
 
     if args.resume:
         try:
@@ -678,6 +792,10 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
 
     if resumed:
         trainer.set_resume_state(start_epoch=start_epoch, global_step=global_step)
+        
+        # 🆕 v2.3: Get resume info untuk auto-continue + metrics display
+        if hasattr(trainer, 'get_resume_info'):
+            resume_info = trainer.get_resume_info()
 
     # Variabel report untuk export
     report: Optional[dict] = None
@@ -694,6 +812,28 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
 
         if resumed:
             print(f"[main] Model dimuat dari checkpoint (epoch {start_epoch}, step {global_step}).")
+            
+            # 🆕 v2.3: Print resume info dengan metrics
+            if resume_info is not None:
+                print_resume_info(resume_info, config)
+                
+                # Tampilkan instruksi berdasarkan status
+                remaining = resume_info.get("remaining_epochs", 0)
+                auto_stop = resume_info.get("auto_stop_triggered", False)
+                
+                if auto_stop:
+                    print()
+                    print("[main] ✅ Training sudah selesai (auto-stop triggered).")
+                    print("[main]    Model siap untuk inference.")
+                elif remaining > 0:
+                    print()
+                    print(f"[main] 🔄 Training belum selesai. Sisa: {remaining} epochs")
+                    print(f"[main]    Ketik: /training --epochs {remaining}")
+                    print(f"[main]    untuk melanjutkan training.")
+                else:
+                    print()
+                    print("[main] ✅ Training sudah selesai (semua epochs dilalui).")
+                    print("[main]    Model siap untuk inference.")
         else:
             print("[main] Model baru dibuat (belum dilatih).")
 
@@ -710,7 +850,7 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
         print("  /training --steps N    : Latih model N steps")
         print("  /retrieve [query]      : Test retrieval (BM25)")
         print("  /context [on|off]      : Toggle context injection")
-        print("  /status                : Lihat SOTA training stats")
+        print("  /status                : Lihat SOTA training stats + metrics")
         print("  /help                  : Bantuan lengkap")
         print()
         print("[main] Ketik prompt biasa untuk RAG inference.")
@@ -752,6 +892,32 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
         if not args.skip_training:
             print_section("🎯 TRAINING (RAG + SOTA Techniques)")
 
+            # 🆕 v2.3: AUTO-CONTINUE LOGIC
+            should_auto_continue = False
+            if resumed and resume_info is not None:
+                # Print resume info dengan metrics
+                print_resume_info(resume_info, config)
+                
+                remaining = resume_info.get("remaining_epochs", 0)
+                auto_stop = resume_info.get("auto_stop_triggered", False)
+                
+                if auto_stop:
+                    print()
+                    print("[main] ✅ AUTO-STOP sudah triggered di sesi sebelumnya.")
+                    print("[main]    Training dianggap selesai. Lewati training.")
+                    should_auto_continue = False
+                elif remaining > 0:
+                    print()
+                    print("[main] 🔄 AUTO-CONTINUE TRAINING")
+                    print(f"[main]    Melanjutkan dari epoch {start_epoch + 1}")
+                    print(f"[main]    Sisa epochs: {remaining}")
+                    should_auto_continue = True
+                else:
+                    print()
+                    print("[main] ✅ Training sudah selesai (semua epochs dilalui).")
+                    print("[main]    Lewati training.")
+                    should_auto_continue = False
+
             if not trainer.qa_samples:
                 n_loaded = trainer.load_qa_dataset(verbose=True)
                 if n_loaded == 0:
@@ -760,51 +926,63 @@ def run_pipeline(config: Config, args: argparse.Namespace) -> None:
                     print("[main]    Lalu: python scripts/prepare_datasets.py")
                     return
 
-            print(f"\n[main] Starting SOTA training dengan {len(trainer.qa_samples):,} samples...")
-            print(f"[main] Model parameters: {model.parameter_count():,}")
-            
-            # Calculate training time estimate
-            steps_per_epoch = len(trainer.qa_samples) // config.training.batch_size
-            total_steps = steps_per_epoch * config.training.epochs
-            est_time_hours = (total_steps * 0.3) / 3600  # ~300ms per step
-            
-            print(f"[main] Steps per epoch: {steps_per_epoch:,}")
-            print(f"[main] Total steps    : {total_steps:,}")
-            print(f"[main] Est. time      : {est_time_hours:.1f} hours")
-            print()
-
-            history = trainer.run_epochs(
-                max_steps=args.max_steps,
-                save_checkpoints=True,
-                verbose=True,
-                start_epoch=start_epoch,
-                global_step=global_step,
+            # Skip training jika sudah selesai (completed atau auto-stop)
+            skip_training_due_to_complete = (
+                resumed 
+                and resume_info is not None 
+                and (resume_info.get("auto_stop_triggered", False) 
+                     or resume_info.get("remaining_epochs", 0) <= 0)
             )
 
-            if history:
-                report = history[-1]
-
-                print()
-                print_section("📊 TRAINING RESULTS")
-                print(f"[main] ✅ Training selesai.")
-                print(f"  Epoch terakhir     : {report.get('epoch')}")
-                print(f"  Stage              : {report.get('stage', 'N/A')}")
-                print(f"  Loss               : {report.get('loss'):.6f}")
-                print(f"  Perplexity         : {report.get('perplexity'):.4f}")
-                print(f"  Accuracy           : {report.get('accuracy'):.4f}")
-                print(f"  Top-5 Accuracy     : {report.get('top5_accuracy', 'N/A')}")
-                print(f"  Valid tokens       : {report.get('num_valid_tokens'):,}")
+            if not skip_training_due_to_complete:
+                print(f"\n[main] Starting SOTA training dengan {len(trainer.qa_samples):,} samples...")
+                print(f"[main] Model parameters: {model.parameter_count():,}")
                 
-                # SOTA stats
-                if hasattr(trainer, 'get_sota_stats'):
-                    stats = trainer.get_sota_stats()
+                # Calculate training time estimate
+                steps_per_epoch = len(trainer.qa_samples) // config.training.batch_size
+                total_steps = steps_per_epoch * config.training.epochs
+                est_time_hours = (total_steps * 0.3) / 3600  # ~300ms per step
+                
+                print(f"[main] Steps per epoch: {steps_per_epoch:,}")
+                print(f"[main] Total steps    : {total_steps:,}")
+                print(f"[main] Est. time      : {est_time_hours:.1f} hours")
+                print()
+
+                history = trainer.run_epochs(
+                    max_steps=args.max_steps,
+                    save_checkpoints=True,
+                    verbose=True,
+                    start_epoch=start_epoch,
+                    global_step=global_step,
+                )
+
+                if history:
+                    report = history[-1]
+
                     print()
-                    print("  🎯 SOTA Statistics:")
-                    print(f"    Spikes detected     : {stats.get('spikes_detected', 0)}")
-                    print(f"    Self-corrections    : {stats.get('corrections_applied', 0)}")
-                    print(f"    Hard samples retrain: {stats.get('hard_samples_retrained', 0)}")
+                    print_section("📊 TRAINING RESULTS")
+                    print(f"[main] ✅ Training selesai.")
+                    print(f"  Epoch terakhir     : {report.get('epoch')}")
+                    print(f"  Stage              : {report.get('stage', 'N/A')}")
+                    print(f"  Loss               : {report.get('loss'):.6f}")
+                    print(f"  Perplexity         : {report.get('perplexity'):.4f}")
+                    print(f"  Accuracy           : {report.get('accuracy'):.4f}")
+                    print(f"  Top-5 Accuracy     : {report.get('top5_accuracy', 'N/A')}")
+                    print(f"  Valid tokens       : {report.get('num_valid_tokens'):,}")
+                    
+                    # SOTA stats
+                    if hasattr(trainer, 'get_sota_stats'):
+                        stats = trainer.get_sota_stats()
+                        print()
+                        print("  🎯 SOTA Statistics:")
+                        print(f"    Spikes detected     : {stats.get('spikes_detected', 0)}")
+                        print(f"    Self-corrections    : {stats.get('corrections_applied', 0)}")
+                        print(f"    Hard samples retrain: {stats.get('hard_samples_retrained', 0)}")
+                else:
+                    print("[main] ⚠️ Training tidak menghasilkan history.")
             else:
-                print("[main] ⚠️ Training tidak menghasilkan history.")
+                print_section("TRAINING")
+                print("[main] ⏭️  Training dilewati karena sudah selesai (dari checkpoint).")
         else:
             print_section("TRAINING")
             print("[main] Training dilewati karena --skip-training.")
@@ -1007,7 +1185,8 @@ def parse_args() -> argparse.Namespace:
         prog="CreateMiniBot RAG+SOTA Pipeline",
         description=(
             "Orkestrator pipeline RAG (Retrieval-Augmented Generation) dengan SOTA training: "
-            "tokenizer, dataset preparation, SOTA trainer, evaluator, playground, dan exporter."
+            "tokenizer, dataset preparation, SOTA trainer, evaluator, playground, dan exporter. "
+            "🆕 v2.3: Auto-continue training dengan --resume + metrics display."
         ),
     )
 
@@ -1020,7 +1199,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Muat checkpoint optimizer/model dan lanjutkan dari epoch terakhir.",
+        help=(
+            "Muat checkpoint dan AUTO-CONTINUE training. "
+            "Menampilkan metrics terakhir (loss, PPL, accuracy) dan sisa epochs. "
+            "Training otomatis dilanjutkan tanpa perlu --interactive."
+        ),
     )
 
     parser.add_argument(

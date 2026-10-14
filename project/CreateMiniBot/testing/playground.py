@@ -10,6 +10,11 @@
 # - EMA Weights: apply Polyak averaged weights untuk smoother inference
 # - SOTA Stats: lihat spikes detected, self-corrections, hard samples
 #
+# 🆕 v2.3 Features:
+# - Metrics Display: loss, PPL, accuracy dengan interpretasi (di /status)
+# - Resume Info: tampilkan sisa epochs + tips commands
+# - Integration dengan weight_manager.get_last_metrics()
+#
 # Fitur Utama:
 # - BM25 Retrieval: otomatis ambil top-k paragraf relevan
 # - Query expansion fallback: sinonim jika retrieval gagal
@@ -25,10 +30,10 @@
 #   /training --epochs 10  : latih model 10 epoch
 #   /retrieve [query]      : test retrieval dengan query spesifik
 #   /context [on|off]      : toggle context injection
-#   /constrained [on|off]  : toggle constrained generation (NEW)
-#   /sota                  : lihat SOTA training stats (NEW)
-#   /apply-ema             : apply EMA weights ke model (NEW)
-#   /status                : tampilkan status model
+#   /constrained [on|off]  : toggle constrained generation
+#   /sota                  : lihat SOTA training stats
+#   /apply-ema             : apply EMA weights ke model
+#   /status                : tampilkan status model + metrics + resume info (v2.3)
 #   /exit                  : keluar
 #
 # Semua input tanpa prefix / dianggap sebagai prompt inference.
@@ -71,6 +76,59 @@ except ImportError:
     _RETRIEVER_AVAILABLE = False
 
 
+# ============================================================================
+# 🆕 v2.3: METRICS INTERPRETATION HELPER
+# ============================================================================
+
+def interpret_metrics(loss: float, accuracy: float) -> Dict[str, str]:
+    """
+    Interpretasi kualitas metrics.
+    
+    Returns:
+        Dict dengan keys: loss_status, acc_status, loss_emoji, acc_emoji
+    """
+    # Interpretasi loss
+    if loss <= 0.0:
+        loss_status = "Not trained yet"
+        loss_emoji = "⚪"
+    elif loss < 0.5:
+        loss_status = "Excellent"
+        loss_emoji = "✅"
+    elif loss < 1.0:
+        loss_status = "Good"
+        loss_emoji = "✅"
+    elif loss < 2.0:
+        loss_status = "Fair"
+        loss_emoji = "⚠️"
+    else:
+        loss_status = "Poor (need more training)"
+        loss_emoji = "❌"
+    
+    # Interpretasi accuracy
+    if accuracy <= 0.0:
+        acc_status = "Not trained yet"
+        acc_emoji = "⚪"
+    elif accuracy > 0.8:
+        acc_status = "Excellent"
+        acc_emoji = "✅"
+    elif accuracy > 0.6:
+        acc_status = "Good"
+        acc_emoji = "✅"
+    elif accuracy > 0.4:
+        acc_status = "Fair"
+        acc_emoji = "⚠️"
+    else:
+        acc_status = "Poor (need more training)"
+        acc_emoji = "❌"
+    
+    return {
+        "loss_status": loss_status,
+        "acc_status": acc_status,
+        "loss_emoji": loss_emoji,
+        "acc_emoji": acc_emoji,
+    }
+
+
 class Playground:
     """
     Tempat testing pertanyaan / inference dengan RAG + SOTA + Constrained Gen.
@@ -89,6 +147,7 @@ class Playground:
     - Context toggle untuk testing tanpa retrieval
     - Constrained toggle untuk creative mode
     - SOTA stats untuk monitoring training
+    - 🆕 v2.3: Metrics display + resume info
     """
 
     # ================================================================
@@ -129,13 +188,13 @@ class Playground:
         self._retriever: Optional[object] = None
         self._context_enabled: bool = True  # Toggle retrieval
         
-        # 🎯 NEW: Constrained generation toggle
+        # 🎯 Constrained generation toggle
         # Default: gunakan constrained jika model support
         self._constrained_enabled: bool = bool(
             getattr(config.model, 'use_constrained_generation', True)
         )
         
-        # 🎯 NEW: Track whether EMA has been applied
+        # Track whether EMA has been applied
         self._ema_applied: bool = False
         
         self._retrieval_stats: Dict[str, int] = {
@@ -289,20 +348,14 @@ class Playground:
             return None, []
 
     # ========================================================================
-    # 🎯 NEW: CONSTRAINED GENERATION HELPERS
+    # 🎯 CONSTRAINED GENERATION HELPERS
     # ========================================================================
 
     def _get_context_token_ids(self, context: str) -> List[int]:
-        """
-        Encode context ke token IDs untuk constrained generation.
-        
-        Returns:
-            List of token IDs (flattened, unique)
-        """
+        """Encode context ke token IDs untuk constrained generation."""
         if not context:
             return []
         
-        # Encode tanpa BOS/EOS - kita hanya mau content tokens
         context_ids = self.tokenizer.encode(
             context,
             add_bos=False,
@@ -325,13 +378,9 @@ class Playground:
         """
         Generate menggunakan constrained generation dari model.
         
-        Menggunakan model.generate_constrained() yang sudah ada di architecture.py
-        dengan cross-attention ke context embeddings.
-        
         Returns:
             (generated_ids, answer_text)
         """
-        # Encode context dan question
         context_ids = self._get_context_token_ids(context)
         question_ids = self.tokenizer.encode(
             question,
@@ -340,7 +389,6 @@ class Playground:
         )
         
         if not context_ids:
-            # Fallback ke standard generation
             return self._generate_standard(
                 question=question,
                 max_new_tokens=max_new_tokens,
@@ -351,7 +399,6 @@ class Playground:
                 min_new_tokens=min_new_tokens,
             )
         
-        # Use model's constrained generation method
         try:
             context_ids_np = np.array(context_ids, dtype=np.int64)
             question_ids_np = np.array(question_ids, dtype=np.int64)
@@ -370,7 +417,6 @@ class Playground:
             
             self._retrieval_stats["constrained_used"] += 1
             
-            # Decode answer
             answer_text = self.tokenizer.decode(
                 generated_ids,
                 skip_special_tokens=True,
@@ -403,12 +449,7 @@ class Playground:
         repetition_penalty: float = 1.3,
         min_new_tokens: int = 4,
     ) -> Tuple[List[int], str]:
-        """
-        Standard generation (tanpa constraints) dengan format RAG.
-        
-        Menggunakan cross-attention ke context jika tersedia.
-        """
-        # Format prompt dengan RAG template
+        """Standard generation dengan format RAG."""
         if context:
             actual_prompt = self.tokenizer.format_rag_prompt(
                 context=context,
@@ -416,10 +457,8 @@ class Playground:
                 include_context=True,
             )
         else:
-            # Tanpa context
             actual_prompt = f"Pertanyaan: {question} Jawaban:"
         
-        # Encode prompt
         prompt_ids = self.tokenizer.encode(
             actual_prompt,
             add_bos=True,
@@ -435,12 +474,10 @@ class Playground:
         max_new_tokens = max(0, int(max_new_tokens))
         min_new_tokens = max(0, int(min_new_tokens))
 
-        # Generation loop
         for step in range(max_new_tokens):
             context_window = current_ids[-self.max_context:]
             input_ids = np.array([context_window], dtype=np.int64)
 
-            # Forward dengan cross-attention ke context jika tersedia
             logits = self.model.forward(input_ids, training=False)
             next_logits = np.asarray(logits[0, -1, :], dtype=np.float32)
 
@@ -481,7 +518,6 @@ class Playground:
         generated_ids = current_ids[len(prompt_ids):]
         self._retrieval_stats["standard_used"] += 1
 
-        # Decode
         answer_text = self.tokenizer.decode_until_eos(
             generated_ids,
             skip_special_tokens=True,
@@ -524,9 +560,6 @@ class Playground:
             print("-" * 60)
             print("Prompt  :", prompt)
             
-            # ============================================================
-            # RAG INFO
-            # ============================================================
             if debug_retrieval:
                 context = rag_info.get("context")
                 retrieval_results = rag_info.get("retrieval_results", [])
@@ -543,9 +576,6 @@ class Playground:
                 
                 print(f"Mode    : {mode}")
             
-            # ============================================================
-            # DEBUG MODE
-            # ============================================================
             if debug_tokens:
                 print()
                 print("[DEBUG] Token IDs    :")
@@ -580,32 +610,14 @@ class Playground:
         min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
         return_debug: bool = False,
     ) -> Tuple[str, List[int], List[str], Dict]:
-        """
-        Membuat jawaban dari prompt dengan RAG + Constrained Generation.
-
-        RAG INFERENCE FLOW:
-        1. Retrieve top-k paragraf relevan dari corpus
-        2. Jika constrained mode aktif + context ada:
-           - Gunakan model.generate_constrained() dengan cross-attention
-           - Hanya tokens dari context yang bisa di-generate
-        3. Jika standard mode:
-           - Format prompt dengan RAG template
-           - Standard autoregressive generation
-        4. Stop saat EOS atau 
-        """
+        """Membuat jawaban dari prompt dengan RAG + Constrained Generation."""
         self._ensure_tokenizer_ready()
 
-        # ================================================================
-        # RAG RETRIEVAL
-        # ================================================================
         context, retrieval_results = self._retrieve_context(
             query=prompt,
             verbose=False,
         )
 
-        # ================================================================
-        # NO CONTEXT FALLBACK
-        # ================================================================
         if not context:
             rag_info = {
                 "context": None,
@@ -623,9 +635,6 @@ class Playground:
                 )
             return self.NO_CONTEXT_RESPONSE, [], [], rag_info
 
-        # ================================================================
-        # CONSTRAINED vs STANDARD GENERATION
-        # ================================================================
         use_constrained = (
             self._constrained_enabled
             and hasattr(self.model, 'generate_constrained')
@@ -656,14 +665,8 @@ class Playground:
             )
             generation_mode = "standard"
 
-        # ================================================================
-        # TOKEN PIECES (untuk debug)
-        # ================================================================
         token_pieces = self._get_token_pieces(generated_ids)
 
-        # ================================================================
-        # RAG INFO (untuk debug)
-        # ================================================================
         rag_info = {
             "context": context,
             "retrieval_results": retrieval_results,
@@ -706,7 +709,7 @@ class Playground:
     ) -> None:
         """Mode CLI interaktif."""
         print("=" * 70)
-        print("🎯 RAG Playground - SOTA + Constrained Generation")
+        print("🎯 RAG Playground - SOTA + Constrained Generation (v2.3)")
         print("=" * 70)
         print("Ketik prompt untuk inference.")
         print("Ketik /help untuk daftar perintah.")
@@ -724,6 +727,9 @@ class Playground:
             print(f">>> CONSTRAINED GEN: AKTIF (on-topic guaranteed) <<<")
         else:
             print(f">>> CONSTRAINED GEN: NONAKTIF (standard generation) <<<")
+
+        # 🆕 v2.3: Tampilkan resume info saat start interactive mode
+        self._print_resume_tips_on_start()
 
         print("=" * 70)
         print(f"temperature        : {temperature}")
@@ -753,9 +759,6 @@ class Playground:
             if not stripped:
                 continue
 
-            # ================================================================
-            # SLASH COMMANDS
-            # ================================================================
             if stripped.startswith("/"):
                 should_exit = self._handle_command(
                     command=stripped,
@@ -773,9 +776,6 @@ class Playground:
 
                 continue
 
-            # ================================================================
-            # PROMPT INFERENCE
-            # ================================================================
             print()
             answer, generated_ids, token_pieces, rag_info = self.generate(
                 prompt=stripped,
@@ -789,9 +789,6 @@ class Playground:
                 return_debug=True,
             )
 
-            # ============================================================
-            # RAG INFO
-            # ============================================================
             if debug_retrieval:
                 context = rag_info.get("context")
                 retrieval_results = rag_info.get("retrieval_results", [])
@@ -811,9 +808,6 @@ class Playground:
                 
                 print(f"[MODE] Generation: {gen_mode}")
 
-            # ============================================================
-            # DEBUG MODE
-            # ============================================================
             if debug_tokens:
                 print()
                 print("[DEBUG] Token IDs    :")
@@ -834,6 +828,62 @@ class Playground:
             print("Jawaban:", answer if answer else "(kosong)")
             print(f"[{len(generated_ids)} token dihasilkan]")
             print("-" * 70)
+
+    # ========================================================================
+    # 🆕 v2.3: RESUME TIPS ON START
+    # ========================================================================
+
+    def _print_resume_tips_on_start(self) -> None:
+        """
+        Print tips berdasarkan resume info saat interactive mode dimulai.
+        
+        Berguna setelah: python main.py --resume --interactive
+        """
+        if self.trainer is None:
+            return
+        
+        if not hasattr(self.trainer, 'get_resume_info'):
+            return
+        
+        try:
+            resume_info = self.trainer.get_resume_info()
+        except Exception:
+            return
+        
+        last_metrics = resume_info.get("last_metrics", {})
+        loss = last_metrics.get("loss", 0.0)
+        acc = last_metrics.get("accuracy", 0.0)
+        
+        # Skip jika belum ada training
+        if loss <= 0.0 and acc <= 0.0:
+            return
+        
+        remaining = resume_info.get("remaining_epochs", 0)
+        auto_stop = resume_info.get("auto_stop_triggered", False)
+        start_epoch = resume_info.get("start_epoch", 0)
+        total_epochs = resume_info.get("total_epochs_configured", 0)
+        
+        print()
+        print("📊 Last Training State (dari checkpoint):")
+        print(f"   Epoch    : {start_epoch} / {total_epochs}")
+        print(f"   Step     : {resume_info.get('global_step', 0):,}")
+        
+        interp = interpret_metrics(loss, acc)
+        print(f"   {interp['loss_emoji']} Loss     : {loss:.4f} ({interp['loss_status']})")
+        print(f"   📊 PPL     : {last_metrics.get('perplexity', 1.0):.4f}")
+        print(f"   {interp['acc_emoji']} Accuracy : {acc:.4f} ({interp['acc_status']})")
+        
+        print()
+        if auto_stop:
+            print("💡 Status: ✅ AUTO-STOP sudah triggered (target tercapai)")
+            print("   Model siap untuk inference. Gunakan prompt biasa untuk test.")
+        elif remaining > 0:
+            print(f"💡 Status: 🔄 Masih ada {remaining} epochs tersisa")
+            print(f"   Untuk lanjutkan training, ketik:")
+            print(f"   >>> /training --epochs {remaining}")
+        else:
+            print("💡 Status: ✅ Training sudah selesai (semua epochs dilalui)")
+            print("   Model siap untuk inference. Gunakan prompt biasa untuk test.")
 
     # ========================================================================
     # COMMAND HANDLER
@@ -878,7 +928,6 @@ class Playground:
             self._handle_context_command(parts)
             return False
 
-        # 🎯 NEW COMMANDS
         if cmd == "/constrained":
             self._handle_constrained_command(parts)
             return False
@@ -896,18 +945,11 @@ class Playground:
         return False
 
     # ========================================================================
-    # 🎯 NEW: CONSTRAINED COMMAND
+    # 🎯 CONSTRAINED COMMAND
     # ========================================================================
 
     def _handle_constrained_command(self, parts: List[str]) -> None:
-        """
-        Toggle constrained generation.
-        
-        Format:
-            /constrained          → tampilkan status
-            /constrained on       → aktifkan constrained generation
-            /constrained off      → nonaktifkan (standard mode)
-        """
+        """Toggle constrained generation."""
         if len(parts) < 2:
             status = "AKTIF" if self._constrained_enabled else "NONAKTIF"
             print(f"[playground] Constrained generation: {status}")
@@ -922,7 +964,6 @@ class Playground:
                 print("  📌 Benefit: Lebih flexible, tapi bisa hallucinate")
             return
         
-        # Check if model support constrained
         if not hasattr(self.model, 'generate_constrained'):
             print("[playground] ⚠️ Model tidak support constrained generation.")
             print("[playground]    Update core/architecture.py untuk enable feature ini.")
@@ -945,31 +986,19 @@ class Playground:
             print("[playground] Gunakan: /constrained on atau /constrained off")
 
     # ========================================================================
-    # 🎯 NEW: SOTA STATS COMMAND
+    # 🎯 SOTA STATS COMMAND
     # ========================================================================
 
     def _print_sota_stats(self) -> None:
-        """
-        Tampilkan SOTA training statistics dari trainer.
-        
-        Menampilkan:
-        - Spikes detected
-        - Self-corrections applied
-        - Hard samples retrained
-        - EMA weights status
-        - Cosine LR schedule
-        - Focal loss, AGC, curriculum stats
-        """
+        """Tampilkan SOTA training statistics dari trainer."""
         print("=" * 70)
         print("🎯 SOTA Training Statistics")
         print("=" * 70)
         
-        # Check if trainer has SOTA stats
         if self.trainer is None:
             print("[playground] ⚠️ Trainer tidak tersedia.")
             return
         
-        # Get SOTA stats jika tersedia
         if hasattr(self.trainer, 'get_sota_stats'):
             stats = self.trainer.get_sota_stats()
             print()
@@ -979,7 +1008,6 @@ class Playground:
             print(f"  Corrections applied        : {stats.get('corrections_applied', 0)}")
             print(f"  Hard samples retrained     : {stats.get('hard_samples_retrained', 0)}")
         
-        # Check training config untuk SOTA features aktif
         training_cfg = self.config.training
         print()
         print("⚙️ SOTA Features (dari config):")
@@ -999,7 +1027,6 @@ class Playground:
             status = "✅" if active else "❌"
             print(f"  {status} {name}")
         
-        # SOTA parameters
         print()
         print("🔧 SOTA Parameters:")
         params = [
@@ -1015,7 +1042,6 @@ class Playground:
         for name, value in params:
             print(f"  {name:30s}: {value}")
         
-        # EMA status
         print()
         print("🧠 EMA Weights Status:")
         if hasattr(self.trainer, '_ema_weights') and self.trainer._ema_weights is not None:
@@ -1029,16 +1055,11 @@ class Playground:
         print("=" * 70)
 
     # ========================================================================
-    # 🎯 NEW: APPLY EMA WEIGHTS
+    # 🎯 APPLY EMA WEIGHTS
     # ========================================================================
 
     def _apply_ema_weights(self) -> None:
-        """
-        Apply EMA (Exponential Moving Average) weights ke model.
-        
-        EMA weights adalah average dari semua weights selama training,
-        biasanya lebih smooth dan generalize lebih baik.
-        """
+        """Apply EMA weights ke model."""
         print("[playground] 🧠 Applying EMA weights...")
         
         if self.trainer is None:
@@ -1069,7 +1090,6 @@ class Playground:
             print("[playground] ⚠️ Retriever tidak tersedia.")
             return
         
-        # Ambil query dari args atau minta input
         if len(parts) >= 2:
             query = " ".join(parts[1:])
         else:
@@ -1107,7 +1127,6 @@ class Playground:
             print(f"[playground] Context injection: {status}")
             print(f"[playground] Gunakan: /context on atau /context off")
             
-            # Print stats
             print(f"\n[playground] Retrieval statistics:")
             for key, value in self._retrieval_stats.items():
                 print(f"  {key}: {value}")
@@ -1178,15 +1197,20 @@ class Playground:
                     print(f"[playground] Perplexity     : {last.get('perplexity', 0.0):.4f}")
                     print(f"[playground] Accuracy       : {last.get('accuracy', 0.0):.4f}")
                     
-                    # SOTA metrics
                     if 'top5_accuracy' in last:
                         print(f"[playground] Top-5 Acc      : {last.get('top5_accuracy', 0.0):.4f}")
                     if 'spikes' in last:
                         print(f"[playground] Spikes         : {last.get('spikes', 0)}")
                     
+                    # 🆕 v2.3: Tampilkan interpretasi metrics
+                    interp = interpret_metrics(last.get('loss', 0.0), last.get('accuracy', 0.0))
+                    print()
+                    print(f"[playground] 📊 Metrics Quality:")
+                    print(f"   {interp['loss_emoji']} Loss     : {interp['loss_status']}")
+                    print(f"   {interp['acc_emoji']} Accuracy : {interp['acc_status']}")
+                    
                     print("-" * 70)
                     
-                    # Reload retriever setelah training
                     self._setup_retriever()
                 else:
                     print("[playground] Training tidak menghasilkan history.")
@@ -1225,6 +1249,14 @@ class Playground:
                     print(f"[playground] Loss           : {report.get('loss', 0.0):.6f}")
                     print(f"[playground] Perplexity     : {report.get('perplexity', 0.0):.4f}")
                     print(f"[playground] Accuracy       : {report.get('accuracy', 0.0):.4f}")
+                    
+                    # 🆕 v2.3: Interpretasi
+                    interp = interpret_metrics(report.get('loss', 0.0), report.get('accuracy', 0.0))
+                    print()
+                    print(f"[playground] 📊 Metrics Quality:")
+                    print(f"   {interp['loss_emoji']} Loss     : {interp['loss_status']}")
+                    print(f"   {interp['acc_emoji']} Accuracy : {interp['acc_status']}")
+                    
                     print("-" * 70)
                     
                     self._setup_retriever()
@@ -1266,13 +1298,13 @@ class Playground:
         return result
 
     # ========================================================================
-    # STATUS (ENHANCED)
+    # STATUS (v2.3 ENHANCED - dengan metrics + resume info)
     # ========================================================================
 
     def _print_status(self) -> None:
-        """Tampilkan status model dengan SOTA info."""
+        """Tampilkan status model dengan SOTA info + metrics + resume info."""
         print("=" * 70)
-        print("📊 Status Model (RAG + SOTA)")
+        print("📊 Status Model (RAG + SOTA) — v2.3")
         print("=" * 70)
 
         print(f"  Parameter count : {self.model.parameter_count():,}")
@@ -1281,21 +1313,19 @@ class Playground:
         print(f"  Trainer         : {'✅ Tersedia' if self.trainer is not None else '❌ Tidak tersedia'}")
         print(f"  Retriever       : {'✅ Tersedia' if self._retriever is not None else '❌ Tidak tersedia'}")
         
-        # 🎯 NEW: Feature flags
+        # Features
         print()
         print("  🎯 Features:")
         print(f"    Context enabled     : {self._context_enabled}")
         print(f"    Constrained gen     : {self._constrained_enabled}")
         print(f"    EMA applied         : {self._ema_applied}")
         
-        # Cross-attention support
         has_cross_attn = hasattr(self.model, 'cross_attention_layer_indices')
         print(f"    Cross-attention     : {has_cross_attn}")
         if has_cross_attn:
             n_cross = len(self.model.cross_attention_layer_indices)
             print(f"      Layers            : {n_cross} ({sorted(self.model.cross_attention_layer_indices)})")
         
-        # Constrained gen support
         has_constrained = hasattr(self.model, 'generate_constrained')
         print(f"    Constrained gen API : {has_constrained}")
         
@@ -1314,13 +1344,66 @@ class Playground:
             print("  🏋️ Training Stats:")
             wm = self.trainer.weight_manager
             print(f"    Optimizer step  : {wm.step_count}")
-            print(f"    Global step     : {getattr(wm, 'global_step', 0)}")
+            print(f"    Global step     : {getattr(wm, 'global_step', 0):,}")
             print(f"    Last epoch      : {getattr(wm, 'last_epoch', 0)}")
             print(f"    Learning rate   : {wm.learning_rate:.2e}")
-
+            
+            # 🆕 v2.3: METRICS (loss, PPL, accuracy) dengan interpretasi
+            if hasattr(wm, 'get_last_metrics'):
+                last_metrics = wm.get_last_metrics()
+                loss = last_metrics.get("loss", 0.0)
+                ppl = last_metrics.get("perplexity", 1.0)
+                acc = last_metrics.get("accuracy", 0.0)
+                
+                if loss > 0 or acc > 0:
+                    interp = interpret_metrics(loss, acc)
+                    
+                    print()
+                    print("  📈 Last Training Metrics:")
+                    print(f"    {interp['loss_emoji']} Loss       : {loss:.6f} ({interp['loss_status']})")
+                    print(f"    📊 Perplexity : {ppl:.4f}")
+                    print(f"    {interp['acc_emoji']} Accuracy   : {acc:.4f} ({interp['acc_status']})")
+                else:
+                    print()
+                    print("  📈 Last Training Metrics:")
+                    print(f"    ⚪ Belum ada training (metrics = 0)")
+        
         # QA samples info
         if self.trainer is not None and hasattr(self.trainer, "qa_samples"):
+            print()
+            print(f"  📦 Dataset:")
             print(f"    QA samples      : {len(self.trainer.qa_samples):,}")
+        
+        # 🆕 v2.3: RESUME INFO
+        if self.trainer is not None and hasattr(self.trainer, 'get_resume_info'):
+            try:
+                resume_info = self.trainer.get_resume_info()
+                remaining = resume_info.get("remaining_epochs", 0)
+                auto_stop = resume_info.get("auto_stop_triggered", False)
+                start_epoch = resume_info.get("start_epoch", 0)
+                total_epochs = resume_info.get("total_epochs_configured", 0)
+                
+                print()
+                print("  🎯 Resume Status:")
+                print(f"    Current epoch   : {start_epoch} / {total_epochs}")
+                print(f"    Global step     : {resume_info.get('global_step', 0):,}")
+                
+                if auto_stop:
+                    print(f"    Status          : ✅ AUTO-STOP (target tercapai)")
+                    print(f"    Remaining       : 0 epochs (selesai)")
+                elif remaining > 0:
+                    print(f"    Status          : 🔄 Incomplete")
+                    print(f"    Remaining       : {remaining} epochs")
+                    print(f"    💡 Tip          : /training --epochs {remaining}")
+                else:
+                    if start_epoch > 0:
+                        print(f"    Status          : ✅ Completed")
+                        print(f"    Remaining       : 0 epochs (selesai)")
+                    else:
+                        print(f"    Status          : ⚪ Not started")
+                        print(f"    💡 Tip          : /training --epochs {total_epochs}")
+            except Exception:
+                pass
 
         # Retrieval stats (inference session)
         print()
@@ -1337,7 +1420,7 @@ class Playground:
     def _print_help(self) -> None:
         """Tampilkan bantuan perintah interactive."""
         print("=" * 70)
-        print("🎯 Bantuan RAG Playground (SOTA + Constrained)")
+        print("🎯 Bantuan RAG Playground (SOTA + Constrained) v2.3")
         print("=" * 70)
         print()
         print("Ketik prompt apa saja untuk inference dengan RAG + Constrained Gen.")
@@ -1372,7 +1455,7 @@ class Playground:
         print("  /training --steps N    : latih N steps")
         print()
         print("  📊 Informasi:")
-        print("  /status                : tampilkan status lengkap")
+        print("  /status                : tampilkan status + metrics + resume info")
         print("  /exit                  : keluar dari playground")
         print()
         print("🎯 CONSTRAINED GENERATION EXPLAINED:")
@@ -1397,6 +1480,11 @@ class Playground:
         print("  - Self-Correction Loop (DeepMind)")
         print("  - EMA Weights (Polyak Averaging)")
         print()
+        print("🆕 v2.3 NEW:")
+        print("  - /status menampilkan metrics (loss, PPL, accuracy) + interpretasi")
+        print("  - /status menampilkan resume info (sisa epochs + tips)")
+        print("  - Auto-detect training state saat start interactive")
+        print()
         print("FLOW INFERENCE:")
         print("  Query → BM25 Retrieval → Context → Constrained Gen → Jawaban On-Topic")
         print()
@@ -1412,9 +1500,7 @@ class Playground:
             self.tokenizer.load()
 
     def _get_forbidden_ids(self) -> List[int]:
-        """
-        Token yang tidak boleh dihasilkan saat sampling.
-        """
+        """Token yang tidak boleh dihasilkan saat sampling."""
         if self._forbidden_cache is not None:
             return self._forbidden_cache
 
@@ -1770,4 +1856,4 @@ if __name__ == "__main__":
                 debug_retrieval=not args.no_debug_retrieval,
             )
 
-        print("\ntesting/playground.py (RAG + SOTA + Constrained) test OK")
+        print("\ntesting/playground.py (RAG + SOTA + Constrained + v2.3 metrics) test OK")

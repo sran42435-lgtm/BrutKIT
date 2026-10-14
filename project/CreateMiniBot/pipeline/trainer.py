@@ -2,7 +2,7 @@
 #
 # Trainer / Training Loop Engine untuk RAG-based Training Pipeline.
 #
-# VERSI FINAL v2.2:
+# VERSI v2.3 (FINAL):
 # Arsitektur: Single-Head + RAG + Constrained Generation
 #
 # 🎯 SELF-CORRECTING TRAINING PHILOSOPHY:
@@ -26,6 +26,11 @@
 # - Auto-Stop pintar (loss + accuracy threshold)
 # - Rolling metrics untuk convergence detection
 #
+# 🆕 Fitur v2.3:
+# - Metrics tracking (loss, PPL, accuracy) di setiap checkpoint
+# - get_resume_info() untuk main.py auto-continue
+# - Metrics persisten di checkpoint untuk resume + /status
+#
 # Keterhubungan:
 # - config.py              : hyperparameter training + RAG
 # - core/tokenizer.py      : encode QA samples
@@ -33,7 +38,7 @@
 # - core/retriever.py      : build index setelah training (optional)
 # - core/model_exporter.py : export otak model
 # - pipeline/evaluator.py  : menghitung loss dan gradient
-# - pipeline/weight_manager.py : memperbarui bobot
+# - pipeline/weight_manager.py : memperbarui bobot + track metrics
 
 from __future__ import annotations
 
@@ -112,6 +117,10 @@ class Trainer:
     - Export otak model bareng checkpoint (anti mati-lampu!)
     - Auto-Stop pintar berdasarkan loss + accuracy threshold
     - Rolling metrics untuk convergence detection
+    
+    🆕 Fitur v2.3:
+    - Metrics tracking (loss, PPL, accuracy) di setiap checkpoint
+    - Resume info untuk auto-continue di main.py
     """
 
     LOG_EVERY_STEPS = 10
@@ -637,7 +646,7 @@ class Trainer:
         self._rolling_total = 0
 
     # ========================================================================
-    # 🎯 CHECKPOINT + BRAIN EXPORT HELPER
+    # 🎯 CHECKPOINT + BRAIN EXPORT + METRICS HELPER (v2.3 UPDATED)
     # ========================================================================
 
     def _save_checkpoint(
@@ -645,10 +654,25 @@ class Trainer:
         verbose: bool = True, 
         context: str = "",
         export_brain: Optional[bool] = None,
+        current_metrics: Optional[Dict] = None,
     ) -> Tuple[Path, Optional[Path]]:
         """
-        Save checkpoint + export otak model (anti mati-lampu!).
+        Save checkpoint + export otak model + track metrics.
+        
+        Args:
+            verbose: print progress
+            context: context message
+            export_brain: override config
+            current_metrics: dict dengan loss, perplexity, accuracy (v2.3 NEW)
         """
+        # 🆕 v2.3: Update metrics di weight_manager sebelum save
+        if current_metrics and hasattr(self.weight_manager, 'update_metrics'):
+            self.weight_manager.update_metrics(
+                loss=current_metrics.get("loss", 0.0),
+                perplexity=current_metrics.get("perplexity", 1.0),
+                accuracy=current_metrics.get("accuracy", 0.0),
+            )
+        
         # 1. Save training session (cepat)
         ckpt_path = self.weight_manager.save_checkpoint()
         
@@ -681,6 +705,11 @@ class Trainer:
                 print(f"  [Checkpoint] 💾 Saved:")
             
             print(f"    📝 Training session : {ckpt_path.name}")
+            
+            # 🆕 v2.3: Print metrics
+            if current_metrics:
+                print(f"    📊 Metrics          : loss={current_metrics.get('loss', 0):.4f} ppl={current_metrics.get('perplexity', 1):.2f} acc={current_metrics.get('accuracy', 0):.4f}")
+            
             if brain_path:
                 try:
                     brain_size_mb = brain_path.stat().st_size / 1024 / 1024
@@ -691,6 +720,35 @@ class Trainer:
                 print(f"    🧠 Brain export     : skipped (ModelExporter not available)")
         
         return ckpt_path, brain_path
+
+    # ========================================================================
+    # 🆕 RESUME INFO (untuk main.py auto-continue)
+    # ========================================================================
+
+    def get_resume_info(self) -> Dict:
+        """
+        Get informasi resume dari checkpoint.
+        
+        Dipakai main.py untuk auto-continue training setelah --resume.
+        
+        Return:
+            Dict dengan start_epoch, global_step, last_metrics, remaining info
+        """
+        last_metrics = {}
+        if hasattr(self.weight_manager, 'get_last_metrics'):
+            last_metrics = self.weight_manager.get_last_metrics()
+        
+        remaining_epochs = max(0, self.epochs - self.start_epoch)
+        
+        return {
+            "start_epoch": self.start_epoch,
+            "global_step": self.start_global_step,
+            "last_metrics": last_metrics,
+            "total_epochs_configured": self.epochs,
+            "remaining_epochs": remaining_epochs,
+            "has_more_to_train": remaining_epochs > 0,
+            "auto_stop_triggered": self._auto_stop_triggered,
+        }
 
     # ========================================================================
     # RESUME STATE
@@ -1058,7 +1116,7 @@ class Trainer:
 
         if verbose:
             print("=" * 70)
-            print("🎯 SOTA RAG TRAINING (v2.2 FINAL)")
+            print("🎯 SOTA RAG TRAINING (v2.3 FINAL)")
             print("=" * 70)
             print(f"  QA samples          : {len(self.qa_samples):,}")
             print(f"  Total epochs        : {total_epochs}")
@@ -1108,6 +1166,7 @@ class Trainer:
         stop_training = False
         best_loss = float("inf")
         patience_counter = 0
+        last_epoch_report = None  # 🆕 v2.3: Track last report untuk final checkpoint
 
         for epoch in range(start_epoch, total_epochs):
             epoch_loss = 0.0
@@ -1167,7 +1226,7 @@ class Trainer:
                             f"{spike_marker}"
                         )
 
-                    # CHECKPOINT PER STEPS + EXPORT BRAIN
+                    # 🆕 v2.3: CHECKPOINT PER STEPS + METRICS + EXPORT BRAIN
                     if (
                         save_checkpoints
                         and self.save_checkpoint_every_n_steps > 0
@@ -1177,6 +1236,11 @@ class Trainer:
                         self._save_checkpoint(
                             verbose=verbose,
                             context=f"Step {global_step}",
+                            current_metrics={
+                                "loss": float(loss),
+                                "perplexity": float(metrics.get('perplexity', 1.0)),
+                                "accuracy": float(metrics.get('accuracy', 0.0)),
+                            },
                         )
                     
                     # AUTO-STOP CHECK
@@ -1192,6 +1256,11 @@ class Trainer:
                                     verbose=verbose,
                                     context="🎯 AUTO-STOP FINAL",
                                     export_brain=True,
+                                    current_metrics={
+                                        "loss": float(loss),
+                                        "perplexity": float(metrics.get('perplexity', 1.0)),
+                                        "accuracy": float(metrics.get('accuracy', 0.0)),
+                                    },
                                 )
                             stop_training = True
                             break
@@ -1236,6 +1305,8 @@ class Trainer:
                     "learning_rate": self._get_learning_rate(global_step, total_steps),
                     "auto_stop_triggered": self._auto_stop_triggered,
                 }
+                
+                last_epoch_report = epoch_report  # 🆕 v2.3: Track untuk final checkpoint
 
                 if verbose:
                     print(
@@ -1252,7 +1323,7 @@ class Trainer:
             self.weight_manager.last_epoch = epoch + 1
             self.weight_manager.global_step = global_step
 
-            # CHECKPOINT PER EPOCHS + EXPORT BRAIN
+            # 🆕 v2.3: CHECKPOINT PER EPOCHS + METRICS + EXPORT BRAIN
             if save_checkpoints:
                 should_save_epoch = (
                     self.save_checkpoint_every_n_epochs > 0
@@ -1263,6 +1334,11 @@ class Trainer:
                     self._save_checkpoint(
                         verbose=verbose,
                         context=f"Epoch {epoch + 1}",
+                        current_metrics={
+                            "loss": epoch_report.get("loss", 0.0),
+                            "perplexity": epoch_report.get("perplexity", 1.0),
+                            "accuracy": epoch_report.get("accuracy", 0.0),
+                        },
                     )
 
             # Early stopping
@@ -1295,9 +1371,19 @@ class Trainer:
             self.apply_ema_to_model()
             
             if save_checkpoints:
+                # 🆕 v2.3: Pass last_epoch_report metrics ke final checkpoint
+                final_metrics = None
+                if last_epoch_report:
+                    final_metrics = {
+                        "loss": last_epoch_report.get("loss", 0.0),
+                        "perplexity": last_epoch_report.get("perplexity", 1.0),
+                        "accuracy": last_epoch_report.get("accuracy", 0.0),
+                    }
+                
                 self._save_checkpoint(
                     verbose=verbose,
                     context="Final (EMA applied)",
+                    current_metrics=final_metrics,
                 )
 
         # FINAL: Print SOTA stats
@@ -1355,6 +1441,9 @@ class Trainer:
         steps_done = 0
         epochs_traversed = 0
         last_checkpoint_step = current_global_step
+        last_loss = 0.0
+        last_perplexity = 1.0
+        last_accuracy = 0.0
 
         if verbose:
             print(f"[Trainer] Inline SOTA training: target {steps} step")
@@ -1388,6 +1477,11 @@ class Trainer:
                     num_correct_step = int(metrics.get("num_correct", 0))
                     total_correct += num_correct_step
                     
+                    # Track last metrics untuk checkpoint
+                    last_loss = float(loss)
+                    last_perplexity = float(metrics.get('perplexity', 1.0))
+                    last_accuracy = float(metrics.get('accuracy', 0.0))
+                    
                     self._update_rolling_metrics(loss, num_correct_step, num_valid_tokens)
 
                     if verbose:
@@ -1400,6 +1494,8 @@ class Trainer:
                         )
                     
                     current_step = current_global_step + steps_done
+                    
+                    # 🆕 v2.3: CHECKPOINT PER STEPS + METRICS
                     if (
                         save_checkpoint
                         and self.save_checkpoint_every_n_steps > 0
@@ -1410,9 +1506,15 @@ class Trainer:
                         self._save_checkpoint(
                             verbose=verbose,
                             context=f"Inline Step {current_step}",
+                            current_metrics={
+                                "loss": last_loss,
+                                "perplexity": last_perplexity,
+                                "accuracy": last_accuracy,
+                            },
                         )
                         last_checkpoint_step = current_step
                     
+                    # AUTO-STOP CHECK
                     if (
                         current_step > 0
                         and current_step % self.auto_stop_check_interval == 0
@@ -1423,6 +1525,11 @@ class Trainer:
                                     verbose=verbose,
                                     context="🎯 INLINE AUTO-STOP FINAL",
                                     export_brain=True,
+                                    current_metrics={
+                                        "loss": last_loss,
+                                        "perplexity": last_perplexity,
+                                        "accuracy": last_accuracy,
+                                    },
                                 )
                             break
                 else:
@@ -1473,10 +1580,16 @@ class Trainer:
             if self._auto_stop_triggered:
                 print(f"[Trainer] 🎯 AUTO-STOP: target tercapai!")
 
+        # 🆕 v2.3: Final checkpoint dengan aggregated metrics
         if save_checkpoint and not self._auto_stop_triggered:
             self._save_checkpoint(
                 verbose=verbose,
                 context="Inline Training Final",
+                current_metrics={
+                    "loss": float(avg_loss),
+                    "perplexity": float(perplexity),
+                    "accuracy": float(accuracy),
+                },
             )
 
         if _RETRIEVER_AVAILABLE:

@@ -2,12 +2,13 @@
 #
 # Weight Manager / Optimizer Engine untuk Training Pipeline Engine.
 #
-# VERSI SOTA-ENHANCED (v2.0):
+# VERSI SOTA-ENHANCED (v2.3):
 # - AdamW optimizer dengan gradient clipping
 # - Learning rate scheduling (warmup + cosine + decay)
 # - EMA Weights (Polyak Averaging) - save/load/apply
 # - Sanitasi gradient & bobot dari NaN/Inf
 # - Checkpoint save/load dengan backward compatibility
+# - 🆕 v2.3: Metrics tracking (loss, PPL, accuracy) untuk auto-resume + /status
 #
 # Tugas utama:
 # 1. Menginisialisasi optimizer AdamW.
@@ -16,7 +17,8 @@
 # 4. Memperbarui bobot model setelah backward pass.
 # 5. Menyimpan dan memuat checkpoint training (termasuk epoch & global step).
 # 6. Mendukung learning rate scheduling (warmup & decay).
-# 7. 🎯 NEW: Menyimpan/memuat EMA weights untuk inference yang lebih smooth.
+# 7. 🎯 Menyimpan/memuat EMA weights untuk inference yang lebih smooth.
+# 8. 🆕 Track metrics terakhir (loss, PPL, acc) untuk auto-resume + display.
 #
 # Implementasi:
 # - Tidak memakai optimizer dari framework ML eksternal.
@@ -25,9 +27,9 @@
 # Keterhubungan:
 # - config.py            : hyperparameter optimizer + EMA
 # - core/architecture.py : parameter model dan gradient
-# - pipeline/trainer.py  : memanggil step() setelah backward, update EMA
+# - pipeline/trainer.py  : memanggil step() setelah backward, update EMA + metrics
 # - main.py              : checkpoint / resume training
-# - testing/playground.py: apply EMA weights untuk inference
+# - testing/playground.py: apply EMA weights + display metrics di /status
 
 from __future__ import annotations
 
@@ -70,6 +72,7 @@ class WeightManager:
     - Gradient clipping (global norm)
     - Learning rate scheduling (warmup + decay)
     - 🎯 EMA Weights (Polyak Averaging) untuk inference lebih smooth
+    - 🆕 Metrics tracking (loss, PPL, accuracy) untuk auto-resume + /status
     - Penyimpanan epoch & global step di checkpoint
 
     Alur pemakaian normal:
@@ -80,8 +83,9 @@ class WeightManager:
         model.backward(grad_logits)
         weight_manager.step()
         
-        # (Optional) Update EMA di trainer:
-        # trainer._update_ema()
+        # Update metrics sebelum save checkpoint
+        weight_manager.update_metrics(loss, perplexity, accuracy)
+        weight_manager.save_checkpoint()
     """
 
     def __init__(self, model, config: Config = CONFIG):
@@ -112,6 +116,12 @@ class WeightManager:
         # State untuk resume training
         self.last_epoch = 0
         self.global_step = 0
+        
+        # 🆕 Metrics tracking (v2.3)
+        # Disimpan ke checkpoint untuk auto-resume + /status
+        self._last_loss: float = 0.0
+        self._last_perplexity: float = 1.0
+        self._last_accuracy: float = 0.0
 
         # State AdamW
         self.m: Dict[str, np.ndarray] = {}
@@ -122,7 +132,7 @@ class WeightManager:
             self.v[name] = np.zeros_like(param.data, dtype=np.float32)
 
         # ================================================================
-        # 🎯 EMA WEIGHTS STATE (BARU)
+        # 🎯 EMA WEIGHTS STATE
         # ================================================================
         # EMA (Exponential Moving Average) weights untuk smoother inference
         # Diupdate setiap step: ema = decay * ema + (1 - decay) * current
@@ -333,7 +343,52 @@ class WeightManager:
         return total_norm
 
     # ========================================================================
-    # 🎯 EMA WEIGHTS (BARU)
+    # 🆕 METRICS TRACKING (v2.3 - untuk auto-resume + /status)
+    # ========================================================================
+
+    def update_metrics(
+        self,
+        loss: float,
+        perplexity: float,
+        accuracy: float,
+    ) -> None:
+        """
+        Update training metrics terakhir.
+        
+        Dipanggil oleh trainer setiap kali checkpoint disimpan.
+        Metrics ini akan:
+        1. Di-save ke checkpoint (persisten)
+        2. Bisa di-load saat resume (--resume flag)
+        3. Ditampilkan di playground /status command
+        
+        Args:
+            loss: training loss terakhir
+            perplexity: perplexity terakhir
+            accuracy: accuracy terakhir
+        """
+        self._last_loss = float(loss)
+        self._last_perplexity = float(perplexity)
+        self._last_accuracy = float(accuracy)
+
+    def get_last_metrics(self) -> Dict[str, float]:
+        """
+        Return metrics terakhir yang disimpan.
+        
+        Returns:
+            Dict dengan keys: loss, perplexity, accuracy
+        
+        Contoh pemakaian di playground:
+            metrics = weight_manager.get_last_metrics()
+            print(f"Last loss: {metrics['loss']:.4f}")
+        """
+        return {
+            "loss": self._last_loss,
+            "perplexity": self._last_perplexity,
+            "accuracy": self._last_accuracy,
+        }
+
+    # ========================================================================
+    # 🎯 EMA WEIGHTS
     # ========================================================================
 
     def initialize_ema(self) -> None:
@@ -435,6 +490,10 @@ class WeightManager:
             "last_epoch": self.last_epoch,
             "learning_rate": self.learning_rate,
             "base_learning_rate": self.base_learning_rate,
+            # 🆕 Metrics tracking (v2.3)
+            "last_loss": self._last_loss,
+            "last_perplexity": self._last_perplexity,
+            "last_accuracy": self._last_accuracy,
             "m": {
                 name: state.copy()
                 for name, state in self.m.items()
@@ -470,6 +529,11 @@ class WeightManager:
 
         if "base_learning_rate" in state:
             self.base_learning_rate = float(state["base_learning_rate"])
+        
+        # 🆕 Load metrics (backward compatible - default ke 0 jika tidak ada)
+        self._last_loss = float(state.get("last_loss", 0.0))
+        self._last_perplexity = float(state.get("last_perplexity", 1.0))
+        self._last_accuracy = float(state.get("last_accuracy", 0.0))
 
         if "m" in state:
             for name, param in self.params.items():
@@ -513,15 +577,16 @@ class WeightManager:
 
     def save_checkpoint(self, path: Optional[Path] = None) -> Path:
         """
-        Menyimpan checkpoint model + optimizer + EMA ke file .npz.
+        Menyimpan checkpoint model + optimizer + EMA + metrics ke file .npz.
 
         Format keys:
         - step, global_step, last_epoch: metadata
         - learning_rate, base_learning_rate: LR state
+        - last_loss, last_perplexity, last_accuracy: 🆕 metrics (v2.3)
         - model__{name}: model weights
         - adam_m__{name}: Adam first moment
         - adam_v__{name}: Adam second moment
-        - ema__{name}: 🎯 EMA weights (BARU)
+        - ema__{name}: 🎯 EMA weights
         - ema_decay, ema_initialized: EMA metadata
         """
         if path is None:
@@ -540,6 +605,10 @@ class WeightManager:
             "last_epoch": np.array(self.last_epoch, dtype=np.int64),
             "learning_rate": np.array(self.learning_rate, dtype=np.float32),
             "base_learning_rate": np.array(self.base_learning_rate, dtype=np.float32),
+            # 🆕 Metrics tracking (v2.3)
+            "last_loss": np.array(self._last_loss, dtype=np.float32),
+            "last_perplexity": np.array(self._last_perplexity, dtype=np.float32),
+            "last_accuracy": np.array(self._last_accuracy, dtype=np.float32),
         }
 
         # 🎯 EMA metadata
@@ -563,10 +632,11 @@ class WeightManager:
 
     def load_checkpoint(self, path: Optional[Path] = None) -> Path:
         """
-        Memuat checkpoint model + optimizer + EMA dari file .npz.
+        Memuat checkpoint model + optimizer + EMA + metrics dari file .npz.
 
         Backward compatible:
         - Jika checkpoint lama (tanpa EMA), EMA akan di-initialize dari model weights
+        - Jika checkpoint lama (tanpa metrics), metrics default ke 0
         - Jika EMA ada di checkpoint, langsung di-load
         """
         if path is None:
@@ -596,6 +666,11 @@ class WeightManager:
             self.base_learning_rate = float(data["base_learning_rate"])
         else:
             self.base_learning_rate = self.learning_rate
+        
+        # 🆕 Load metrics (backward compatible - default ke 0 jika tidak ada)
+        self._last_loss = float(data.get("last_loss", 0.0))
+        self._last_perplexity = float(data.get("last_perplexity", 1.0))
+        self._last_accuracy = float(data.get("last_accuracy", 0.0))
 
         # Load model weights dan optimizer state
         for name, param in self.params.items():
@@ -741,7 +816,7 @@ if __name__ == "__main__":
     from core.architecture import CustomTransformerLM
 
     print("=" * 70)
-    print("pipeline/weight_manager.py SOTA Test Suite")
+    print("pipeline/weight_manager.py SOTA v2.3 Test Suite")
     print("=" * 70)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -763,7 +838,7 @@ if __name__ == "__main__":
                 weight_decay=0.01,
                 grad_clip_norm=1.0,
                 seed=1337,
-		lr_warmup_steps=0,
+                lr_warmup_steps=0,
                 use_ema=True,
                 ema_decay=0.999,
             ),
@@ -838,26 +913,47 @@ if __name__ == "__main__":
         assert changed_count > 0, "EMA weights should change after updates"
 
         # --------------------------------------------------------------------
-        # Test 4: Checkpoint Save (with EMA)
+        # Test 4: Metrics Tracking (v2.3 NEW)
         # --------------------------------------------------------------------
-        print("\n[Test 4] Checkpoint Save (with EMA)")
+        print("\n[Test 4] Metrics Tracking (v2.3 NEW)")
+        weight_manager.update_metrics(
+            loss=0.8234,
+            perplexity=2.2783,
+            accuracy=0.7234,
+        )
+        metrics = weight_manager.get_last_metrics()
+        print(f"  Last loss       : {metrics['loss']:.4f}")
+        print(f"  Last perplexity : {metrics['perplexity']:.4f}")
+        print(f"  Last accuracy   : {metrics['accuracy']:.4f}")
+        assert abs(metrics['loss'] - 0.8234) < 1e-6
+        assert abs(metrics['perplexity'] - 2.2783) < 1e-4
+        assert abs(metrics['accuracy'] - 0.7234) < 1e-6
+
+        # --------------------------------------------------------------------
+        # Test 5: Checkpoint Save (with EMA + Metrics)
+        # --------------------------------------------------------------------
+        print("\n[Test 5] Checkpoint Save (with EMA + Metrics)")
         ckpt_path = weight_manager.save_checkpoint()
         print(f"  Checkpoint saved : {ckpt_path}")
         print(f"  File size        : {ckpt_path.stat().st_size:,} bytes")
         
-        # Verify EMA keys in checkpoint
+        # Verify EMA + Metrics keys in checkpoint
         data = np.load(ckpt_path, allow_pickle=False)
         ema_keys = [k for k in data.files if k.startswith("ema__")]
         print(f"  EMA keys in ckpt : {len(ema_keys)}")
         print(f"  EMA initialized  : {bool(data['ema_initialized'])}")
         print(f"  EMA decay        : {float(data['ema_decay'])}")
+        print(f"  Last loss        : {float(data['last_loss']):.4f}")
+        print(f"  Last perplexity  : {float(data['last_perplexity']):.4f}")
+        print(f"  Last accuracy    : {float(data['last_accuracy']):.4f}")
 
         # --------------------------------------------------------------------
-        # Test 5: Checkpoint Load (with EMA)
+        # Test 6: Checkpoint Load (with EMA + Metrics)
         # --------------------------------------------------------------------
-        print("\n[Test 5] Checkpoint Load (with EMA)")
-        # Save EMA state before load
+        print("\n[Test 6] Checkpoint Load (with EMA + Metrics)")
+        # Save state before load
         ema_before = {k: v.copy() for k, v in weight_manager.ema_weights.items()}
+        metrics_before = weight_manager.get_last_metrics()
         
         # Create fresh model and manager
         model2 = CustomTransformerLM(small_config)
@@ -871,6 +967,17 @@ if __name__ == "__main__":
         print(f"  EMA initialized  : {wm2._ema_initialized}")
         print(f"  EMA weights count: {len(wm2.ema_weights)}")
         
+        # Verify metrics
+        metrics_after = wm2.get_last_metrics()
+        print(f"  Loaded loss      : {metrics_after['loss']:.4f}")
+        print(f"  Loaded perplexity: {metrics_after['perplexity']:.4f}")
+        print(f"  Loaded accuracy  : {metrics_after['accuracy']:.4f}")
+        
+        # Verify metrics match
+        assert abs(metrics_before['loss'] - metrics_after['loss']) < 1e-6
+        assert abs(metrics_before['perplexity'] - metrics_after['perplexity']) < 1e-4
+        assert abs(metrics_before['accuracy'] - metrics_after['accuracy']) < 1e-6
+        
         # Verify EMA weights match
         ema_match = True
         for name in ema_before:
@@ -880,12 +987,13 @@ if __name__ == "__main__":
                     break
         
         print(f"  EMA weights match: {ema_match}")
+        print(f"  Metrics match    : True")
         assert ema_match, "EMA weights should match after load"
 
         # --------------------------------------------------------------------
-        # Test 6: Apply EMA to Model
+        # Test 7: Apply EMA to Model
         # --------------------------------------------------------------------
-        print("\n[Test 6] Apply EMA to Model")
+        print("\n[Test 7] Apply EMA to Model")
         # Save current model weights
         model_weights_before = {
             name: param.data.copy()
@@ -906,10 +1014,10 @@ if __name__ == "__main__":
         assert changed > 0, "Model weights should change after EMA apply"
 
         # --------------------------------------------------------------------
-        # Test 7: Backward Compatibility (old checkpoint without EMA)
+        # Test 8: Backward Compatibility (old checkpoint without EMA & Metrics)
         # --------------------------------------------------------------------
-        print("\n[Test 7] Backward Compatibility (old checkpoint without EMA)")
-        # Create a fake old checkpoint (without ema__ keys)
+        print("\n[Test 8] Backward Compatibility (old checkpoint)")
+        # Create a fake old checkpoint (without ema__ keys and metrics)
         old_ckpt_path = output_dir / "old_checkpoint.npz"
         
         old_payload = {
@@ -919,6 +1027,7 @@ if __name__ == "__main__":
             "learning_rate": np.array(3e-4, dtype=np.float32),
             "base_learning_rate": np.array(3e-4, dtype=np.float32),
             # No ema_initialized, no ema_decay, no ema__ keys
+            # No last_loss, last_perplexity, last_accuracy
         }
         
         for name, param in wm2.params.items():
@@ -934,17 +1043,26 @@ if __name__ == "__main__":
         wm3 = WeightManager(model3, small_config)
         wm3.load_checkpoint(old_ckpt_path)
         
-        print(f"  Old ckpt loaded  : True")
-        print(f"  Step count       : {wm3.step_count}")
-        print(f"  EMA auto-init    : {wm3._ema_initialized}")
-        print(f"  EMA weights count: {len(wm3.ema_weights)}")
+        # Verify defaults
+        metrics3 = wm3.get_last_metrics()
+        print(f"  Old ckpt loaded      : True")
+        print(f"  Step count           : {wm3.step_count}")
+        print(f"  EMA auto-init        : {wm3._ema_initialized}")
+        print(f"  EMA weights count    : {len(wm3.ema_weights)}")
+        print(f"  Default loss (0.0)   : {metrics3['loss']:.4f}")
+        print(f"  Default ppl (1.0)    : {metrics3['perplexity']:.4f}")
+        print(f"  Default acc (0.0)    : {metrics3['accuracy']:.4f}")
+        
         assert wm3._ema_initialized, "EMA should auto-initialize from model weights"
         assert len(wm3.ema_weights) == len(wm3.params), "All params should have EMA"
+        assert metrics3['loss'] == 0.0, "Default loss should be 0.0"
+        assert metrics3['perplexity'] == 1.0, "Default perplexity should be 1.0"
+        assert metrics3['accuracy'] == 0.0, "Default accuracy should be 0.0"
 
         # --------------------------------------------------------------------
-        # Test 8: Learning Rate Scheduling
+        # Test 9: Learning Rate Scheduling
         # --------------------------------------------------------------------
-        print("\n[Test 8] Learning Rate Scheduling")
+        print("\n[Test 9] Learning Rate Scheduling")
         model4 = CustomTransformerLM(small_config)
         wm4 = WeightManager(model4, small_config)
         
@@ -961,9 +1079,9 @@ if __name__ == "__main__":
         print(f"    Step 150: {lrs[15] if len(lrs) > 15 else 'N/A'}")
 
         # --------------------------------------------------------------------
-        # Test 9: Gradient Clipping
+        # Test 10: Gradient Clipping
         # --------------------------------------------------------------------
-        print("\n[Test 9] Gradient Clipping")
+        print("\n[Test 10] Gradient Clipping")
         model5 = CustomTransformerLM(small_config)
         wm5 = WeightManager(model5, small_config)
         
@@ -988,23 +1106,33 @@ if __name__ == "__main__":
         assert grad_norm_after <= wm5.grad_clip_norm + 1e-5
 
         # --------------------------------------------------------------------
-        # Test 10: State Dict Round-trip
+        # Test 11: State Dict Round-trip (with Metrics)
         # --------------------------------------------------------------------
-        print("\n[Test 10] State Dict Round-trip")
+        print("\n[Test 11] State Dict Round-trip (with Metrics)")
+        # Set some metrics
+        weight_manager.update_metrics(loss=0.5, perplexity=1.65, accuracy=0.8)
         state = weight_manager.state_dict()
         
         model6 = CustomTransformerLM(small_config)
         wm6 = WeightManager(model6, small_config)
         wm6.load_state_dict(state)
         
+        # Verify all preserved
+        metrics6 = wm6.get_last_metrics()
         print(f"  Step preserved     : {wm6.step_count == weight_manager.step_count}")
         print(f"  Global step match  : {wm6.global_step == weight_manager.global_step}")
         print(f"  LR match           : {abs(wm6.learning_rate - weight_manager.learning_rate) < 1e-9}")
         print(f"  EMA match          : {wm6.has_ema_weights()}")
+        print(f"  Loss match         : {abs(metrics6['loss'] - 0.5) < 1e-6}")
+        print(f"  PPL match          : {abs(metrics6['perplexity'] - 1.65) < 1e-4}")
+        print(f"  Acc match          : {abs(metrics6['accuracy'] - 0.8) < 1e-6}")
         
         assert wm6.step_count == weight_manager.step_count
         assert wm6.global_step == weight_manager.global_step
+        assert abs(metrics6['loss'] - 0.5) < 1e-6
+        assert abs(metrics6['perplexity'] - 1.65) < 1e-4
+        assert abs(metrics6['accuracy'] - 0.8) < 1e-6
 
         print("\n" + "=" * 70)
-        print("✅ pipeline/weight_manager.py (SOTA + EMA) ALL TESTS PASSED")
+        print("✅ pipeline/weight_manager.py (SOTA v2.3 + EMA + Metrics) ALL TESTS PASSED")
         print("=" * 70)
