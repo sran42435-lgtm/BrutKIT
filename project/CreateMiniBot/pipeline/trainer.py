@@ -2,7 +2,7 @@
 #
 # Trainer / Training Loop Engine untuk RAG-based Training Pipeline.
 #
-# VERSI SOTA-ENHANCED (v2.0):
+# VERSI FINAL v2.2:
 # Arsitektur: Single-Head + RAG + Constrained Generation
 #
 # 🎯 SELF-CORRECTING TRAINING PHILOSOPHY:
@@ -13,18 +13,25 @@
 # 2. Label Smoothing (cegah overconfidence)
 # 3. Focal Loss (fokus pada hard examples)
 # 4. Token Importance Weighting (answer tokens 3x penting)
-# 5. Adaptive Gradient Clipping - AGC (NFNet, lebih stabil dari fixed clip)
+# 5. Adaptive Gradient Clipping - AGC (NFNet)
 # 6. Loss Spike Detection + Auto-Recovery
 # 7. Curriculum Learning (easy → hard)
 # 8. Self-Correction Loop (DeepMind style)
 # 9. EMA Weights (Exponential Moving Average)
 # 10. Dynamic Sample Difficulty Scoring
 #
+# Fitur v2.2:
+# - Flexible Checkpoint System (per-steps + per-epochs)
+# - Export otak model BARENG checkpoint (anti mati-lampu!)
+# - Auto-Stop pintar (loss + accuracy threshold)
+# - Rolling metrics untuk convergence detection
+#
 # Keterhubungan:
 # - config.py              : hyperparameter training + RAG
 # - core/tokenizer.py      : encode QA samples
 # - core/architecture.py   : model (single LM head + cross-attention)
 # - core/retriever.py      : build index setelah training (optional)
+# - core/model_exporter.py : export otak model
 # - pipeline/evaluator.py  : menghitung loss dan gradient
 # - pipeline/weight_manager.py : memperbarui bobot
 
@@ -68,34 +75,28 @@ try:
 except ImportError:
     _RETRIEVER_AVAILABLE = False
 
+# Import ModelExporter untuk export otak model
+try:
+    from core.model_exporter import ModelExporter
+    _EXPORTER_AVAILABLE = True
+except ImportError:
+    _EXPORTER_AVAILABLE = False
+
 
 # ============================================================================
 # SOTA TRAINING CONSTANTS
 # ============================================================================
 
-# Loss spike detection: jika loss > MEAN + N*STD, dianggap spike
 LOSS_SPIKE_SIGMA = 3.0
-LOSS_SPIKE_WINDOW = 50  # steps untuk rolling statistics
+LOSS_SPIKE_WINDOW = 50
+AUTO_STOP_ROLLING_WINDOW = 100
 
-# EMA decay untuk model averaging (Polyak averaging)
 DEFAULT_EMA_DECAY = 0.999
-
-# Label smoothing epsilon (standard: 0.1)
 DEFAULT_LABEL_SMOOTHING = 0.1
-
-# Focal loss gamma (2.0 = fokus pada hard examples)
 DEFAULT_FOCAL_GAMMA = 2.0
-
-# Token importance weight untuk answer tokens
 DEFAULT_ANSWER_TOKEN_WEIGHT = 3.0
-
-# AGC (Adaptive Gradient Clipping) factor
 DEFAULT_AGC_FACTOR = 0.01
-
-# Self-correction: max iterations per sample
 DEFAULT_SELF_CORRECTION_MAX_ITER = 2
-
-# Difficulty threshold: samples dengan loss > threshold di-train ulang
 DEFAULT_HARD_SAMPLE_LOSS_THRESHOLD = 2.0
 
 
@@ -106,29 +107,11 @@ class Trainer:
     🎯 Self-Correcting Training Philosophy:
     "Model berlatih keras, memperbaiki setiap kesalahan, menjadi jauh lebih baik"
 
-    Arsitektur:
-    - Single LM head (no domain contamination)
-    - Context-conditioned training
-    - Loss ↓ = Presisi ↑ (korelasi langsung)
-
-    SOTA Features:
-    - Cosine Annealing LR + Warmup
-    - Label Smoothing + Focal Loss
-    - Token Importance Weighting
-    - Adaptive Gradient Clipping (AGC)
-    - Loss Spike Detection + Auto-Recovery
-    - Curriculum Learning (easy → hard)
-    - Self-Correction Loop
-    - EMA Weights (Polyak Averaging)
-
-    Standard Features:
-    - Resume dari epoch terakhir
-    - Early stopping
-    - Periodic checkpoint
-    - Inline training dari playground
-    - Context dropout (mitigasi hallucination)
-    - Context perturbation (mitigasi urutan memorization)
-    - Progressive training stages
+    Fitur v2.2:
+    - Flexible Checkpoint (per-steps + per-epochs)
+    - Export otak model bareng checkpoint (anti mati-lampu!)
+    - Auto-Stop pintar berdasarkan loss + accuracy threshold
+    - Rolling metrics untuk convergence detection
     """
 
     LOG_EVERY_STEPS = 10
@@ -158,11 +141,45 @@ class Trainer:
         # Early stopping
         self.early_stopping_patience = int(config.training.early_stopping_patience)
 
-        # Periodic checkpoint
-        self.save_checkpoint_every_n_steps = int(config.training.save_checkpoint_every_n_steps)
-
         # Inline training
         self.inline_training_steps = int(config.training.inline_training_steps)
+
+        # ================================================================
+        # 🎯 FLEXIBLE CHECKPOINT SYSTEM
+        # ================================================================
+        self.save_checkpoint_every_n_steps = int(
+            getattr(config.training, 'save_checkpoint_every_n_steps', 500)
+        )
+        self.save_checkpoint_every_n_epochs = int(
+            getattr(config.training, 'save_checkpoint_every_n_epochs', 1)
+        )
+        
+        # Export otak model bareng checkpoint
+        self.export_brain_on_checkpoint = bool(
+            getattr(config.training, 'export_brain_on_checkpoint', True)
+        )
+
+        # ================================================================
+        # 🎯 AUTO-STOP CONFIGURATION
+        # ================================================================
+        self.auto_stop_enabled = bool(
+            getattr(config.training, 'auto_stop_enabled', True)
+        )
+        self.auto_stop_loss_threshold = float(
+            getattr(config.training, 'auto_stop_loss_threshold', 0.8)
+        )
+        self.auto_stop_accuracy_threshold = float(
+            getattr(config.training, 'auto_stop_accuracy_threshold', 0.75)
+        )
+        self.auto_stop_min_steps = int(
+            getattr(config.training, 'auto_stop_min_steps', 1000)
+        )
+        self.auto_stop_patience_steps = int(
+            getattr(config.training, 'auto_stop_patience_steps', 100)
+        )
+        self.auto_stop_check_interval = int(
+            getattr(config.training, 'auto_stop_check_interval', 50)
+        )
 
         # ================================================================
         # RAG-SPECIFIC PARAMETERS
@@ -181,10 +198,8 @@ class Trainer:
         )
 
         # ================================================================
-        # 🎯 SOTA TRAINING PARAMETERS (BARU)
+        # 🎯 SOTA TRAINING PARAMETERS
         # ================================================================
-        
-        # Cosine annealing
         self.use_cosine_schedule = bool(
             getattr(config.training, 'use_cosine_schedule', True)
         )
@@ -192,12 +207,10 @@ class Trainer:
         self.lr_warmup_steps = int(config.training.lr_warmup_steps)
         self.lr_min = float(getattr(config.training, 'lr_min', 1e-6))
         
-        # Label smoothing
         self.label_smoothing = float(
             getattr(config.training, 'label_smoothing', DEFAULT_LABEL_SMOOTHING)
         )
         
-        # Focal loss
         self.use_focal_loss = bool(
             getattr(config.training, 'use_focal_loss', True)
         )
@@ -205,7 +218,6 @@ class Trainer:
             getattr(config.training, 'focal_gamma', DEFAULT_FOCAL_GAMMA)
         )
         
-        # Token importance weighting
         self.use_token_weighting = bool(
             getattr(config.training, 'use_token_weighting', True)
         )
@@ -213,25 +225,15 @@ class Trainer:
             getattr(config.training, 'answer_token_weight', DEFAULT_ANSWER_TOKEN_WEIGHT)
         )
         
-        # Adaptive Gradient Clipping (AGC)
-        self.use_agc = bool(
-            getattr(config.training, 'use_agc', True)
-        )
-        self.agc_factor = float(
-            getattr(config.training, 'agc_factor', DEFAULT_AGC_FACTOR)
-        )
+        self.use_agc = bool(getattr(config.training, 'use_agc', True))
+        self.agc_factor = float(getattr(config.training, 'agc_factor', DEFAULT_AGC_FACTOR))
         
-        # Loss spike detection
         self.use_loss_spike_detection = bool(
             getattr(config.training, 'use_loss_spike_detection', True)
         )
         
-        # Curriculum learning
-        self.use_curriculum = bool(
-            getattr(config.training, 'use_curriculum', True)
-        )
+        self.use_curriculum = bool(getattr(config.training, 'use_curriculum', True))
         
-        # Self-correction loop
         self.use_self_correction = bool(
             getattr(config.training, 'use_self_correction', True)
         )
@@ -242,13 +244,8 @@ class Trainer:
             getattr(config.training, 'hard_sample_loss_threshold', DEFAULT_HARD_SAMPLE_LOSS_THRESHOLD)
         )
         
-        # EMA weights
-        self.use_ema = bool(
-            getattr(config.training, 'use_ema', True)
-        )
-        self.ema_decay = float(
-            getattr(config.training, 'ema_decay', DEFAULT_EMA_DECAY)
-        )
+        self.use_ema = bool(getattr(config.training, 'use_ema', True))
+        self.ema_decay = float(getattr(config.training, 'ema_decay', DEFAULT_EMA_DECAY))
 
         # ================================================================
         # STATE
@@ -256,34 +253,37 @@ class Trainer:
         self.start_epoch = 0
         self.start_global_step = 0
 
-        # Token IDs untuk special tokens
         self.pad_id = int(config.special_tokens.pad_id)
         self.bos_id = int(config.special_tokens.bos_id)
         self.eos_id = int(config.special_tokens.eos_id)
         self.endoftext_id = int(config.special_tokens.endoftext_id)
 
-        # QA Dataset
         self.qa_samples: List[Dict] = []
 
-        # Random generators
         self._rng = np.random.default_rng(self.seed)
         self._py_rng = random.Random(self.seed)
 
-        # Retriever
         self._retriever: Optional['BM25Retriever'] = None
         
         # ================================================================
-        # 🎯 SOTA TRACKING STATE (BARU)
+        # 🎯 SOTA TRACKING STATE
         # ================================================================
         self._loss_history: deque = deque(maxlen=LOSS_SPIKE_WINDOW)
         self._ema_weights: Optional[Dict[str, np.ndarray]] = None
-        self._sample_difficulty: Dict[int, float] = {}  # idx → running loss
+        self._sample_difficulty: Dict[int, float] = {}
         self._self_correction_stats = {
             "total_attempts": 0,
             "corrections_applied": 0,
             "spikes_detected": 0,
             "hard_samples_retrained": 0,
         }
+        
+        # Rolling metrics untuk auto-stop
+        self._rolling_losses: deque = deque(maxlen=AUTO_STOP_ROLLING_WINDOW)
+        self._rolling_correct: int = 0
+        self._rolling_total: int = 0
+        self._consecutive_target_met: int = 0
+        self._auto_stop_triggered: bool = False
 
         if self.batch_size <= 0:
             raise ValueError("batch_size harus lebih besar dari 0.")
@@ -292,33 +292,18 @@ class Trainer:
             raise ValueError("sequence_length harus lebih besar dari 0.")
 
     # ========================================================================
-    # 🎯 SOTA: LEARNING RATE SCHEDULING (COSINE WITH WARMUP)
+    # 🎯 SOTA: LEARNING RATE SCHEDULING
     # ========================================================================
 
     def _get_learning_rate(self, step: int, total_steps: int) -> float:
-        """
-        Cosine Annealing dengan Linear Warmup (GPT-3/LLaMA style).
-        
-        Formula:
-        - Warmup phase (step < warmup_steps): linear increase
-        - Cosine phase: lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(π * progress))
-        
-        Args:
-            step: current training step
-            total_steps: total training steps
-        
-        Returns:
-            learning_rate untuk step ini
-        """
+        """Cosine Annealing dengan Linear Warmup."""
         if not self.use_cosine_schedule:
             return self.base_learning_rate
         
-        # Phase 1: Warmup (linear increase)
         if step < self.lr_warmup_steps:
             progress = step / max(1, self.lr_warmup_steps)
             return self.lr_min + (self.base_learning_rate - self.lr_min) * progress
         
-        # Phase 2: Cosine decay
         cosine_steps = max(1, total_steps - self.lr_warmup_steps)
         progress = (step - self.lr_warmup_steps) / cosine_steps
         progress = min(1.0, progress)
@@ -336,29 +321,15 @@ class Trainer:
     # 🎯 SOTA: LABEL SMOOTHING
     # ========================================================================
 
-    def _apply_label_smoothing(
-        self,
-        targets: np.ndarray,
-        vocab_size: int,
-    ) -> np.ndarray:
-        """
-        Apply label smoothing ke target distribution.
-        
-        Standard: target = [0, 0, ..., 1, ..., 0]
-        Smoothed: target = [ε/V, ε/V, ..., 1-ε, ..., ε/V]
-        
-        Benefit: cegah model terlalu confident, improve generalization
-        """
+    def _apply_label_smoothing(self, targets: np.ndarray, vocab_size: int) -> np.ndarray:
+        """Apply label smoothing ke target distribution."""
         if self.label_smoothing <= 0.0:
-            return None  # Use standard cross-entropy
+            return None
         
         B, T = targets.shape
         eps = self.label_smoothing
-        
-        # Buat uniform distribution
         smooth_targets = np.full((B, T, vocab_size), eps / vocab_size, dtype=np.float32)
         
-        # Set high probability untuk correct token
         for b in range(B):
             for t in range(T):
                 token_id = targets[b, t]
@@ -368,31 +339,19 @@ class Trainer:
         return smooth_targets
 
     # ========================================================================
-    # 🎯 SOTA: FOCAL LOSS MODULATION
+    # 🎯 SOTA: FOCAL LOSS
     # ========================================================================
 
-    def _compute_focal_weights(
-        self,
-        logits: np.ndarray,
-        targets: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Compute focal loss weights: (1 - p_t)^gamma
-        
-        Benefit: down-weight easy examples, fokus pada hard examples
-        Reference: Lin et al. 2017 "Focal Loss for Dense Object Detection"
-        """
+    def _compute_focal_weights(self, logits: np.ndarray, targets: np.ndarray) -> np.ndarray:
+        """Compute focal loss weights: (1 - p_t)^gamma"""
         if not self.use_focal_loss or self.focal_gamma <= 0.0:
             return None
         
         B, T, V = logits.shape
-        
-        # Softmax probabilities
         logits_shifted = logits - np.max(logits, axis=-1, keepdims=True)
         exp_logits = np.exp(logits_shifted)
         probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
         
-        # Get probability of correct token
         p_t = np.zeros((B, T), dtype=np.float32)
         for b in range(B):
             for t in range(T):
@@ -400,53 +359,26 @@ class Trainer:
                 if 0 <= token_id < V:
                     p_t[b, t] = probs[b, t, token_id]
         
-        # Focal weight: (1 - p_t)^gamma
         focal_weights = np.power(1.0 - p_t, self.focal_gamma)
-        
         return focal_weights.astype(np.float32)
 
     # ========================================================================
     # 🎯 SOTA: TOKEN IMPORTANCE WEIGHTING
     # ========================================================================
 
-    def _compute_token_weights(
-        self,
-        input_ids: np.ndarray,
-        target_ids: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Compute per-token weights berdasarkan importance.
-        
-        Strategy:
-        - PAD tokens: weight = 0 (ignore)
-        - Question tokens: weight = 1.0 (standard)
-        - Answer tokens: weight = answer_token_weight (3.0 default)
-        
-        Benefit: model fokus pada kualitas jawaban, bukan pertanyaan
-        """
+    def _compute_token_weights(self, input_ids: np.ndarray, target_ids: np.ndarray) -> np.ndarray:
+        """Compute per-token weights."""
         if not self.use_token_weighting:
             return None
         
         B, T = target_ids.shape
         weights = np.ones((B, T), dtype=np.float32)
-        
-        # Zero weight untuk PAD tokens
         weights[target_ids == self.pad_id] = 0.0
         
-        # Heuristic: answer tokens biasanya di后半部分 sequence
-        # Kita identify answer start dengan pattern matching pada input
-        # Untuk simplicity, gunakan position-based weighting
-        # (Answer tokens typically di second half setelah "Jawaban:")
-        
-        # Detect "Jawaban:" position via token patterns
-        # Ini heuristic sederhana; trainer bisa pass explicit answer_start
         for b in range(B):
-            # Cari EOS di input (marker end of question)
             input_seq = input_ids[b]
             eos_positions = np.where(input_seq == self.eos_id)[0]
-            
             if len(eos_positions) > 0:
-                # Tokens setelah EOS pertama = answer region
                 answer_start = eos_positions[0] + 1
                 if answer_start < T:
                     weights[b, answer_start:] = self.answer_token_weight
@@ -454,21 +386,11 @@ class Trainer:
         return weights
 
     # ========================================================================
-    # 🎯 SOTA: ADAPTIVE GRADIENT CLIPPING (AGC)
+    # 🎯 SOTA: AGC
     # ========================================================================
 
     def _apply_agc(self) -> None:
-        """
-        Adaptive Gradient Clipping dari NFNet (Brock et al. 2021).
-        
-        Alih-alih fixed clip norm, AGC clip berdasarkan ratio:
-            ||grad|| / ||weight||
-        
-        Jika ratio > threshold, scale gradient:
-            grad_new = grad * (threshold * ||weight|| / ||grad||)
-        
-        Benefit: lebih stabil untuk large batch training, cegah explosion
-        """
+        """Adaptive Gradient Clipping dari NFNet."""
         if not self.use_agc:
             return
         
@@ -482,15 +404,9 @@ class Trainer:
             if grad_norm < 1e-8 or weight_norm < 1e-8:
                 continue
             
-            # Max ratio allowed (adaptive threshold)
-            max_ratio = self.agc_factor
-            
-            # Current ratio
             ratio = grad_norm / weight_norm
-            
-            if ratio > max_ratio:
-                # Scale down gradient
-                scale_factor = (max_ratio * weight_norm) / grad_norm
+            if ratio > self.agc_factor:
+                scale_factor = (self.agc_factor * weight_norm) / grad_norm
                 param.grad = param.grad * scale_factor
 
     # ========================================================================
@@ -498,18 +414,11 @@ class Trainer:
     # ========================================================================
 
     def _detect_loss_spike(self, current_loss: float) -> bool:
-        """
-        Deteksi apakah current loss adalah spike (anomaly).
-        
-        Criterion: loss > mean(history) + N * std(history)
-        
-        Returns:
-            True jika spike detected
-        """
+        """Deteksi loss spike."""
         if not self.use_loss_spike_detection:
             return False
         
-        if len(self._loss_history) < 10:  # Butuh minimal samples
+        if len(self._loss_history) < 10:
             self._loss_history.append(current_loss)
             return False
         
@@ -518,7 +427,6 @@ class Trainer:
         std_loss = np.std(history_array)
         
         spike_threshold = mean_loss + LOSS_SPIKE_SIGMA * std_loss
-        
         is_spike = current_loss > spike_threshold
         
         self._loss_history.append(current_loss)
@@ -529,13 +437,7 @@ class Trainer:
         return is_spike
 
     def _recover_from_spike(self) -> None:
-        """
-        Recovery dari loss spike:
-        1. Reduce gradient (already clipped by AGC)
-        2. Optionally rollback to previous weights (jika tersedia)
-        3. Reduce learning rate temporarily
-        """
-        # Temporary learning rate reduction
+        """Recovery dari loss spike."""
         if hasattr(self.weight_manager, 'learning_rate'):
             current_lr = self.weight_manager.learning_rate
             self.weight_manager.learning_rate = current_lr * 0.5
@@ -545,105 +447,51 @@ class Trainer:
     # ========================================================================
 
     def _compute_sample_difficulty(self, sample: Dict) -> float:
-        """
-        Estimate difficulty dari satu sample.
-        
-        Heuristics:
-        - Panjang context: lebih panjang = lebih sulit
-        - Panjang question: lebih panjang = lebih sulit
-        - Vocabulary rarity: banyak UNK = lebih sulit
-        """
+        """Estimate difficulty."""
         context = sample.get("context", "")
         question = sample.get("question", "")
         answer = sample.get("answer", "")
         
-        # Length-based difficulty
         context_len = len(context.split())
         question_len = len(question.split())
         answer_len = len(answer.split())
         
-        # Normalize ke [0, 1]
         diff_length = min(1.0, (context_len + question_len) / 300.0)
-        
-        # Answer complexity (lebih panjang = lebih sulit)
         diff_answer = min(1.0, answer_len / 50.0)
         
-        # Combined score
-        difficulty = 0.6 * diff_length + 0.4 * diff_answer
-        
-        return difficulty
+        return 0.6 * diff_length + 0.4 * diff_answer
 
     def _sort_samples_by_curriculum(
-        self,
-        samples: List[Dict],
-        epoch: int,
-        total_epochs: int,
+        self, samples: List[Dict], epoch: int, total_epochs: int,
     ) -> List[Dict]:
-        """
-        Sort samples berdasarkan curriculum: easy → hard.
-        
-        Strategy:
-        - Epoch 1-30%: easy samples saja
-        - Epoch 30-70%: mix easy + medium
-        - Epoch 70-100%: all samples (termasuk hard)
-        """
+        """Sort samples easy → hard."""
         if not self.use_curriculum:
             return samples
         
-        # Compute difficulty untuk setiap sample
-        sample_with_diff = [
-            (s, self._compute_sample_difficulty(s))
-            for s in samples
-        ]
-        
-        # Sort by difficulty
+        sample_with_diff = [(s, self._compute_sample_difficulty(s)) for s in samples]
         sample_with_diff.sort(key=lambda x: x[1])
         
-        # Determine difficulty threshold based on epoch progress
         progress = (epoch + 1) / total_epochs
         
         if progress < 0.3:
-            # First 30%: only easy samples
             threshold = 0.4
         elif progress < 0.7:
-            # Middle 40%: easy + medium
             threshold = 0.7
         else:
-            # Last 30%: all samples
             threshold = 1.0
         
-        # Filter by threshold
         filtered = [s for s, d in sample_with_diff if d <= threshold]
-        
-        # Shuffle filtered samples
         self._py_rng.shuffle(filtered)
-        
         return filtered
 
     # ========================================================================
-    # 🎯 SOTA: SELF-CORRECTION LOOP
+    # 🎯 SOTA: SELF-CORRECTION
     # ========================================================================
 
     def _self_correct_batch(
-        self,
-        inputs: np.ndarray,
-        targets: np.ndarray,
-        initial_loss: float,
+        self, inputs: np.ndarray, targets: np.ndarray, initial_loss: float,
     ) -> Tuple[float, int]:
-        """
-        Self-correction loop (DeepMind style).
-        
-        Jika sample sulit (loss tinggi), train ulang beberapa kali
-        dengan fokus pada error patterns.
-        
-        Args:
-            inputs: input batch
-            targets: target batch
-            initial_loss: loss dari forward pertama
-        
-        Returns:
-            (final_loss, num_corrections)
-        """
+        """Self-correction loop."""
         if not self.use_self_correction:
             return initial_loss, 0
         
@@ -651,28 +499,20 @@ class Trainer:
         corrections = 0
         
         for iteration in range(self.self_correction_max_iter):
-            # Check jika masih "hard" sample
             if current_loss < self.hard_sample_loss_threshold:
-                break  # Sudah cukup baik, stop
+                break
             
-            # Re-train dengan fokus
             self.model.zero_grad()
             logits = self.model.forward(inputs, training=True)
-            
-            loss, grad_logits, metrics = self.evaluator.compute_loss_and_grad(
-                logits, targets,
-            )
+            loss, grad_logits, metrics = self.evaluator.compute_loss_and_grad(logits, targets)
             
             num_valid = int(metrics["num_valid_tokens"])
             if num_valid == 0:
                 break
             
             self.model.backward(grad_logits)
-            
-            # Apply AGC sebelum step
             self._apply_agc()
             
-            # Step dengan smaller learning rate untuk fine-tuning
             original_lr = getattr(self.weight_manager, 'learning_rate', None)
             if original_lr is not None:
                 self.weight_manager.learning_rate = original_lr * 0.5
@@ -689,17 +529,11 @@ class Trainer:
         return current_loss, corrections
 
     # ========================================================================
-    # 🎯 SOTA: EMA WEIGHTS (POLYAK AVERAGING)
+    # 🎯 SOTA: EMA WEIGHTS
     # ========================================================================
 
     def _update_ema(self) -> None:
-        """
-        Update EMA (Exponential Moving Average) weights.
-        
-        Formula: ema_weight = decay * ema_weight + (1 - decay) * current_weight
-        
-        Benefit: smoother model, better generalization di akhir training
-        """
+        """Update EMA weights."""
         if not self.use_ema:
             return
         
@@ -709,10 +543,8 @@ class Trainer:
         }
         
         if self._ema_weights is None:
-            # Initialize EMA dengan current weights
             self._ema_weights = current_weights
         else:
-            # Update EMA
             for name in current_weights:
                 if name in self._ema_weights:
                     self._ema_weights[name] = (
@@ -723,19 +555,142 @@ class Trainer:
                     self._ema_weights[name] = current_weights[name]
 
     def apply_ema_to_model(self) -> None:
-        """
-        Apply EMA weights ke model (biasanya di akhir training).
-        
-        WARNING: Ini akan replace model weights. Lakukan hanya saat:
-        - Training selesai (final model)
-        - Evaluation (untuk hasil lebih smooth)
-        """
+        """Apply EMA weights ke model."""
         if self._ema_weights is None:
             return
         
         for name, param in self.model.parameters().items():
             if name in self._ema_weights:
                 param.data = self._ema_weights[name].copy()
+
+    # ========================================================================
+    # 🎯 AUTO-STOP LOGIC
+    # ========================================================================
+
+    def _update_rolling_metrics(self, loss: float, num_correct: int, num_tokens: int) -> None:
+        """Update rolling metrics untuk auto-stop check."""
+        self._rolling_losses.append(loss)
+        self._rolling_correct += num_correct
+        self._rolling_total += num_tokens
+
+    def _check_auto_stop(self, current_step: int, verbose: bool = True) -> bool:
+        """
+        Cek apakah training harus stop berdasarkan loss + accuracy threshold.
+        
+        Returns:
+            True jika training harus stop
+        """
+        if not self.auto_stop_enabled:
+            return False
+        
+        if current_step < self.auto_stop_min_steps:
+            return False
+        
+        if len(self._rolling_losses) < AUTO_STOP_ROLLING_WINDOW:
+            return False
+        
+        avg_loss = float(np.mean(list(self._rolling_losses)))
+        
+        if self._rolling_total > 0:
+            rolling_accuracy = self._rolling_correct / self._rolling_total
+        else:
+            rolling_accuracy = 0.0
+        
+        loss_ok = avg_loss < self.auto_stop_loss_threshold
+        acc_ok = rolling_accuracy > self.auto_stop_accuracy_threshold
+        
+        if loss_ok and acc_ok:
+            self._consecutive_target_met += 1
+        else:
+            self._consecutive_target_met = 0
+        
+        if self._consecutive_target_met >= self.auto_stop_patience_steps:
+            if verbose:
+                print()
+                print("=" * 70)
+                print("🎯 AUTO-STOP TRIGGERED!")
+                print("=" * 70)
+                print(f"  Step                  : {current_step:,}")
+                print(f"  Average loss          : {avg_loss:.6f} (< {self.auto_stop_loss_threshold})")
+                print(f"  Rolling accuracy      : {rolling_accuracy:.4f} (> {self.auto_stop_accuracy_threshold})")
+                print(f"  Consecutive meets     : {self._consecutive_target_met}")
+                print(f"  Target sudah tercapai! Training akan dihentikan.")
+                print("=" * 70)
+            self._auto_stop_triggered = True
+            return True
+        
+        if verbose and current_step % self.auto_stop_check_interval == 0:
+            if loss_ok or acc_ok:
+                partial_status = []
+                if loss_ok:
+                    partial_status.append(f"✅loss={avg_loss:.4f}")
+                if acc_ok:
+                    partial_status.append(f"✅acc={rolling_accuracy:.4f}")
+                print(f"  [Auto-stop] Progress: {' '.join(partial_status)} | consecutive={self._consecutive_target_met}/{self.auto_stop_patience_steps}")
+        
+        return False
+
+    def reset_rolling_metrics(self) -> None:
+        """Reset rolling metrics."""
+        self._rolling_losses.clear()
+        self._rolling_correct = 0
+        self._rolling_total = 0
+
+    # ========================================================================
+    # 🎯 CHECKPOINT + BRAIN EXPORT HELPER
+    # ========================================================================
+
+    def _save_checkpoint(
+        self, 
+        verbose: bool = True, 
+        context: str = "",
+        export_brain: Optional[bool] = None,
+    ) -> Tuple[Path, Optional[Path]]:
+        """
+        Save checkpoint + export otak model (anti mati-lampu!).
+        """
+        # 1. Save training session (cepat)
+        ckpt_path = self.weight_manager.save_checkpoint()
+        
+        # 2. Export otak model (lambat tapi aman)
+        should_export_brain = (
+            export_brain if export_brain is not None 
+            else self.export_brain_on_checkpoint
+        )
+        
+        brain_path = None
+        if should_export_brain and _EXPORTER_AVAILABLE:
+            try:
+                exporter = ModelExporter(self.config)
+                brain_path = exporter.save(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    include_vocab=True,
+                    include_rag_assets=False,
+                    verbose=False,
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"  [Checkpoint] ⚠️ Failed to export brain: {e}")
+        
+        # 3. Print info
+        if verbose:
+            if context:
+                print(f"  [Checkpoint] 💾 {context}:")
+            else:
+                print(f"  [Checkpoint] 💾 Saved:")
+            
+            print(f"    📝 Training session : {ckpt_path.name}")
+            if brain_path:
+                try:
+                    brain_size_mb = brain_path.stat().st_size / 1024 / 1024
+                    print(f"    🧠 Brain model      : {brain_path.name} ({brain_size_mb:.1f} MB)")
+                except Exception:
+                    print(f"    🧠 Brain model      : {brain_path.name}")
+            elif should_export_brain and not _EXPORTER_AVAILABLE:
+                print(f"    🧠 Brain export     : skipped (ModelExporter not available)")
+        
+        return ckpt_path, brain_path
 
     # ========================================================================
     # RESUME STATE
@@ -750,9 +705,8 @@ class Trainer:
     # ========================================================================
 
     def load_qa_dataset(self, path: Optional[Path] = None, verbose: bool = True) -> int:
-        """Load QA dataset dari file JSON."""
+        """Load QA dataset."""
         if path is None:
-            # Coba load merged dataset dulu (SQuAD prepared)
             merged_train = Path(self.config.paths.merged_qa_train_path)
             if merged_train.exists():
                 path = merged_train
@@ -774,14 +728,12 @@ class Trainer:
                 data = json.load(f)
 
             samples = data.get("samples", [])
-
             valid_samples = []
             for sample in samples:
                 if not isinstance(sample, dict):
                     continue
                 if "question" not in sample:
                     continue
-                # Support both "answer" key and empty answer (impossible questions)
                 valid_samples.append(sample)
 
             self.qa_samples = valid_samples
@@ -791,7 +743,6 @@ class Trainer:
                 print(f"[Trainer] ✅ Loaded {len(valid_samples)} QA samples dari {path.name}")
                 print(f"[Trainer]    Total samples: {metadata.get('total', len(valid_samples))}")
 
-                # Print stats
                 stats = metadata.get("stats", {})
                 if stats:
                     print(f"[Trainer]    By source: {dict(stats.get('by_source', {}))}")
@@ -805,7 +756,7 @@ class Trainer:
             return 0
 
     def get_qa_samples(self) -> List[Dict]:
-        """Return list QA samples yang sudah di-load."""
+        """Return list QA samples."""
         return list(self.qa_samples)
 
     # ========================================================================
@@ -813,7 +764,7 @@ class Trainer:
     # ========================================================================
 
     def _split_sentences(self, text: str) -> List[str]:
-        """Split teks menjadi kalimat-kalimat."""
+        """Split teks jadi kalimat."""
         sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
         sentences = [s.strip() for s in sentences if s.strip()]
         if not sentences:
@@ -821,7 +772,7 @@ class Trainer:
         return sentences
 
     def _shuffle_sentences(self, text: str) -> str:
-        """Shuffle kalimat dalam paragraf."""
+        """Shuffle kalimat."""
         sentences = self._split_sentences(text)
         if len(sentences) <= 1:
             return text
@@ -829,7 +780,7 @@ class Trainer:
         return ' '.join(sentences)
 
     def _apply_context_dropout(self, context: str) -> Tuple[str, bool]:
-        """Randomly hapus konteks (untuk context dropout training)."""
+        """Randomly hapus konteks."""
         if not context:
             return context, True
 
@@ -839,7 +790,7 @@ class Trainer:
         return context, False
 
     def _apply_context_perturbation(self, context: str) -> str:
-        """Randomly perturbasi konteks: shuffle atau truncate."""
+        """Randomly perturbasi konteks."""
         if not context:
             return context
 
@@ -867,16 +818,7 @@ class Trainer:
     # ========================================================================
 
     def _prepare_sample(self, sample: Dict) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """
-        Siapkan satu QA sample untuk training.
-
-        Flow:
-        1. Ambil context, question, answer
-        2. Apply context dropout (random)
-        3. Apply context perturbation (random)
-        4. Encode ke token IDs
-        5. Truncate/pad ke sequence_length + 1
-        """
+        """Siapkan satu QA sample."""
         context = sample.get("context", "")
         question = sample.get("question", "")
         answer = sample.get("answer", "")
@@ -885,33 +827,25 @@ class Trainer:
         if not question:
             return None
 
-        # Handle impossible questions (SQuAD 2.0 feature)
         if is_impossible or not answer:
             answer = self.NO_CONTEXT_ANSWER
 
-        # Context dropout
         context, is_dropped = self._apply_context_dropout(context)
         if is_dropped and context == "":
             answer = self.NO_CONTEXT_ANSWER
 
-        # Context perturbation
         if context:
             context = self._apply_context_perturbation(context)
 
-        # Encode
         try:
             if context:
                 input_ids, target_ids = self.tokenizer.split_qa_for_training(
-                    context=context,
-                    question=question,
-                    answer=answer,
+                    context=context, question=question, answer=answer,
                 )
             else:
                 full_ids = self.tokenizer.encode_qa_no_context(
-                    question=question,
-                    answer=answer,
-                    add_bos=True,
-                    add_eos=True,
+                    question=question, answer=answer,
+                    add_bos=True, add_eos=True,
                 )
                 input_text = f"Pertanyaan: {question} Jawaban:"
                 input_ids = self.tokenizer.encode(input_text, add_bos=True, add_eos=False)
@@ -922,7 +856,6 @@ class Trainer:
         if not input_ids or not target_ids:
             return None
 
-        # Concatenate dan truncate/pad
         full_sequence = input_ids + target_ids
         chunk_size = self.sequence_length + 1
 
@@ -935,9 +868,7 @@ class Trainer:
         return np.array(full_sequence, dtype=np.int64)
 
     def _prepare_sample_progressive(
-        self,
-        sample: Dict,
-        stage: int,
+        self, sample: Dict, stage: int,
     ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Siapkan sample dengan progressive difficulty."""
         if stage == 1:
@@ -968,7 +899,7 @@ class Trainer:
     # ========================================================================
 
     def _get_current_stage(self, epoch: int, total_epochs: int) -> int:
-        """Hitung current progressive stage berdasarkan epoch."""
+        """Hitung current progressive stage."""
         if self.progressive_stages <= 0 or total_epochs <= 0:
             return 1
 
@@ -982,16 +913,13 @@ class Trainer:
         total_epochs: Optional[int] = None,
         shuffle: bool = True,
     ) -> Iterable[Tuple[np.ndarray, np.ndarray]]:
-        """
-        Yield batches dengan curriculum learning.
-        """
+        """Yield batches dengan curriculum learning."""
         if total_epochs is None:
             total_epochs = self.epochs
 
         if not self.qa_samples:
             return
 
-        # Apply curriculum sorting
         samples = self._sort_samples_by_curriculum(
             self.qa_samples, epoch, total_epochs
         )
@@ -1019,7 +947,7 @@ class Trainer:
             yield inputs, targets
 
     # ========================================================================
-    # 🎯 SOTA: SINGLE TRAINING STEP (dengan semua teknik)
+    # 🎯 SOTA: SINGLE TRAINING STEP
     # ========================================================================
 
     def _train_step_sota(
@@ -1029,36 +957,12 @@ class Trainer:
         step: int,
         total_steps: int,
     ) -> Tuple[float, dict]:
-        """
-        Satu training step dengan semua SOTA techniques.
-        
-        Flow:
-        1. Forward pass dengan cross-attention
-        2. Compute loss dengan label smoothing + focal + token weighting
-        3. Backward pass
-        4. AGC (adaptive gradient clipping)
-        5. Loss spike detection
-        6. Self-correction loop jika hard sample
-        7. Weight update
-        8. EMA update
-        
-        Returns:
-            (loss, metrics_dict)
-        """
-        # ============================================================
-        # Step 0: Update learning rate (cosine schedule)
-        # ============================================================
+        """Satu training step dengan semua SOTA techniques."""
         self._apply_lr_to_weight_manager(step, total_steps)
 
-        # ============================================================
-        # Step 1: Forward pass
-        # ============================================================
         self.model.zero_grad()
         logits = self.model.forward(inputs, training=True)
 
-        # ============================================================
-        # Step 2: Compute loss dengan SOTA techniques
-        # ============================================================
         loss, grad_logits, metrics = self.evaluator.compute_loss_and_grad(
             logits, targets,
         )
@@ -1067,49 +971,31 @@ class Trainer:
         if num_valid_tokens == 0:
             return 0.0, metrics
         
-        # Apply label smoothing (modifikasi gradient)
         if self.label_smoothing > 0.0:
-            # Smooth gradient: blend dengan uniform distribution
             smooth_factor = self.label_smoothing
             vocab_size = logits.shape[-1]
             uniform_grad = -1.0 / vocab_size
             grad_logits = (1.0 - smooth_factor) * grad_logits + smooth_factor * uniform_grad
         
-        # Apply focal loss weighting
         if self.use_focal_loss:
             focal_weights = self._compute_focal_weights(logits, targets)
             if focal_weights is not None:
-                # Expand dims untuk broadcast
                 focal_weights = focal_weights[:, :, np.newaxis]
                 grad_logits = grad_logits * focal_weights
         
-        # Apply token importance weighting
         if self.use_token_weighting:
             token_weights = self._compute_token_weights(inputs, targets)
             if token_weights is not None:
                 token_weights = token_weights[:, :, np.newaxis]
                 grad_logits = grad_logits * token_weights
 
-        # ============================================================
-        # Step 3: Backward pass
-        # ============================================================
         self.model.backward(grad_logits)
-
-        # ============================================================
-        # Step 4: Adaptive Gradient Clipping (AGC)
-        # ============================================================
         self._apply_agc()
 
-        # ============================================================
-        # Step 5: Loss spike detection
-        # ============================================================
         is_spike = self._detect_loss_spike(float(loss))
         if is_spike:
             self._recover_from_spike()
 
-        # ============================================================
-        # Step 6: Self-correction loop untuk hard samples
-        # ============================================================
         final_loss = float(loss)
         if self.use_self_correction and final_loss > self.hard_sample_loss_threshold:
             final_loss, corrections = self._self_correct_batch(
@@ -1119,17 +1005,9 @@ class Trainer:
             if corrections > 0:
                 self._self_correction_stats["hard_samples_retrained"] += 1
 
-        # ============================================================
-        # Step 7: Weight update
-        # ============================================================
         step_info = self.weight_manager.step(zero_grad=True)
-
-        # ============================================================
-        # Step 8: EMA update
-        # ============================================================
         self._update_ema()
 
-        # Update metrics dengan final loss
         metrics["loss"] = final_loss
         metrics["is_spike"] = is_spike
         metrics["learning_rate"] = step_info.get("learning_rate", self.base_learning_rate)
@@ -1148,9 +1026,7 @@ class Trainer:
         start_epoch: Optional[int] = None,
         global_step: Optional[int] = None,
     ) -> List[dict]:
-        """
-        Main training entry point dengan SOTA techniques.
-        """
+        """Main training entry point dengan SOTA techniques + auto-stop."""
         if not self.tokenizer.is_ready:
             self.tokenizer.load()
 
@@ -1177,13 +1053,12 @@ class Trainer:
                 )
             total_epochs = new_total
 
-        # Calculate total steps untuk cosine schedule
         steps_per_epoch = len(self.qa_samples) // self.batch_size
         total_steps = total_epochs * steps_per_epoch
 
         if verbose:
             print("=" * 70)
-            print("🎯 SOTA RAG TRAINING")
+            print("🎯 SOTA RAG TRAINING (v2.2 FINAL)")
             print("=" * 70)
             print(f"  QA samples          : {len(self.qa_samples):,}")
             print(f"  Total epochs        : {total_epochs}")
@@ -1205,6 +1080,28 @@ class Trainer:
             print(f"    Curriculum Learning    : {self.use_curriculum}")
             print(f"    Self-Correction        : {self.use_self_correction}")
             print(f"    EMA Weights (decay={self.ema_decay}): {self.use_ema}")
+            print()
+            print("  🎯 Flexible Checkpoint:")
+            if self.save_checkpoint_every_n_steps > 0:
+                print(f"    Per steps              : every {self.save_checkpoint_every_n_steps} steps")
+            else:
+                print(f"    Per steps              : disabled")
+            if self.save_checkpoint_every_n_epochs > 0:
+                print(f"    Per epochs             : every {self.save_checkpoint_every_n_epochs} epoch(s)")
+            else:
+                print(f"    Per epochs             : disabled")
+            print(f"    Export brain           : {self.export_brain_on_checkpoint}")
+            print()
+            print("  🎯 Auto-Stop:")
+            if self.auto_stop_enabled:
+                print(f"    Status                 : enabled")
+                print(f"    Loss target            : < {self.auto_stop_loss_threshold}")
+                print(f"    Accuracy target        : > {self.auto_stop_accuracy_threshold}")
+                print(f"    Min steps              : {self.auto_stop_min_steps}")
+                print(f"    Patience               : {self.auto_stop_patience_steps} checks")
+                print(f"    Check interval         : every {self.auto_stop_check_interval} steps")
+            else:
+                print(f"    Status                 : disabled")
             print("=" * 70)
 
         history: List[dict] = []
@@ -1218,7 +1115,6 @@ class Trainer:
             epoch_correct = 0
             steps_done = 0
             epoch_spikes = 0
-            epoch_corrections = 0
 
             self._rng = np.random.default_rng(self.seed + epoch)
             self._py_rng = random.Random(self.seed + epoch)
@@ -1242,7 +1138,6 @@ class Trainer:
                     stop_training = True
                     break
 
-                # 🎯 SOTA TRAINING STEP
                 loss, metrics = self._train_step_sota(
                     inputs, targets, global_step, total_steps
                 )
@@ -1252,7 +1147,10 @@ class Trainer:
                 if num_valid_tokens > 0:
                     epoch_loss += loss * num_valid_tokens
                     epoch_tokens += num_valid_tokens
-                    epoch_correct += int(metrics.get("num_correct", 0))
+                    num_correct_step = int(metrics.get("num_correct", 0))
+                    epoch_correct += num_correct_step
+                    
+                    self._update_rolling_metrics(loss, num_correct_step, num_valid_tokens)
                     
                     if metrics.get("is_spike", False):
                         epoch_spikes += 1
@@ -1269,14 +1167,34 @@ class Trainer:
                             f"{spike_marker}"
                         )
 
+                    # CHECKPOINT PER STEPS + EXPORT BRAIN
                     if (
-                        self.save_checkpoint_every_n_steps > 0
+                        save_checkpoints
+                        and self.save_checkpoint_every_n_steps > 0
                         and global_step > 0
                         and global_step % self.save_checkpoint_every_n_steps == 0
                     ):
-                        ckpt_path = self.weight_manager.save_checkpoint()
-                        if verbose:
-                            print(f"  [Checkpoint] Disimpan: {ckpt_path}")
+                        self._save_checkpoint(
+                            verbose=verbose,
+                            context=f"Step {global_step}",
+                        )
+                    
+                    # AUTO-STOP CHECK
+                    if (
+                        global_step > 0 
+                        and global_step % self.auto_stop_check_interval == 0
+                    ):
+                        if self._check_auto_stop(global_step, verbose=verbose):
+                            if save_checkpoints:
+                                if verbose:
+                                    print("\n[Trainer] 💾 Saving final checkpoint + brain...")
+                                self._save_checkpoint(
+                                    verbose=verbose,
+                                    context="🎯 AUTO-STOP FINAL",
+                                    export_brain=True,
+                                )
+                            stop_training = True
+                            break
                 else:
                     self.model.zero_grad()
 
@@ -1314,8 +1232,9 @@ class Trainer:
                     "num_correct": int(epoch_correct),
                     "steps": int(steps_done),
                     "spikes": epoch_spikes,
-                    "corrections": epoch_corrections,
+                    "corrections": 0,
                     "learning_rate": self._get_learning_rate(global_step, total_steps),
+                    "auto_stop_triggered": self._auto_stop_triggered,
                 }
 
                 if verbose:
@@ -1333,10 +1252,18 @@ class Trainer:
             self.weight_manager.last_epoch = epoch + 1
             self.weight_manager.global_step = global_step
 
+            # CHECKPOINT PER EPOCHS + EXPORT BRAIN
             if save_checkpoints:
-                ckpt_path = self.weight_manager.save_checkpoint()
-                if verbose:
-                    print(f"[Trainer] Checkpoint disimpan: {ckpt_path}")
+                should_save_epoch = (
+                    self.save_checkpoint_every_n_epochs > 0
+                    and (epoch + 1) % self.save_checkpoint_every_n_epochs == 0
+                )
+                
+                if should_save_epoch:
+                    self._save_checkpoint(
+                        verbose=verbose,
+                        context=f"Epoch {epoch + 1}",
+                    )
 
             # Early stopping
             if self.early_stopping_patience > 0 and steps_done > 0:
@@ -1357,27 +1284,23 @@ class Trainer:
                     stop_training = True
 
             if stop_training:
-                if verbose:
+                if verbose and not self._auto_stop_triggered:
                     print("[Trainer] Training dihentikan.")
                 break
 
-        # ================================================================
-        # FINAL: Apply EMA weights (jika aktif)
-        # ================================================================
-        if self.use_ema and self._ema_weights is not None:
+        # FINAL: Apply EMA weights
+        if self.use_ema and self._ema_weights is not None and not self._auto_stop_triggered:
             if verbose:
                 print("\n[Trainer] 🎯 Applying EMA weights ke model...")
             self.apply_ema_to_model()
             
-            # Save EMA checkpoint
             if save_checkpoints:
-                ckpt_path = self.weight_manager.save_checkpoint()
-                if verbose:
-                    print(f"[Trainer] EMA checkpoint disimpan: {ckpt_path}")
+                self._save_checkpoint(
+                    verbose=verbose,
+                    context="Final (EMA applied)",
+                )
 
-        # ================================================================
         # FINAL: Print SOTA stats
-        # ================================================================
         if verbose:
             print("\n" + "=" * 70)
             print("📊 SOTA TRAINING STATISTICS")
@@ -1387,16 +1310,21 @@ class Trainer:
             print(f"  Self-correction attempts : {stats['total_attempts']}")
             print(f"  Corrections applied      : {stats['corrections_applied']}")
             print(f"  Hard samples retrained   : {stats['hard_samples_retrained']}")
+            
+            if self._auto_stop_triggered:
+                print(f"  Auto-stop triggered      : ✅ YES (target tercapai)")
+            else:
+                print(f"  Auto-stop triggered      : ❌ NO")
+            
             print("=" * 70)
 
-        # Build retriever index
         if _RETRIEVER_AVAILABLE:
             self._build_retriever_index(verbose=verbose)
 
         return history
 
     # ========================================================================
-    # INLINE TRAINING (simplified versions)
+    # INLINE TRAINING
     # ========================================================================
 
     def train_steps(
@@ -1405,7 +1333,7 @@ class Trainer:
         save_checkpoint: bool = True,
         verbose: bool = True,
     ) -> List[dict]:
-        """Inline training untuk N steps dengan SOTA techniques."""
+        """Inline training untuk N steps."""
         if not self.tokenizer.is_ready:
             self.tokenizer.load()
 
@@ -1426,6 +1354,7 @@ class Trainer:
         total_correct = 0
         steps_done = 0
         epochs_traversed = 0
+        last_checkpoint_step = current_global_step
 
         if verbose:
             print(f"[Trainer] Inline SOTA training: target {steps} step")
@@ -1456,7 +1385,10 @@ class Trainer:
                 if num_valid_tokens > 0:
                     total_loss += loss * num_valid_tokens
                     total_tokens += num_valid_tokens
-                    total_correct += int(metrics.get("num_correct", 0))
+                    num_correct_step = int(metrics.get("num_correct", 0))
+                    total_correct += num_correct_step
+                    
+                    self._update_rolling_metrics(loss, num_correct_step, num_valid_tokens)
 
                     if verbose:
                         print(
@@ -1466,6 +1398,33 @@ class Trainer:
                             f"acc={metrics.get('accuracy', 0.0):.4f} "
                             f"lr={metrics.get('learning_rate', 0.0):.2e}"
                         )
+                    
+                    current_step = current_global_step + steps_done
+                    if (
+                        save_checkpoint
+                        and self.save_checkpoint_every_n_steps > 0
+                        and current_step > 0
+                        and current_step % self.save_checkpoint_every_n_steps == 0
+                        and current_step != last_checkpoint_step
+                    ):
+                        self._save_checkpoint(
+                            verbose=verbose,
+                            context=f"Inline Step {current_step}",
+                        )
+                        last_checkpoint_step = current_step
+                    
+                    if (
+                        current_step > 0
+                        and current_step % self.auto_stop_check_interval == 0
+                    ):
+                        if self._check_auto_stop(current_step, verbose=verbose):
+                            if save_checkpoint:
+                                self._save_checkpoint(
+                                    verbose=verbose,
+                                    context="🎯 INLINE AUTO-STOP FINAL",
+                                    export_brain=True,
+                                )
+                            break
                 else:
                     self.model.zero_grad()
 
@@ -1477,6 +1436,9 @@ class Trainer:
             epochs_traversed += 1
 
             if batches_this_epoch == 0:
+                break
+            
+            if self._auto_stop_triggered:
                 break
 
         if steps_done == 0:
@@ -1497,6 +1459,7 @@ class Trainer:
             "num_correct": int(total_correct),
             "steps": int(steps_done),
             "epochs_traversed": int(epochs_traversed),
+            "auto_stop_triggered": self._auto_stop_triggered,
         }
 
         if verbose:
@@ -1507,11 +1470,14 @@ class Trainer:
                 f"ppl={perplexity:.4f} | "
                 f"acc={accuracy:.4f}"
             )
+            if self._auto_stop_triggered:
+                print(f"[Trainer] 🎯 AUTO-STOP: target tercapai!")
 
-        if save_checkpoint:
-            ckpt_path = self.weight_manager.save_checkpoint()
-            if verbose:
-                print(f"[Trainer] Checkpoint disimpan: {ckpt_path}")
+        if save_checkpoint and not self._auto_stop_triggered:
+            self._save_checkpoint(
+                verbose=verbose,
+                context="Inline Training Final",
+            )
 
         if _RETRIEVER_AVAILABLE:
             self._build_retriever_index(verbose=verbose)
@@ -1525,7 +1491,7 @@ class Trainer:
         save_checkpoint: bool = True,
         verbose: bool = True,
     ) -> List[dict]:
-        """Inline training untuk N epochs dengan SOTA techniques."""
+        """Inline training untuk N epochs."""
         if not self.tokenizer.is_ready:
             self.tokenizer.load()
 
@@ -1550,13 +1516,11 @@ class Trainer:
                 + (f", minimal {min_steps} step" if min_steps > 0 else "")
             )
 
-        # Delegate ke run_epochs dengan current state
         self.set_resume_state(
             start_epoch=current_epoch,
             global_step=current_global_step,
         )
 
-        # Override epochs untuk inline
         original_epochs = self.epochs
         self.epochs = current_epoch + epochs
 
@@ -1575,7 +1539,7 @@ class Trainer:
     # ========================================================================
 
     def _build_retriever_index(self, verbose: bool = True) -> None:
-        """Bangun BM25 retrieval index dari corpus mentah."""
+        """Bangun BM25 retrieval index."""
         if not _RETRIEVER_AVAILABLE:
             if verbose:
                 print("[Trainer] core/retriever.py tidak tersedia.")
@@ -1622,203 +1586,3 @@ class Trainer:
     def get_sota_stats(self) -> Dict:
         """Return SOTA training statistics."""
         return dict(self._self_correction_stats)
-
-
-# ============================================================================
-# DIRECT EXECUTION TEST
-# ============================================================================
-
-if __name__ == "__main__":
-    import tempfile
-
-    from config import (
-        Config,
-        ModelConfig,
-        PathsConfig,
-        SpecialTokensConfig,
-        TrainingConfig,
-        RetrievalConfig,
-    )
-    from core.tokenizer import Tokenizer
-    from core.architecture import CustomTransformerLM
-    from pipeline.evaluator import Evaluator
-    from pipeline.weight_manager import WeightManager
-
-    print("=" * 70)
-    print("pipeline/trainer.py SOTA Test Suite")
-    print("=" * 70)
-
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-
-        datasets_dir = tmp_path / "datasets"
-        output_models_dir = tmp_path / "output_models"
-
-        datasets_dir.mkdir(parents=True, exist_ok=True)
-        output_models_dir.mkdir(parents=True, exist_ok=True)
-
-        sample_file = datasets_dir / "sample.txt"
-        sample_file.write_text(
-            "Mobil adalah kendaraan beroda empat.\n\n"
-            "Rem mobil berfungsi untuk menghentikan kendaraan.\n\n"
-            "Air adalah senyawa H2O.\n\n"
-            "Fotosintesis menghasilkan oksigen.",
-            encoding="utf-8",
-        )
-
-        qa_dataset_path = output_models_dir / "qa_dataset.json"
-        sample_qa_data = {
-            "version": "1.0",
-            "metadata": {
-                "total_samples": 4,
-                "source_corpus_size": 4,
-            },
-            "samples": [
-                {
-                    "context": "Mobil adalah kendaraan beroda empat.",
-                    "question": "Apa itu mobil?",
-                    "answer": "Kendaraan beroda empat.",
-                    "is_impossible": False,
-                },
-                {
-                    "context": "Rem mobil berfungsi untuk menghentikan kendaraan.",
-                    "question": "Apa fungsi rem?",
-                    "answer": "Menghentikan kendaraan.",
-                    "is_impossible": False,
-                },
-                {
-                    "context": "Air adalah senyawa H2O.",
-                    "question": "Apa itu air?",
-                    "answer": "Senyawa H2O.",
-                    "is_impossible": False,
-                },
-                {
-                    "context": "Fotosintesis menghasilkan oksigen.",
-                    "question": "Apa hasil fotosintesis?",
-                    "answer": "Oksigen.",
-                    "is_impossible": False,
-                },
-            ],
-        }
-
-        with open(qa_dataset_path, "w", encoding="utf-8") as f:
-            json.dump(sample_qa_data, f)
-
-        paths = PathsConfig(
-            datasets_dir=datasets_dir,
-            output_models_dir=output_models_dir,
-            vocab_path=tmp_path / "vocab.json",
-            final_model_path=output_models_dir / "otak_model.safetensors",
-            checkpoint_path=output_models_dir / "training_checkpoint.npz",
-            retrieval_index_path=output_models_dir / "retrieval_index.json",
-            qa_dataset_path=qa_dataset_path,
-            merged_qa_train_path=qa_dataset_path,
-        )
-
-        small_config = Config(
-            paths=paths,
-            special_tokens=SpecialTokensConfig(),
-            training=TrainingConfig(
-                learning_rate=3e-4,
-                batch_size=2,
-                epochs=2,
-                sequence_length=32,
-                dropout_rate=0.1,
-                weight_decay=0.01,
-                grad_clip_norm=1.0,
-                seed=1337,
-                lr_warmup_steps=5,
-            ),
-            model=ModelConfig(
-                vocab_size=128,
-                embedding_dim=32,
-                num_attention_heads=4,
-                num_layers=1,
-                max_position_embeddings=64,
-                layer_norm_eps=1e-5,
-                ffn_hidden_dim=64,
-                train_dtype="float32",
-                export_dtype="float32",
-            ),
-            retrieval=RetrievalConfig(top_k=2),
-        )
-
-        tokenizer = Tokenizer(small_config)
-        tokenizer.train()
-
-        model = CustomTransformerLM(small_config)
-        evaluator = Evaluator(small_config)
-        weight_manager = WeightManager(model, small_config)
-
-        trainer = Trainer(
-            model=model,
-            tokenizer=tokenizer,
-            evaluator=evaluator,
-            weight_manager=weight_manager,
-            config=small_config,
-        )
-
-        # Test 1: Load dataset
-        print("\n[Test 1] Load Dataset")
-        n = trainer.load_qa_dataset(verbose=True)
-        assert n == 4, f"Expected 4 samples, got {n}"
-
-        # Test 2: Cosine LR schedule
-        print("\n[Test 2] Cosine LR Schedule")
-        for step in [0, 2, 5, 10, 20]:
-            lr = trainer._get_learning_rate(step, 20)
-            print(f"  Step {step:2d}: lr={lr:.6f}")
-
-        # Test 3: Sample difficulty scoring
-        print("\n[Test 3] Curriculum Difficulty Scoring")
-        for i, sample in enumerate(trainer.qa_samples):
-            diff = trainer._compute_sample_difficulty(sample)
-            print(f"  Sample {i}: difficulty={diff:.3f} | Q: {sample['question'][:30]}")
-
-        # Test 4: SOTA training step
-        print("\n[Test 4] SOTA Training Step")
-        samples_prepared = []
-        for s in trainer.qa_samples:
-            result = trainer._prepare_sample(s)
-            if result is not None:
-                samples_prepared.append(result)
-        
-        if samples_prepared:
-            batch = np.stack(samples_prepared[:2])
-            inputs = batch[:, :-1]
-            targets = batch[:, 1:]
-            
-            loss, metrics = trainer._train_step_sota(inputs, targets, step=0, total_steps=10)
-            print(f"  Loss: {loss:.6f}")
-            print(f"  Metrics: {metrics}")
-
-        # Test 5: Full training (1 epoch)
-        print("\n[Test 5] Full SOTA Training (1 epoch)")
-        trainer.epochs = 1
-        history = trainer.run_epochs(
-            save_checkpoints=True,
-            verbose=True,
-        )
-        
-        print(f"\n  Training selesai: {len(history)} epoch")
-        for r in history:
-            print(f"  - Epoch {r['epoch']}: loss={r['loss']:.4f}, acc={r['accuracy']:.4f}")
-
-        # Test 6: SOTA stats
-        print("\n[Test 6] SOTA Statistics")
-        stats = trainer.get_sota_stats()
-        for k, v in stats.items():
-            print(f"  {k}: {v}")
-
-        # Test 7: EMA weights
-        print("\n[Test 7] EMA Weights")
-        if trainer._ema_weights is not None:
-            print(f"  EMA weights initialized: {len(trainer._ema_weights)} tensors")
-            trainer.apply_ema_to_model()
-            print("  ✅ EMA weights applied ke model")
-        else:
-            print("  ⚠️ EMA weights belum diinitialize")
-
-        print("\n" + "=" * 70)
-        print("✅ pipeline/trainer.py (SOTA) ALL TESTS PASSED")
-        print("=" * 70)
