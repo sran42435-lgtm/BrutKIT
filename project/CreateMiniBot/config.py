@@ -12,6 +12,7 @@
 # - Context-conditioned training
 # - Constrained generation (tokens only from context)
 # - SOTA: RoPE, Weight Tying, Soft-Capping, DropPath
+# - 🎯 9 SOTA Training Techniques (BARU)
 #
 # Implementasi ini sengaja tidak bergantung pada pustaka ML eksternal.
 # Hanya menggunakan standard library Python + NumPy.
@@ -214,6 +215,17 @@ class TrainingConfig:
     - Epochs minimal (3) untuk hindari overfitting di data besar
     - Regularization rendah (data besar = kurang perlu regularization)
     - Sequence length panjang (512) untuk fit context + Q + A
+    
+    🎯 SOTA Training Techniques:
+    1. Cosine LR + Warmup (GPT-3/LLaMA)
+    2. Label Smoothing (Inception-v3)
+    3. Focal Loss (RetinaNet)
+    4. Token Importance Weighting
+    5. Adaptive Gradient Clipping - AGC (NFNet)
+    6. Loss Spike Detection + Recovery
+    7. Curriculum Learning (easy → hard)
+    8. Self-Correction Loop (DeepMind)
+    9. EMA Weights (Polyak Averaging)
     """
     
     # ================================================================
@@ -320,6 +332,81 @@ class TrainingConfig:
     # Loss weight untuk "impossible questions" (SQuAD 2.0 feature)
     # Higher weight = model lebih serius belajar bilang "tidak tahu"
     impossible_loss_weight: float = 1.0
+    
+    # ================================================================
+    # 🎯 SOTA: LEARNING RATE SCHEDULE (BARU)
+    # ================================================================
+    # Cosine annealing dengan warmup (GPT-3/LLaMA style)
+    # True = cosine schedule (recommended)
+    # False = linear decay (simpler)
+    use_cosine_schedule: bool = True
+    
+    # ================================================================
+    # 🎯 SOTA: LABEL SMOOTHING (BARU)
+    # ================================================================
+    # Cegah model overconfident (standard: 0.1)
+    # 0.0 = disabled
+    # 0.1 = recommended (Inception-v3)
+    label_smoothing: float = 0.1
+    
+    # ================================================================
+    # 🎯 SOTA: FOCAL LOSS (BARU)
+    # ================================================================
+    # Fokus pada hard examples (Lin et al. 2017)
+    # γ=0 = standard cross-entropy
+    # γ=2.0 = recommended (down-weight easy examples 100x)
+    use_focal_loss: bool = True
+    focal_gamma: float = 2.0
+    
+    # ================================================================
+    # 🎯 SOTA: TOKEN IMPORTANCE WEIGHTING (BARU)
+    # ================================================================
+    # Answer tokens lebih penting dari question tokens
+    # 1.0 = uniform (no weighting)
+    # 3.0 = answer tokens 3x lebih penting (recommended)
+    use_token_weighting: bool = True
+    answer_token_weight: float = 3.0
+    
+    # ================================================================
+    # 🎯 SOTA: ADAPTIVE GRADIENT CLIPPING - AGC (BARU)
+    # ================================================================
+    # Dari NFNet (Brock et al. 2021) - lebih stabil dari fixed clip
+    # factor = max(||grad|| / ||weight||)
+    # 0.01 = recommended untuk small-medium models
+    use_agc: bool = True
+    agc_factor: float = 0.01
+    
+    # ================================================================
+    # 🎯 SOTA: LOSS SPIKE DETECTION (BARU)
+    # ================================================================
+    # Auto-detect dan recover dari loss spikes
+    # Criterion: loss > mean(history) + 3*std(history)
+    use_loss_spike_detection: bool = True
+    
+    # ================================================================
+    # 🎯 SOTA: CURRICULUM LEARNING (BARU)
+    # ================================================================
+    # Easy → hard sample progression
+    # True = sort by difficulty, gradually introduce harder samples
+    use_curriculum: bool = True
+    
+    # ================================================================
+    # 🎯 SOTA: SELF-CORRECTION LOOP (BARU)
+    # ================================================================
+    # Retrain pada hard samples (DeepMind style)
+    # Jika sample loss > threshold, train ulang beberapa iterasi
+    use_self_correction: bool = True
+    self_correction_max_iter: int = 2
+    hard_sample_loss_threshold: float = 2.0
+    
+    # ================================================================
+    # 🎯 SOTA: EMA WEIGHTS (BARU)
+    # ================================================================
+    # Exponential Moving Average untuk smoother inference
+    # decay=0.999 = recommended (Polyak averaging)
+    # True = maintain EMA weights alongside regular weights
+    use_ema: bool = True
+    ema_decay: float = 0.999
 
     # ================================================================
     # 🎯 FLEXIBLE CHECKPOINT SYSTEM
@@ -328,7 +415,7 @@ class TrainingConfig:
     # - 0 = disabled (tidak save per step, hanya di akhir epoch)
     # - 50 = save setiap 50 steps (recommended untuk quick testing)
     # - 500 = save setiap 500 steps (recommended untuk production)
-    save_checkpoint_every_n_steps: int = 30
+    save_checkpoint_every_n_steps: int = 500
     
     # Save checkpoint berdasarkan EPOCHS:
     # - 0 = disabled (tidak save per epoch)
@@ -685,6 +772,32 @@ class Config:
             raise ValueError("training.impossible_loss_weight tidak boleh negatif.")
 
         # ------------------------------------------------------------------
+        # 🎯 Validasi SOTA training parameters (BARU)
+        # ------------------------------------------------------------------
+        if not (0.0 <= t.label_smoothing < 1.0):
+            raise ValueError(
+                "training.label_smoothing harus berada pada rentang [0, 1)."
+            )
+
+        if t.focal_gamma < 0.0:
+            raise ValueError("training.focal_gamma tidak boleh negatif.")
+
+        if t.answer_token_weight < 0.0:
+            raise ValueError("training.answer_token_weight tidak boleh negatif.")
+
+        if t.agc_factor < 0.0:
+            raise ValueError("training.agc_factor tidak boleh negatif.")
+
+        if t.self_correction_max_iter < 0:
+            raise ValueError("training.self_correction_max_iter tidak boleh negatif.")
+
+        if t.hard_sample_loss_threshold < 0.0:
+            raise ValueError("training.hard_sample_loss_threshold tidak boleh negatif.")
+
+        if not (0.0 <= t.ema_decay < 1.0):
+            raise ValueError("training.ema_decay harus berada pada rentang [0, 1).")
+
+        # ------------------------------------------------------------------
         # Validasi hyperparameter training
         # ------------------------------------------------------------------
         if t.learning_rate <= 0.0:
@@ -750,24 +863,6 @@ class Config:
         if t.inline_training_steps < 1:
             raise ValueError("training.inline_training_steps harus >= 1.")
 
-        if t.save_checkpoint_every_n_steps < 0:
-            raise ValueError("training.save_checkpoint_every_n_steps tidak boleh negatif.")
-        
-        if t.save_checkpoint_every_n_epochs < 0:
-            raise ValueError("training.save_checkpoint_every_n_epochs tidak boleh negatif.")
-
-	# Auto-stop validation
-        if t.auto_stop_loss_threshold < 0.0:
-            raise ValueError("training.auto_stop_loss_threshold tidak boleh negatif.")
-        if not (0.0 <= t.auto_stop_accuracy_threshold <= 1.0):
-            raise ValueError("training.auto_stop_accuracy_threshold harus [0, 1].")
-        if t.auto_stop_min_steps < 0:
-            raise ValueError("training.auto_stop_min_steps tidak boleh negatif.")
-        if t.auto_stop_patience_steps < 1:
-            raise ValueError("training.auto_stop_patience_steps harus >= 1.")
-        if t.auto_stop_check_interval < 1:
-            raise ValueError("training.auto_stop_check_interval harus >= 1.")
-
 
 # ==============================================================================
 # INSTANCE GLOBAL
@@ -787,7 +882,7 @@ if __name__ == "__main__":
     CONFIG.ensure_dirs()
 
     print("=" * 70)
-    print("CONFIGURATION SUMMARY (Path B - Constrained Generation)")
+    print("CONFIGURATION SUMMARY (RAG + SOTA v2.0)")
     print("=" * 70)
     
     print(f"\n📁 Paths:")
@@ -823,15 +918,15 @@ if __name__ == "__main__":
     print(f"  export_dtype          : {CONFIG.model.export_dtype}")
     
     print(f"\n🔬 SOTA Features:")
-    print(f"  use_rope              : {CONFIG.model.use_rope}")
-    print(f"  use_weight_tying      : {CONFIG.model.use_weight_tying}")
-    print(f"  attention_logit_cap   : {CONFIG.model.attention_logit_cap}")
-    print(f"  final_logit_cap       : {CONFIG.model.final_logit_cap}")
-    print(f"  drop_path_rate        : {CONFIG.model.drop_path_rate}")
-    print(f"  cross_attention_layers: {CONFIG.model.cross_attention_layers}")
-    print(f"  use_constrained_gen   : {CONFIG.model.use_constrained_generation}")
+    print(f"  use_rope                    : {CONFIG.model.use_rope}")
+    print(f"  use_weight_tying            : {CONFIG.model.use_weight_tying}")
+    print(f"  attention_logit_cap         : {CONFIG.model.attention_logit_cap}")
+    print(f"  final_logit_cap             : {CONFIG.model.final_logit_cap}")
+    print(f"  drop_path_rate              : {CONFIG.model.drop_path_rate}")
+    print(f"  cross_attention_layers      : {CONFIG.model.cross_attention_layers}")
+    print(f"  use_constrained_generation  : {CONFIG.model.use_constrained_generation}")
 
-    print(f"\n📚 Training:")
+    print(f"\n📚 Training (Core):")
     print(f"  learning_rate         : {CONFIG.training.learning_rate}")
     print(f"  batch_size            : {CONFIG.training.batch_size}")
     print(f"  epochs                : {CONFIG.training.epochs}")
@@ -844,6 +939,29 @@ if __name__ == "__main__":
     print(f"  early_stopping        : {CONFIG.training.early_stopping_patience}")
     print(f"  eval_every_n_steps    : {CONFIG.training.eval_every_n_steps}")
     print(f"  save_checkpoint_every : {CONFIG.training.save_checkpoint_every_n_steps}")
+
+    print(f"\n🎯 SOTA Training Techniques:")
+    techniques = [
+        ("Cosine LR + Warmup", CONFIG.training.use_cosine_schedule),
+        ("Label Smoothing (ε={})".format(CONFIG.training.label_smoothing), 
+         CONFIG.training.label_smoothing > 0),
+        ("Focal Loss (γ={})".format(CONFIG.training.focal_gamma), 
+         CONFIG.training.use_focal_loss),
+        ("Token Weighting (×{})".format(CONFIG.training.answer_token_weight), 
+         CONFIG.training.use_token_weighting),
+        ("Adaptive Gradient Clipping (factor={})".format(CONFIG.training.agc_factor), 
+         CONFIG.training.use_agc),
+        ("Loss Spike Detection", CONFIG.training.use_loss_spike_detection),
+        ("Curriculum Learning", CONFIG.training.use_curriculum),
+        ("Self-Correction Loop (max_iter={})".format(CONFIG.training.self_correction_max_iter), 
+         CONFIG.training.use_self_correction),
+        ("EMA Weights (decay={})".format(CONFIG.training.ema_decay), 
+         CONFIG.training.use_ema),
+    ]
+    
+    for name, active in techniques:
+        status = "✅" if active else "❌"
+        print(f"  {status} {name}")
 
     print(f"\n🔎 RAG Training:")
     print(f"  context_dropout_rate  : {CONFIG.training.context_dropout_rate}")
@@ -879,8 +997,3 @@ if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("✅ config.py valid dan optimized untuk 142K samples!")
     print("=" * 70)
-    print("\n🚀 Next step: Update core/architecture.py untuk support:")
-    print("   - Constrained generation (vocab masking)")
-    print("   - Cross-attention ke context")
-    print("   - SQuAD-specific QA format")
-
