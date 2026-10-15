@@ -415,7 +415,7 @@ class TrainingConfig:
     # - 0 = disabled (tidak save per step, hanya di akhir epoch)
     # - 50 = save setiap 50 steps (recommended untuk quick testing)
     # - 500 = save setiap 500 steps (recommended untuk production)
-    save_checkpoint_every_n_steps: int = 50
+    save_checkpoint_every_n_steps: int = 10
     
     # Save checkpoint berdasarkan EPOCHS:
     # - 0 = disabled (tidak save per epoch)

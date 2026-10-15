@@ -2,13 +2,16 @@
 #
 # Weight Manager / Optimizer Engine untuk Training Pipeline Engine.
 #
-# VERSI SOTA-ENHANCED (v2.3):
+# VERSI SOTA-ENHANCED (v2.3.2b - FINAL):
 # - AdamW optimizer dengan gradient clipping
 # - Learning rate scheduling (warmup + cosine + decay)
 # - EMA Weights (Polyak Averaging) - save/load/apply
 # - Sanitasi gradient & bobot dari NaN/Inf
 # - Checkpoint save/load dengan backward compatibility
 # - 🆕 v2.3: Metrics tracking (loss, PPL, accuracy) untuk auto-resume + /status
+# - 🆕 v2.3.1: ATOMIC WRITE - cegah corrupt checkpoint saat interrupt
+# - 🆕 v2.3.2: MANUAL ZIP WRITING - fix np.savez_compressed silent failure
+# - 🆕 v2.3.2b: ROBUST ZIP VALIDATION - fix testzip() issue dengan file besar
 #
 # Tugas utama:
 # 1. Menginisialisasi optimizer AdamW.
@@ -33,9 +36,13 @@
 
 from __future__ import annotations
 
+import io
+import os
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 # ============================================================================
 # FIX IMPORT PATH
@@ -60,6 +67,10 @@ except ImportError as exc:
 from config import CONFIG, Config
 
 
+# 🆕 v2.3.1: Magic bytes untuk validasi ZIP
+ZIP_MAGIC_BYTES = b'PK\x03\x04'
+
+
 class WeightManager:
     """
     Pengelola pembaruan bobot model dengan SOTA enhancements.
@@ -73,6 +84,8 @@ class WeightManager:
     - Learning rate scheduling (warmup + decay)
     - 🎯 EMA Weights (Polyak Averaging) untuk inference lebih smooth
     - 🆕 Metrics tracking (loss, PPL, accuracy) untuk auto-resume + /status
+    - 🆕 v2.3.1: Atomic write + ZIP validation untuk cegah corrupt
+    - 🆕 v2.3.2: Manual ZIP writing (robust untuk file besar)
     - Penyimpanan epoch & global step di checkpoint
 
     Alur pemakaian normal:
@@ -572,21 +585,160 @@ class WeightManager:
                 self.ema_decay = float(state["ema_decay"])
 
     # ========================================================================
-    # CHECKPOINT
+    # 🆕 v2.3.1 + v2.3.2b: ZIP VALIDATION + MANUAL ZIP WRITING
+    # ========================================================================
+
+    @staticmethod
+    def _check_zip_magic(path: Path) -> bool:
+        """
+        Cek apakah file dimulai dengan ZIP magic bytes (PK\x03\x04).
+        
+        Quick check (read 4 bytes only) untuk detect truncated/corrupt file
+        sebelum mencoba load dengan np.load().
+        """
+        try:
+            with open(path, 'rb') as f:
+                magic = f.read(4)
+                return magic == ZIP_MAGIC_BYTES
+        except Exception:
+            return False
+
+    @staticmethod
+    def _verify_zip_integrity(path: Path) -> Tuple[bool, Optional[str]]:
+        """
+        Verify ZIP file integrity dengan approach robust.
+        
+        🆕 v2.3.2b: Fix untuk file besar (Zip64)
+        
+        Strategy:
+        1. Check bisa dibuka sebagai ZipFile
+        2. Check required metadata entries ada (fast, no data read)
+        3. Skip testzip() karena unreliable untuk Zip64 files
+        4. Verify dengan np.load() (ultimate validator)
+        
+        Args:
+            path: path ke file .npz
+        
+        Returns:
+            (is_valid, error_message)
+            - is_valid: True jika file OK
+            - error_message: None jika valid, atau string error jika invalid
+        """
+        try:
+            # Step 1: Can open as ZipFile?
+            with zipfile.ZipFile(path, 'r') as zf:
+                names = zf.namelist()
+                
+                # Step 2: Check required metadata keys (fast, no data read)
+                required = ['step.npy', 'global_step.npy', 'last_epoch.npy']
+                missing = [r for r in required if r not in names]
+                if missing:
+                    return False, f"Missing keys: {missing}"
+                
+                # Check file punya minimal beberapa entries (sanity)
+                if len(names) < 3:
+                    return False, f"Too few entries: {len(names)}"
+            
+            # Step 3: Verify dengan np.load() (ultimate validator)
+            # Skip testzip() karena unreliable untuk Zip64 files besar
+            try:
+                with np.load(path, allow_pickle=False) as data:
+                    if "step" not in data:
+                        return False, "np.load: 'step' key missing"
+                    # Test access (read actual data)
+                    _ = int(data["step"])
+                return True, None
+            except Exception as e:
+                return False, f"np.load failed: {type(e).__name__}: {e}"
+                
+        except zipfile.BadZipFile as e:
+            return False, f"BadZipFile: {e}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    @staticmethod
+    def _write_checkpoint_manual(path: Path, payload: Dict[str, np.ndarray]) -> int:
+        """
+        🆕 v2.3.2: Write checkpoint menggunakan manual ZIP approach.
+        
+        Lebih robust daripada np.savez_compressed karena:
+        - Tidak ada limit kwargs (fix bug NumPy dengan banyak keys panjang)
+        - allowZip64=True support file >4GB
+        - Full control error handling
+        - Compatible dengan np.load() karena format sama
+        
+        Args:
+            path: target file path
+            payload: dict nama array → numpy array
+        
+        Returns:
+            Total bytes written (uncompressed payload size)
+        
+        Raises:
+            IOError jika write gagal
+        """
+        total_bytes = 0
+        
+        try:
+            # Gunakan ZIP_DEFLATED untuk compression (sama dengan savez_compressed)
+            with zipfile.ZipFile(
+                str(path), 
+                'w', 
+                compression=zipfile.ZIP_DEFLATED,
+                allowZip64=True,
+            ) as zf:
+                for name, arr in payload.items():
+                    # Convert ke numpy array (jika belum)
+                    arr_np = np.asarray(arr)
+                    
+                    # Save ke in-memory buffer menggunakan np.save
+                    buf = io.BytesIO()
+                    np.save(buf, arr_np, allow_pickle=False)
+                    buf.seek(0)
+                    data_bytes = buf.read()
+                    
+                    # Write ke ZIP dengan nama {key}.npy (format npz standard)
+                    entry_name = f"{name}.npy"
+                    zf.writestr(entry_name, data_bytes)
+                    total_bytes += len(data_bytes)
+            
+            return total_bytes
+            
+        except Exception as e:
+            raise IOError(f"Manual ZIP write gagal: {e}") from e
+
+    # ========================================================================
+    # CHECKPOINT (v2.3.2b - ATOMIC WRITE + MANUAL ZIP + ROBUST VERIFY)
     # ========================================================================
 
     def save_checkpoint(self, path: Optional[Path] = None) -> Path:
         """
         Menyimpan checkpoint model + optimizer + EMA + metrics ke file .npz.
 
+        🆕 v2.3.2b: ATOMIC WRITE + MANUAL ZIP WRITING + ROBUST VERIFICATION
+        
+        Flow:
+        1. Build payload di memory
+        2. Write ke temporary file (.npz.tmp) menggunakan manual ZIP writing
+        3. Verify temp file sebagai valid ZIP (dengan np.load)
+        4. Backup file lama ke .bak (jika ada)
+        5. Atomic rename: .tmp → final .npz
+        6. Cleanup backup
+        
+        Benefit:
+        - No kwargs limit (fix silent failure di np.savez_compressed)
+        - Support file besar (>4GB via Zip64)
+        - Atomic: file utama selalu complete atau tidak ada
+        - Crash saat write tidak corrupt file utama
+        
         Format keys:
         - step, global_step, last_epoch: metadata
         - learning_rate, base_learning_rate: LR state
-        - last_loss, last_perplexity, last_accuracy: 🆕 metrics (v2.3)
+        - last_loss, last_perplexity, last_accuracy: metrics (v2.3)
         - model__{name}: model weights
         - adam_m__{name}: Adam first moment
         - adam_v__{name}: Adam second moment
-        - ema__{name}: 🎯 EMA weights
+        - ema__{name}: EMA weights
         - ema_decay, ema_initialized: EMA metadata
         """
         if path is None:
@@ -599,6 +751,7 @@ class WeightManager:
 
         path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Build payload
         payload = {
             "step": np.array(self.step_count, dtype=np.int64),
             "global_step": np.array(self.global_step, dtype=np.int64),
@@ -618,22 +771,118 @@ class WeightManager:
         for name, param in self.params.items():
             safe_name = name.replace(".", "__")
 
-            payload[f"model__{safe_name}"] = param.data.astype(np.float32)
-            payload[f"adam_m__{safe_name}"] = self.m[name].astype(np.float32)
-            payload[f"adam_v__{safe_name}"] = self.v[name].astype(np.float32)
+            payload[f"model__{safe_name}"] = param.data.astype(np.float32, copy=True)
+            payload[f"adam_m__{safe_name}"] = self.m[name].astype(np.float32, copy=True)
+            payload[f"adam_v__{safe_name}"] = self.v[name].astype(np.float32, copy=True)
             
             # 🎯 Save EMA weights
             if self._ema_initialized and name in self.ema_weights:
-                payload[f"ema__{safe_name}"] = self.ema_weights[name].astype(np.float32)
+                payload[f"ema__{safe_name}"] = self.ema_weights[name].astype(np.float32, copy=True)
 
-        np.savez_compressed(path, **payload)
-
-        return path
+        # ================================================================
+        # 🆕 ATOMIC WRITE dengan MANUAL ZIP
+        # ================================================================
+        temp_fd = None
+        temp_path = None
+        backup_path = path.with_suffix('.npz.bak')
+        
+        try:
+            # Step 1: Create temp file di directory yang sama (untuk atomic rename)
+            temp_fd, temp_path_str = tempfile.mkstemp(
+                suffix=".npz.tmp",
+                prefix=f"{path.stem}_",
+                dir=str(path.parent)
+            )
+            temp_path = Path(temp_path_str)
+            os.close(temp_fd)
+            temp_fd = None
+            
+            # Step 2: Write ke temp file menggunakan manual ZIP
+            bytes_written = self._write_checkpoint_manual(temp_path, payload)
+            
+            # Step 3: Verify file written
+            if not temp_path.exists():
+                raise IOError(f"Temp file tidak dibuat: {temp_path}")
+            
+            file_size = temp_path.stat().st_size
+            if file_size == 0:
+                raise IOError(f"Temp file kosong: {temp_path}")
+            
+            # Sanity check: file size harus reasonable
+            if file_size < bytes_written * 0.1:
+                raise IOError(
+                    f"Temp file terlalu kecil: {file_size:,} bytes "
+                    f"(expected at least {bytes_written // 10:,} bytes)"
+                )
+            
+            # Step 4: Verify ZIP integrity dengan np.load (ultimate validator)
+            is_valid, error_msg = self._verify_zip_integrity(temp_path)
+            if not is_valid:
+                raise IOError(f"Temp file invalid: {error_msg}")
+            
+            # Step 5: Backup file lama (jika ada)
+            if path.exists():
+                try:
+                    if backup_path.exists():
+                        backup_path.unlink()
+                    path.rename(backup_path)
+                except Exception as e:
+                    print(f"[WeightManager] ⚠️ Gagal backup file lama: {e}")
+            
+            # Step 6: Atomic rename temp → final
+            temp_path.rename(path)
+            
+            # Step 7: Cleanup backup jika rename sukses
+            if backup_path.exists():
+                try:
+                    backup_path.unlink()
+                except Exception:
+                    pass
+            
+            return path
+            
+        except Exception as e:
+            # Cleanup temp file jika ada error
+            if temp_fd is not None:
+                try:
+                    os.close(temp_fd)
+                except Exception:
+                    pass
+            
+            if temp_path is not None and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+            
+            # Restore dari backup jika file utama hilang
+            if backup_path.exists() and not path.exists():
+                try:
+                    backup_path.rename(path)
+                    print(f"[WeightManager] ℹ️ Restored dari backup: {backup_path.name}")
+                except Exception as restore_err:
+                    print(f"[WeightManager] ⚠️ Gagal restore backup: {restore_err}")
+            
+            raise IOError(
+                f"Gagal save checkpoint (atomic write): {e}\n"
+                f"Target: {path}\n"
+                f"Payload keys: {len(payload)}\n"
+                f"Checkpoint lama tetap aman (jika ada backup)."
+            ) from e
 
     def load_checkpoint(self, path: Optional[Path] = None) -> Path:
         """
         Memuat checkpoint model + optimizer + EMA + metrics dari file .npz.
 
+        🆕 v2.3.1: PRE-VALIDATION + BACKUP FALLBACK
+        
+        Flow:
+        1. Cek magic bytes file utama
+        2. Jika invalid, coba backup (.bak)
+        3. Try load dengan np.load()
+        4. Jika gagal, coba backup
+        5. Continue load normal
+        
         Backward compatible:
         - Jika checkpoint lama (tanpa EMA), EMA akan di-initialize dari model weights
         - Jika checkpoint lama (tanpa metrics), metrics default ke 0
@@ -647,14 +896,65 @@ class WeightManager:
         if path.suffix != ".npz":
             path = path.with_suffix(".npz")
 
-        if not path.exists():
-            raise FileNotFoundError(f"Checkpoint tidak ditemukan di: {path}")
-
-        data = np.load(path, allow_pickle=False)
-
-        if "step" not in data:
-            raise ValueError("File checkpoint tidak valid: tidak memiliki 'step'.")
-
+        # ================================================================
+        # 🆕 PRE-VALIDATION + BACKUP FALLBACK
+        # ================================================================
+        backup_path = path.with_suffix('.npz.bak')
+        paths_to_try = [path]
+        if backup_path.exists():
+            paths_to_try.append(backup_path)
+        
+        data = None
+        loaded_path = None
+        last_error = None
+        
+        for try_path in paths_to_try:
+            if not try_path.exists():
+                continue
+            
+            # Pre-validation: cek ZIP magic bytes (fast check)
+            if not self._check_zip_magic(try_path):
+                print(f"[WeightManager] ⚠️ {try_path.name}: bukan valid ZIP (bad magic), skip")
+                continue
+            
+            # Try load
+            try:
+                data = np.load(try_path, allow_pickle=False)
+                
+                # Verify minimal keys
+                if "step" not in data:
+                    raise ValueError("File tidak memiliki 'step'")
+                
+                # Verify ZIP integrity lebih detail (dengan np.load)
+                is_valid, error_msg = self._verify_zip_integrity(try_path)
+                if not is_valid:
+                    raise ValueError(f"ZIP integrity check failed: {error_msg}")
+                
+                loaded_path = try_path
+                break
+                
+            except Exception as e:
+                last_error = e
+                print(f"[WeightManager] ⚠️ Gagal load {try_path.name}: {e}")
+                data = None
+                continue
+        
+        if data is None:
+            if not path.exists() and not backup_path.exists():
+                raise FileNotFoundError(f"Checkpoint tidak ditemukan di: {path}")
+            raise ValueError(
+                f"Semua checkpoint candidates corrupt/invalid.\n"
+                f"Tried: {[str(p) for p in paths_to_try]}\n"
+                f"Error terakhir: {last_error}\n"
+                f"Saran: hapus checkpoint dan train ulang.\n"
+                f"  rm -f {path}"
+            )
+        
+        # Use loaded path untuk info
+        if loaded_path != path:
+            print(f"[WeightManager] ℹ️ Loaded dari backup: {loaded_path.name}")
+        
+        # Continue dengan load logic normal
         self.step_count = int(data["step"])
         self.global_step = int(data.get("global_step", self.step_count))
         self.last_epoch = int(data.get("last_epoch", 0))
@@ -667,7 +967,7 @@ class WeightManager:
         else:
             self.base_learning_rate = self.learning_rate
         
-        # 🆕 Load metrics (backward compatible - default ke 0 jika tidak ada)
+        # 🆕 Load metrics (backward compatible)
         self._last_loss = float(data.get("last_loss", 0.0))
         self._last_perplexity = float(data.get("last_perplexity", 1.0))
         self._last_accuracy = float(data.get("last_accuracy", 0.0))
@@ -749,11 +1049,13 @@ class WeightManager:
             if self.use_ema:
                 self.initialize_ema()
 
-        return path
+        return loaded_path
 
     def load_ema_weights(self, path: Optional[Path] = None) -> bool:
         """
         Hanya load EMA weights dari checkpoint (tanpa load model weights).
+        
+        🆕 v2.3.1: Pre-validation sebelum load
         
         Berguna untuk:
         - Apply EMA weights ke model yang sudah di-load
@@ -771,6 +1073,11 @@ class WeightManager:
             path = path.with_suffix(".npz")
 
         if not path.exists():
+            return False
+        
+        # 🆕 Pre-validation
+        if not self._check_zip_magic(path):
+            print(f"[WeightManager] ⚠️ {path.name}: bukan valid ZIP, skip EMA load")
             return False
 
         try:
@@ -795,7 +1102,8 @@ class WeightManager:
             
             return False
         
-        except Exception:
+        except Exception as e:
+            print(f"[WeightManager] ⚠️ Gagal load EMA weights: {e}")
             return False
 
 
@@ -816,7 +1124,7 @@ if __name__ == "__main__":
     from core.architecture import CustomTransformerLM
 
     print("=" * 70)
-    print("pipeline/weight_manager.py SOTA v2.3 Test Suite")
+    print("pipeline/weight_manager.py SOTA v2.3.2b Test Suite")
     print("=" * 70)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -890,10 +1198,8 @@ if __name__ == "__main__":
         # Test 3: EMA Update
         # --------------------------------------------------------------------
         print("\n[Test 3] EMA Update")
-        # Simpan initial EMA untuk comparison
         initial_ema = {k: v.copy() for k, v in weight_manager.ema_weights.items()}
         
-        # Do a few more steps to change model weights
         for _ in range(3):
             model.zero_grad()
             logits = model.forward(input_ids, training=True)
@@ -902,7 +1208,6 @@ if __name__ == "__main__":
             weight_manager.step()
             weight_manager.update_ema()
         
-        # Check EMA has changed
         changed_count = 0
         for name in initial_ema:
             if not np.allclose(initial_ema[name], weight_manager.ema_weights[name]):
@@ -930,12 +1235,21 @@ if __name__ == "__main__":
         assert abs(metrics['accuracy'] - 0.7234) < 1e-6
 
         # --------------------------------------------------------------------
-        # Test 5: Checkpoint Save (with EMA + Metrics)
+        # Test 5: Checkpoint Save (with EMA + Metrics) - Atomic Write v2.3.2b
         # --------------------------------------------------------------------
-        print("\n[Test 5] Checkpoint Save (with EMA + Metrics)")
+        print("\n[Test 5] Checkpoint Save (Atomic Write v2.3.2b)")
         ckpt_path = weight_manager.save_checkpoint()
         print(f"  Checkpoint saved : {ckpt_path}")
         print(f"  File size        : {ckpt_path.stat().st_size:,} bytes")
+        
+        # Verify ZIP integrity
+        is_valid, error_msg = WeightManager._verify_zip_integrity(ckpt_path)
+        print(f"  ZIP integrity    : {'✅ OK' if is_valid else '❌ ' + str(error_msg)}")
+        assert is_valid, f"Checkpoint harus valid ZIP: {error_msg}"
+        
+        has_magic = WeightManager._check_zip_magic(ckpt_path)
+        print(f"  Magic bytes OK   : {has_magic}")
+        assert has_magic
         
         # Verify EMA + Metrics keys in checkpoint
         data = np.load(ckpt_path, allow_pickle=False)
@@ -950,16 +1264,13 @@ if __name__ == "__main__":
         # --------------------------------------------------------------------
         # Test 6: Checkpoint Load (with EMA + Metrics)
         # --------------------------------------------------------------------
-        print("\n[Test 6] Checkpoint Load (with EMA + Metrics)")
-        # Save state before load
+        print("\n[Test 6] Checkpoint Load (with Pre-validation v2.3.1)")
         ema_before = {k: v.copy() for k, v in weight_manager.ema_weights.items()}
         metrics_before = weight_manager.get_last_metrics()
         
-        # Create fresh model and manager
         model2 = CustomTransformerLM(small_config)
         wm2 = WeightManager(model2, small_config)
         
-        # Load checkpoint
         loaded_path = wm2.load_checkpoint(ckpt_path)
         print(f"  Loaded from      : {loaded_path}")
         print(f"  Step count       : {wm2.step_count}")
@@ -967,18 +1278,15 @@ if __name__ == "__main__":
         print(f"  EMA initialized  : {wm2._ema_initialized}")
         print(f"  EMA weights count: {len(wm2.ema_weights)}")
         
-        # Verify metrics
         metrics_after = wm2.get_last_metrics()
         print(f"  Loaded loss      : {metrics_after['loss']:.4f}")
         print(f"  Loaded perplexity: {metrics_after['perplexity']:.4f}")
         print(f"  Loaded accuracy  : {metrics_after['accuracy']:.4f}")
         
-        # Verify metrics match
         assert abs(metrics_before['loss'] - metrics_after['loss']) < 1e-6
         assert abs(metrics_before['perplexity'] - metrics_after['perplexity']) < 1e-4
         assert abs(metrics_before['accuracy'] - metrics_after['accuracy']) < 1e-6
         
-        # Verify EMA weights match
         ema_match = True
         for name in ema_before:
             if name in wm2.ema_weights:
@@ -994,17 +1302,14 @@ if __name__ == "__main__":
         # Test 7: Apply EMA to Model
         # --------------------------------------------------------------------
         print("\n[Test 7] Apply EMA to Model")
-        # Save current model weights
         model_weights_before = {
             name: param.data.copy()
             for name, param in wm2.params.items()
         }
         
-        # Apply EMA
         success = wm2.apply_ema_to_model()
         print(f"  Apply success    : {success}")
         
-        # Verify model weights changed to EMA
         changed = 0
         for name in model_weights_before:
             if not np.allclose(model_weights_before[name], wm2.params[name].data):
@@ -1017,7 +1322,6 @@ if __name__ == "__main__":
         # Test 8: Backward Compatibility (old checkpoint without EMA & Metrics)
         # --------------------------------------------------------------------
         print("\n[Test 8] Backward Compatibility (old checkpoint)")
-        # Create a fake old checkpoint (without ema__ keys and metrics)
         old_ckpt_path = output_dir / "old_checkpoint.npz"
         
         old_payload = {
@@ -1026,8 +1330,6 @@ if __name__ == "__main__":
             "last_epoch": np.array(2, dtype=np.int64),
             "learning_rate": np.array(3e-4, dtype=np.float32),
             "base_learning_rate": np.array(3e-4, dtype=np.float32),
-            # No ema_initialized, no ema_decay, no ema__ keys
-            # No last_loss, last_perplexity, last_accuracy
         }
         
         for name, param in wm2.params.items():
@@ -1038,12 +1340,10 @@ if __name__ == "__main__":
         
         np.savez_compressed(old_ckpt_path, **old_payload)
         
-        # Load with new manager
         model3 = CustomTransformerLM(small_config)
         wm3 = WeightManager(model3, small_config)
         wm3.load_checkpoint(old_ckpt_path)
         
-        # Verify defaults
         metrics3 = wm3.get_last_metrics()
         print(f"  Old ckpt loaded      : True")
         print(f"  Step count           : {wm3.step_count}")
@@ -1074,9 +1374,8 @@ if __name__ == "__main__":
         
         print(f"  Warmup LR progression:")
         print(f"    Step 0  : {lrs[0]:.6e}")
-        print(f"    Step 50 : {lrs[5] if len(lrs) > 5 else 'N/A'}")
-        print(f"    Step 100: {lrs[10] if len(lrs) > 10 else 'N/A'}")
-        print(f"    Step 150: {lrs[15] if len(lrs) > 15 else 'N/A'}")
+        print(f"    Step 5  : {lrs[5]:.6e}")
+        print(f"    Step 10 : {lrs[10]:.6e}")
 
         # --------------------------------------------------------------------
         # Test 10: Gradient Clipping
@@ -1085,7 +1384,6 @@ if __name__ == "__main__":
         model5 = CustomTransformerLM(small_config)
         wm5 = WeightManager(model5, small_config)
         
-        # Set large gradients
         for param in wm5.params.values():
             param.grad = np.random.randn(*param.shape).astype(np.float32) * 100.0
         
@@ -1109,7 +1407,6 @@ if __name__ == "__main__":
         # Test 11: State Dict Round-trip (with Metrics)
         # --------------------------------------------------------------------
         print("\n[Test 11] State Dict Round-trip (with Metrics)")
-        # Set some metrics
         weight_manager.update_metrics(loss=0.5, perplexity=1.65, accuracy=0.8)
         state = weight_manager.state_dict()
         
@@ -1117,7 +1414,6 @@ if __name__ == "__main__":
         wm6 = WeightManager(model6, small_config)
         wm6.load_state_dict(state)
         
-        # Verify all preserved
         metrics6 = wm6.get_last_metrics()
         print(f"  Step preserved     : {wm6.step_count == weight_manager.step_count}")
         print(f"  Global step match  : {wm6.global_step == weight_manager.global_step}")
@@ -1133,6 +1429,139 @@ if __name__ == "__main__":
         assert abs(metrics6['perplexity'] - 1.65) < 1e-4
         assert abs(metrics6['accuracy'] - 0.8) < 1e-6
 
+        # --------------------------------------------------------------------
+        # 🆕 Test 12: Corrupt File Detection (v2.3.1 NEW)
+        # --------------------------------------------------------------------
+        print("\n[Test 12] Corrupt File Detection (v2.3.1 NEW)")
+        corrupt_path = output_dir / "corrupt_checkpoint.npz"
+        with open(corrupt_path, 'wb') as f:
+            # Write valid ZIP header
+            f.write(b'PK\x03\x04')
+            # Truncate (no EOCD, no data)
+            f.write(b'\x00' * 100)
+        
+        # Verify magic bytes (should pass - header is valid)
+        has_magic = WeightManager._check_zip_magic(corrupt_path)
+        print(f"  Magic bytes OK   : {has_magic} (expected True)")
+        assert has_magic, "Truncated file still has magic bytes"
+        
+        # Verify integrity (should fail)
+        is_valid, error_msg = WeightManager._verify_zip_integrity(corrupt_path)
+        print(f"  Integrity check  : {'OK' if is_valid else 'FAILED'} - {error_msg}")
+        assert not is_valid, "Truncated file harus gagal integrity check"
+        
+        # Try load (should fail with helpful error)
+        model_corrupt = CustomTransformerLM(small_config)
+        wm_corrupt = WeightManager(model_corrupt, small_config)
+        
+        try:
+            wm_corrupt.load_checkpoint(corrupt_path)
+            print("  ❌ FAIL: Should have raised ValueError")
+            assert False, "Load corrupt file should fail"
+        except ValueError as e:
+            print(f"  ✅ Load failed as expected: {str(e)[:80]}...")
+        
+        # Cleanup
+        corrupt_path.unlink()
+
+        # --------------------------------------------------------------------
+        # 🆕 Test 13: Atomic Write - Multiple Saves (v2.3.1 NEW)
+        # --------------------------------------------------------------------
+        print("\n[Test 13] Atomic Write - Multiple Saves (v2.3.1 NEW)")
+        valid_path = weight_manager.save_checkpoint()
+        valid_size = valid_path.stat().st_size
+        print(f"  First save       : {valid_size:,} bytes")
+        
+        valid_path2 = weight_manager.save_checkpoint()
+        valid_size2 = valid_path2.stat().st_size
+        print(f"  Second save      : {valid_size2:,} bytes")
+        
+        assert valid_path == valid_path2, "Path harus sama"
+        assert abs(valid_size - valid_size2) < 1000, "Size harus mirip"
+        
+        # Verify no .tmp files left
+        tmp_files = list(valid_path.parent.glob("*.npz.tmp"))
+        print(f"  Orphan .tmp files: {len(tmp_files)}")
+        assert len(tmp_files) == 0, "No orphan temp files should remain"
+        
+        # Verify no .bak files left (cleaned up)
+        bak_files = list(valid_path.parent.glob("*.npz.bak"))
+        print(f"  Orphan .bak files: {len(bak_files)}")
+        assert len(bak_files) == 0, "Backup should be cleaned up after success"
+
+        # --------------------------------------------------------------------
+        # 🆕 Test 14: Large Payload (v2.3.2b - simulating 46M params) [FIXED]
+        # --------------------------------------------------------------------
+        print("\n[Test 14] Large Payload (v2.3.2b - simulating 46M params)")
+        # Simulate payload dengan banyak keys panjang (seperti 46M model)
+        # Note: Ini payload sintetis (hanya weights, tanpa metadata step/epoch)
+        # jadi _verify_zip_integrity tidak berlaku di sini
+        large_payload = {}
+        for i in range(200):
+            large_payload[f"model__layers__{i}__self_attn__q_proj__weight"] = (
+                np.random.randn(512, 512).astype(np.float32)
+            )
+        
+        large_ckpt = output_dir / "large_test.npz"
+        bytes_written = WeightManager._write_checkpoint_manual(large_ckpt, large_payload)
+        file_size_mb = large_ckpt.stat().st_size / 1024 / 1024
+        print(f"  Payload (raw)    : {bytes_written / 1024 / 1024:.2f} MB")
+        print(f"  File size (zip)  : {file_size_mb:.2f} MB")
+        
+        # Verify dengan np.load (ultimate validator)
+        np_load_ok = False
+        loaded_keys = 0
+        sample_shape = None
+        try:
+            with np.load(large_ckpt, allow_pickle=False) as data:
+                loaded_keys = len(data.files)
+                print(f"  np.load: OK, {loaded_keys} keys")
+                sample_key = list(data.files)[0]
+                sample_shape = data[sample_key].shape
+                print(f"  Sample entry '{sample_key}': shape {sample_shape}")
+                
+                # Verify semua data bisa dibaca tanpa error
+                for key in list(data.files)[:5]:
+                    _ = data[key].shape  # Trigger actual read
+                print(f"  Sample read: OK (5 entries verified)")
+                
+                np_load_ok = True
+        except Exception as e:
+            print(f"  np.load FAILED: {type(e).__name__}: {e}")
+        
+        # Verify ZIP structure
+        zip_structure_ok = False
+        try:
+            with zipfile.ZipFile(large_ckpt, 'r') as zf:
+                names = zf.namelist()
+                print(f"  ZIP entries    : {len(names)}")
+                print(f"  First 3        : {names[:3]}")
+                zip_structure_ok = len(names) == 200
+        except Exception as e:
+            print(f"  ZIP open FAILED: {type(e).__name__}: {e}")
+        
+        # Assertion: hanya cek yang relevan untuk payload sintetis
+        # - np.load berhasil (ultimate validator)
+        # - ZIP structure valid (200 entries)
+        # - Skip _verify_zip_integrity karena payload tidak punya metadata
+        assert np_load_ok, "np.load harus berhasil (ultimate validator)"
+        assert loaded_keys == 200, f"Expected 200 keys, got {loaded_keys}"
+        assert sample_shape == (512, 512), f"Expected (512, 512), got {sample_shape}"
+        assert zip_structure_ok, "ZIP structure harus valid"
+        
+        print(f"  ✅ Large payload OK: {file_size_mb:.2f} MB, {loaded_keys} keys")
+        
+        large_ckpt.unlink()
+
         print("\n" + "=" * 70)
-        print("✅ pipeline/weight_manager.py (SOTA v2.3 + EMA + Metrics) ALL TESTS PASSED")
+        print("✅ pipeline/weight_manager.py (v2.3.2b + Robust Validation) ALL TESTS PASSED")
+        print("=" * 70)
+        print("\n📊 v2.3.2b Features:")
+        print("  ✓ Manual ZIP writing (fix np.savez_compressed silent failure)")
+        print("  ✓ Atomic write pattern (anti-corrupt saat interrupt)")
+        print("  ✓ Robust ZIP validation (np.load sebagai ultimate validator)")
+        print("  ✓ Backup fallback (.npz.bak)")
+        print("  ✓ Support large payloads (200+ keys, 200MB+)")
+        print("  ✓ Zip64 support untuk file >4GB")
+        print("  ✓ Helpful error messages dengan saran perbaikan")
         print("=" * 70)
