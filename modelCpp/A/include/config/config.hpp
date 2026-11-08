@@ -83,6 +83,12 @@ struct NolConfig {
     float lr = 1e-4f;               // L19: Learning rate AdamW
     int warmup_steps = 1000;        // L19: Linear warmup
     int self_evo_steps = 1000;      // L19: Self-evolution anchor setiap N steps
+
+    // Training basics (dibutuhkan oleh io.cpp dan trainer)
+    int epochs = 10;                // Total epoch training
+    int batch_size = 4;             // Batch size per step
+    int checkpoint_steps = 500;     // Save checkpoint setiap N steps
+    int checkpoint_epochs = 1;      // Save checkpoint setiap N epochs
     
     // Flag Integrasi (untuk verifikasi, bukan ablasi produksi)
     bool enable_hga = true;         // T1

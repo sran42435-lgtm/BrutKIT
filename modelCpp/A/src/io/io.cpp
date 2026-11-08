@@ -226,6 +226,7 @@ bool load_safetensors(NolModel& model, const std::string& path) {
     }
 
     file.close();
+    model.rebuild_tied_embedding();
     std::cout << "[IO] Loaded safetensors: " << path << "\n";
     return true;
 }

@@ -58,6 +58,10 @@ void print_config(const NolConfig& cfg) {
               << " ISO=" << cfg.w_iso << " BAL=" << cfg.w_bal << " ║\n";
     std::cout << "║  Curriculum:" << std::setprecision(0) << (cfg.curriculum_ratio * 100) << "%  GradClip:" 
               << std::setprecision(1) << cfg.grad_clip << "  LR:" << std::scientific << cfg.lr << "  ║\n";
+    std::cout << "║  Epochs:" << std::setw(4) << std::fixed << cfg.epochs
+              << "  Batch:" << std::setw(3) << cfg.batch_size
+              << "  Checkpoint:" << std::setw(4) << cfg.checkpoint_steps << "s/"
+              << cfg.checkpoint_epochs << "e  ║\n";
     std::cout << "║  Self-Evo every " << std::fixed << cfg.self_evo_steps << " steps                  ║\n";
 
     std::cout << "\033[1;36m╚═══════════════════════════════════════════════════════════╝\033[0m\n\n";
@@ -90,6 +94,10 @@ bool validate_config(const NolConfig& cfg) {
     if (cfg.w_lm < 0.0f || cfg.w_hcl < 0.0f || cfg.w_hier < 0.0f || cfg.w_iso < 0.0f || cfg.w_bal < 0.0f) return false;
     if (cfg.curriculum_ratio < 0.0f || cfg.curriculum_ratio > 1.0f) return false;
     if (cfg.grad_clip <= 0.0f || cfg.lr <= 0.0f || cfg.warmup_steps < 0 || cfg.self_evo_steps <= 0) return false;
+
+    // Training basics
+    if (cfg.epochs <= 0 || cfg.batch_size <= 0) return false;
+    if (cfg.checkpoint_steps <= 0 || cfg.checkpoint_epochs <= 0) return false;
 
     return true;
 }
@@ -136,7 +144,17 @@ static void run_config_tests() {
     bad = cfg; bad.top_k_experts = cfg.n_top_anchors + 1;
     assert(!validate_config(bad));
 
-    // Test 5: Print config tidak crash
+    // Test 5: Training basics validation
+    bad = cfg; bad.epochs = 0;
+    assert(!validate_config(bad));
+
+    bad = cfg; bad.batch_size = -1;
+    assert(!validate_config(bad));
+
+    bad = cfg; bad.checkpoint_steps = 0;
+    assert(!validate_config(bad));
+
+    // Test 6: Print config tidak crash
     print_config(cfg);
 
     std::cout << "[PASS] ✅ Semua unit test config berhasil!\n\n";

@@ -80,6 +80,7 @@ public:
     NolModel() = default;
     explicit NolModel(const NolConfig& config);
     void initialize_weights(uint64_t seed);
+    void rebuild_tied_embedding();
 
     // ==========================================
     // FORWARD PASS

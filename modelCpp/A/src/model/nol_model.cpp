@@ -76,6 +76,9 @@ NolModel::NolModel(const NolConfig& config) : cfg(config) {
     rmsnorm_final_gamma = Tensor({static_cast<size_t>(cfg.d_model)}, DType::FP32);
     H_v = Tensor({static_cast<size_t>(cfg.vocab_size),
                   static_cast<size_t>(cfg.d_hyp + 1)}, DType::FP32);
+
+    // W_v_head TIDAK dialokasikan di sini — akan di-set sebagai alias di initialize_weights
+    // atau direkonstruksi setelah load_safetensors
 }
 
 void NolModel::initialize_weights(uint64_t seed) {
@@ -127,6 +130,20 @@ void NolModel::initialize_weights(uint64_t seed) {
     fill_const(rmsnorm_final_gamma, 1.0f);
     fill_normal(H_v);
 
+    // Set tied embedding alias SETELAH embed_E dialokasikan dan diisi
+    W_v_head.data = embed_E.data;
+    W_v_head.shape = embed_E.shape;
+    W_v_head.strides = embed_E.strides;
+    W_v_head.numel = embed_E.numel;
+    W_v_head.dtype = embed_E.dtype;
+    W_v_head.owns_memory = false;
+}
+
+/**
+ * @brief Rekonstruksi alias W_v_head → embed_E setelah load.
+ * HARUS dipanggil setelah load_safetensors.
+ */
+void NolModel::rebuild_tied_embedding() {
     W_v_head.data = embed_E.data;
     W_v_head.shape = embed_E.shape;
     W_v_head.strides = embed_E.strides;
@@ -598,6 +615,12 @@ void NolModel::head_forward(const Tensor& xN, const Tensor& z_N,
     int total = batch * seq_len;
     int dh1 = d_hyp + 1;
 
+    // Safety check: W_v harus valid (tidak null)
+    if (W_v.data == nullptr) {
+        std::cerr << "[FATAL] W_v_head is null! Call rebuild_tied_embedding() after load.\n";
+        return;
+    }
+
     gemm(xN.fp32_data(), W_v.fp32_data(), logits.fp32_data(),
          total, vocab_size, d_model);
 
@@ -890,6 +913,17 @@ static void run_model_tests() {
         NolModel model(cfg);
         float c = std::log(1.0f + std::exp(model.curvature)) + cfg.c_min;
         assert(std::abs(c - cfg.c_init) < 1e-4f);
+    }
+
+    // Test 6: rebuild_tied_embedding setelah konstruksi tanpa init
+    {
+        NolModel model(cfg);
+        // Tanpa initialize_weights, W_v_head.data harus null
+        assert(model.W_v_head.data == nullptr);
+        // Setelah rebuild, harus menunjuk ke embed_E
+        model.rebuild_tied_embedding();
+        assert(model.W_v_head.data == model.embed_E.data);
+        assert(model.W_v_head.owns_memory == false);
     }
 
     std::cout << "[PASS] ✅ Semua unit test model berhasil!\n\n";
