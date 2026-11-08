@@ -32,8 +32,6 @@ static NolModel* g_model = nullptr;
 static TrainingStatus g_status;
 static std::string g_current_model_name;
 static volatile bool g_interrupted = false;
-
-// Tambahan: Tokenizer dan Dataset global
 static BPETokenizer* g_tokenizer = nullptr;
 static Dataset* g_dataset = nullptr;
 static bool g_vocab_ready = false;
@@ -126,6 +124,41 @@ std::string get_flag_str(const std::vector<std::string>& args, const std::string
 }
 
 // ==========================================
+// CONFIG CLI OVERRIDE (baru)
+// ==========================================
+void apply_config_overrides(int argc, char* argv[], NolConfig& cfg) {
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        auto next_val = [&]() -> std::string {
+            if (i + 1 < argc) return argv[++i];
+            return "";
+        };
+        try {
+            if (arg == "--vocab-size")     cfg.vocab_size     = std::stoi(next_val());
+            else if (arg == "--d-model")   cfg.d_model        = std::stoi(next_val());
+            else if (arg == "--n-layers")  cfg.n_layers       = std::stoi(next_val());
+            else if (arg == "--n-heads")   cfg.n_heads        = std::stoi(next_val());
+            else if (arg == "--n-kv-heads") cfg.n_kv_heads    = std::stoi(next_val());
+            else if (arg == "--d-head")    cfg.d_head         = std::stoi(next_val());
+            else if (arg == "--ffn-hidden") cfg.ffn_hidden    = std::stoi(next_val());
+            else if (arg == "--max-seq-len") cfg.max_seq_len  = std::stoi(next_val());
+            else if (arg == "--n-hyp-heads") cfg.n_hyp_heads  = std::stoi(next_val());
+            else if (arg == "--d-hyp")     cfg.d_hyp          = std::stoi(next_val());
+            else if (arg == "--n-top-anchors") cfg.n_top_anchors = std::stoi(next_val());
+            else if (arg == "--n-children") cfg.n_children     = std::stoi(next_val());
+            else if (arg == "--top-k-experts") cfg.top_k_experts = std::stoi(next_val());
+            else if (arg == "--epochs")    cfg.epochs         = std::stoi(next_val());
+            else if (arg == "--batch-size") cfg.batch_size    = std::stoi(next_val());
+            else if (arg == "--lr")        cfg.lr             = std::stof(next_val());
+            else if (arg == "--warmup-steps") cfg.warmup_steps = std::stoi(next_val());
+            else if (arg == "--self-evo-steps") cfg.self_evo_steps = std::stoi(next_val());
+        } catch (...) {
+            std::cerr << "Warning: invalid value for " << arg << "\n";
+        }
+    }
+}
+
+// ==========================================
 // COMMAND HANDLERS
 // ==========================================
 
@@ -136,7 +169,6 @@ void handle_build_vocab(const std::vector<std::string>& args) {
     }
     std::string corpus_path = args[1];
 
-    // Baca corpus
     std::ifstream file(corpus_path);
     if (!file.is_open()) {
         std::cout << "Error: Cannot open file '" << corpus_path << "'\n";
@@ -155,11 +187,9 @@ void handle_build_vocab(const std::vector<std::string>& args) {
         return;
     }
 
-    // Build tokenizer
     if (!g_tokenizer) g_tokenizer = new BPETokenizer();
     g_tokenizer->build_vocab(texts, g_cfg.vocab_size);
 
-    // Save vocab
     std::string vocab_path = g_current_model_name + ".vocab";
     g_tokenizer->save_vocab(vocab_path);
 
@@ -174,7 +204,6 @@ void handle_load(const std::vector<std::string>& args) {
     }
     std::string dataset_path = args[1];
 
-    // Cek apakah vocab sudah siap
     if (!g_vocab_ready) {
         std::cout << "Vocab belum siap. Mencoba load dari " << g_current_model_name << ".vocab ...\n";
         if (!g_tokenizer) g_tokenizer = new BPETokenizer();
@@ -186,7 +215,6 @@ void handle_load(const std::vector<std::string>& args) {
         g_vocab_ready = true;
     }
 
-    // Load dataset
     if (!g_dataset) g_dataset = new Dataset();
     int count = g_dataset->load_from_text(dataset_path, *g_tokenizer, g_cfg.max_seq_len);
 
@@ -206,10 +234,8 @@ void handle_training(const std::vector<std::string>& args) {
     Trainer trainer(*g_model, train_cfg);
     trainer.status = g_status;
 
-    // Gunakan dataset yang sudah di-load jika ada, otherwise generate random
     Dataset ds;
     if (g_dataset && g_dataset->size() > 0) {
-        // Copy dataset yang sudah di-load
         ds.samples = g_dataset->samples;
         ds.raw_texts = g_dataset->raw_texts;
         ds.seq_len = g_dataset->seq_len;
@@ -242,7 +268,6 @@ void handle_prompt(const std::vector<std::string>& args) {
 
     InferenceEngine engine(*g_model, g_cfg);
 
-    // Cek apakah input berupa angka (token IDs) atau teks
     bool is_token_ids = true;
     std::istringstream check_iss(input);
     std::string word;
@@ -255,7 +280,6 @@ void handle_prompt(const std::vector<std::string>& args) {
     }
 
     if (is_token_ids) {
-        // Parse sebagai token IDs
         std::vector<int> prompt;
         std::istringstream iss(input);
         int tok;
@@ -269,7 +293,6 @@ void handle_prompt(const std::vector<std::string>& args) {
         for (int t : generated) std::cout << t << " ";
         std::cout << "\n";
 
-        // Decode jika tokenizer tersedia
         if (g_vocab_ready && g_tokenizer) {
             std::string decoded = g_tokenizer->decode(generated);
             std::cout << "Decoded text: " << decoded << "\n";
@@ -281,7 +304,6 @@ void handle_prompt(const std::vector<std::string>& args) {
                   << " (PPL=" << std::setprecision(2) << metrics.perplexity
                   << " Mix=" << std::setprecision(4) << metrics.topic_mixing_rate << ")\n";
     } else {
-        // Parse sebagai teks
         if (!g_vocab_ready || !g_tokenizer) {
             std::cout << "Error: Vocab belum siap. Jalankan /build-vocab atau /load terlebih dahulu.\n";
             return;
@@ -290,7 +312,6 @@ void handle_prompt(const std::vector<std::string>& args) {
         std::string generated_text = engine.generate_text(input, *g_tokenizer, params);
         std::cout << "\nGenerated text: " << generated_text << "\n";
 
-        // Compute proficiency
         std::vector<int> prompt_ids = g_tokenizer->encode(input, false, false);
         std::vector<int> gen_ids = g_tokenizer->encode(generated_text, false, false);
         ProficiencyMetrics metrics = engine.compute_proficiency(gen_ids, prompt_ids);
@@ -335,7 +356,6 @@ void handle_switch(const std::vector<std::string>& args) {
         g_status.context_proficiency = meta.context_proficiency;
     }
 
-    // Coba load vocab untuk model baru
     if (g_tokenizer) {
         std::string vocab_path = new_model + ".vocab";
         if (g_tokenizer->load_vocab(vocab_path)) {
@@ -365,6 +385,9 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
 
     g_cfg = get_default_config();
+
+    // Apply CLI config overrides SEBELUM parsing model-name/resume
+    apply_config_overrides(argc, argv, g_cfg);
 
     std::string model_name;
     std::string resume_model;
@@ -396,7 +419,6 @@ int main(int argc, char* argv[]) {
             g_status.remaining_epochs = meta.remaining_epochs;
             g_status.completed_steps = meta.completed_steps;
 
-            // Coba load vocab yang sudah ada
             g_tokenizer = new BPETokenizer();
             std::string vocab_path = model_name + ".vocab";
             if (g_tokenizer->load_vocab(vocab_path)) {
@@ -429,7 +451,6 @@ int main(int argc, char* argv[]) {
             g_status.context_proficiency = meta.context_proficiency;
         }
 
-        // Load vocab
         g_tokenizer = new BPETokenizer();
         std::string vocab_path = resume_model + ".vocab";
         if (g_tokenizer->load_vocab(vocab_path)) {
@@ -445,6 +466,11 @@ int main(int argc, char* argv[]) {
         std::cout << "Usage:\n";
         std::cout << "  ./proyek --model-name \"name\"   Create new model\n";
         std::cout << "  ./proyek --resume \"name\"       Resume training\n";
+        std::cout << "\nConfig overrides:\n";
+        std::cout << "  --vocab-size N  --d-model N  --n-layers N  --n-heads N\n";
+        std::cout << "  --ffn-hidden N  --max-seq-len N  --n-hyp-heads N  --d-hyp N\n";
+        std::cout << "  --n-top-anchors N  --n-children N  --epochs N  --batch-size N\n";
+        std::cout << "  --lr F  --warmup-steps N  --self-evo-steps N\n";
         return 0;
     }
 
