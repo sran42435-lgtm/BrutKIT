@@ -1,0 +1,118 @@
+SESSION_ID: 997430
+SOLVE_TIME: 3.12 ms
+SOLVED_BOARD: 812753649943682175675491283154237896369845721287169534521974368438526917796318452
+
+=== SOLVED BOARD ===
++-------+-------+-------+
+| 8 1 2 | 7 5 3 | 6 4 9 | 
+| 9 4 3 | 6 8 2 | 1 7 5 | 
+| 6 7 5 | 4 9 1 | 2 8 3 | 
++-------+-------+-------+
+| 1 5 4 | 2 3 7 | 8 9 6 | 
+| 3 6 9 | 8 4 5 | 7 2 1 | 
+| 2 8 7 | 1 6 9 | 5 3 4 | 
++-------+-------+-------+
+| 5 2 1 | 9 7 4 | 3 6 8 | 
+| 4 3 8 | 5 2 6 | 9 1 7 | 
+| 7 9 6 | 3 1 8 | 4 5 2 | 
++-------+-------+-------+
+
+=== FILL LOG ===
+[step:1 2x,-3y:0->9]
+[step:3 2x,-2y:0->3]
+[step:4 -4x,-2y:0->5]
+[step:5 0x,-2y:0->7]
+[step:6 4x,-3y:0->7]
+[step:7 -1x,4y:0->7]
+[step:8 3x,3y:0->7]
+[step:10 -2x,-4y:0->6]
+[step:11 -4x,-4y:0->7]
+[step:12 -2x,-1y:0->7]
+[step:14 0x,-3y:0->2]
+[step:15 1x,-3y:0->6]
+[step:16 -3x,-2y:0->2]
+[step:17 -2x,2y:0->5]
+[step:18 -2x,1y:0->4]
+[step:19 4x,-1y:0->4]
+[step:20 2x,-1y:0->5]
+[step:21 -2x,4y:0->2]
+[step:22 -4x,3y:0->9]
+[step:23 1x,3y:0->2]
+[step:24 -3x,3y:0->4]
+[step:25 -2x,0y:0->9]
+[step:26 -4x,-1y:0->2]
+[step:27 1x,-1y:0->9]
+[step:28 1x,-2y:0->4]
+[step:29 -1x,-2y:0->9]
+[step:30 1x,4y:0->3]
+[step:31 3x,4y:0->4]
+[step:32 0x,4y:0->5]
+[step:33 4x,4y:0->9]
+[step:34 4x,3y:0->5]
+[step:35 3x,2y:0->8]
+[step:36 4x,2y:0->3]
+[step:37 -1x,2y:0->4]
+[step:38 2x,3y:0->1]
+[step:39 0x,3y:0->8]
+[step:40 2x,4y:0->6]
+[step:41 -3x,4y:0->1]
+[step:42 -4x,2y:0->6]
+[step:43 1x,2y:0->1]
+[step:44 2x,1y:0->8]
+[step:45 3x,1y:0->9]
+[step:46 3x,0y:0->2]
+[step:47 -1x,1y:0->2]
+[step:48 0x,-1y:0->6]
+[step:49 -3x,-1y:0->8]
+[step:50 0x,1y:0->3]
+[step:51 4x,1y:0->6]
+[step:52 -4x,1y:0->1]
+[step:53 -4x,0y:0->3]
+[step:54 -3x,0y:0->6]
+[step:55 -1x,0y:0->8]
+[step:56 4x,0y:0->1]
+[step:57 -4x,-3y:0->4]
+[step:58 -3x,-3y:0->3]
+[step:59 -1x,-4y:0->3]
+[step:60 0x,-4y:0->1]
+[step:61 1x,-4y:0->8]
+[step:62 3x,-4y:0->5]
+[step:63 4x,-4y:0->2]
+
+=== STATISTICS ===
+Propagasi: 363
+Eliminasi: 1323
+Tebakan: 35
+Deadend: 16
+Retry: 16
+Time: 3.12 ms
+
+=== TECHNIQUE STATS ===
+Naked Single:
+  invoked=221 patterns=0 removed=0 filled=221
+Hidden Single (Baris):
+  invoked=120 patterns=0 removed=0 filled=120
+Hidden Single (Kolom):
+  invoked=17 patterns=0 removed=0 filled=17
+Hidden Single (Box):
+  invoked=5 patterns=0 removed=0 filled=5
+Locked Claiming:
+  invoked=1998 patterns=204 removed=42 filled=0
+Locked Pointing:
+  invoked=801 patterns=188 removed=9 filled=0
+Naked Pair:
+  invoked=367 patterns=160 removed=114 filled=0
+Naked Triple:
+  invoked=543 patterns=100 removed=56 filled=0
+Naked Quad:
+  invoked=605 patterns=175 removed=44 filled=0
+X-Wing:
+  invoked=1508 patterns=38 removed=8 filled=0
+
+=== TECHNIQUE TIMING ===
+Naked Single: 564.836 µs | Calls: 841
+Hidden Single: 351.446 µs | Calls: 841
+Naked Subsets: 527.692 µs | Calls: 841
+Locked Candidates: 175.360 µs | Calls: 36
+X-Wing: 173.061 µs | Calls: 36
+Total Technique Time: 1792.395 µs (1.792 ms)

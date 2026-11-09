@@ -1,0 +1,409 @@
+SESSION_ID: 997430
+
+=== DATABASE DUAL-KOORDINAT (v10.4) ===
+
+TITIK 1 | PUSAT (-4,4) = [8]
+Horizontal: [ -4x,4y:8 -3x,4y:0 -2x,4y:0 -1x,4y:0 0x,4y:0 1x,4y:0 2x,4y:0 3x,4y:0 4x,4y:0 ]
+Vertikal: [ 4y,-4x:8 3y,-4x:0 2y,-4x:0 1y,-4x:0 0y,-4x:0 -1y,-4x:0 -2y,-4x:0 -3y,-4x:0 -4y,-4x:0 ]
+Kandidat: [ 8 ]
+
+TITIK 2 | PUSAT (-3,4) = [0]
+Horizontal: [ -4x,4y:8 -3x,4y:0 -2x,4y:0 -1x,4y:0 0x,4y:0 1x,4y:0 2x,4y:0 3x,4y:0 4x,4y:0 ]
+Vertikal: [ 4y,-3x:0 3y,-3x:0 2y,-3x:7 1y,-3x:5 0y,-3x:0 -1y,-3x:0 -2y,-3x:0 -3y,-3x:0 -4y,-3x:9 ]
+Kandidat: [ 1 2 4 6  ]
+
+TITIK 3 | PUSAT (-2,4) = [0]
+Horizontal: [ -4x,4y:8 -3x,4y:0 -2x,4y:0 -1x,4y:0 0x,4y:0 1x,4y:0 2x,4y:0 3x,4y:0 4x,4y:0 ]
+Vertikal: [ 4y,-2x:0 3y,-2x:3 2y,-2x:0 1y,-2x:0 0y,-2x:0 -1y,-2x:0 -2y,-2x:1 -3y,-2x:8 -4y,-2x:0 ]
+Kandidat: [ 2 4 5 6 9  ]
+
+TITIK 4 | PUSAT (-1,4) = [0]
+Horizontal: [ -4x,4y:8 -3x,4y:0 -2x,4y:0 -1x,4y:0 0x,4y:0 1x,4y:0 2x,4y:0 3x,4y:0 4x,4y:0 ]
+Vertikal: [ 4y,-1x:0 3y,-1x:6 2y,-1x:0 1y,-1x:0 0y,-1x:0 -1y,-1x:1 -2y,-1x:0 -3y,-1x:5 -4y,-1x:0 ]
+Kandidat: [ 2 3 4 7  ]
+
+TITIK 5 | PUSAT (0,4) = [0]
+Horizontal: [ -4x,4y:8 -3x,4y:0 -2x,4y:0 -1x,4y:0 0x,4y:0 1x,4y:0 2x,4y:0 3x,4y:0 4x,4y:0 ]
+Vertikal: [ 4y,0x:0 3y,0x:0 2y,0x:9 1y,0x:0 0y,0x:4 -1y,0x:0 -2y,0x:0 -3y,0x:0 -4y,0x:0 ]
+Kandidat: [ 1 2 3 5 7  ]
+
+TITIK 6 | PUSAT (1,4) = [0]
+Horizontal: [ -4x,4y:8 -3x,4y:0 -2x,4y:0 -1x,4y:0 0x,4y:0 1x,4y:0 2x,4y:0 3x,4y:0 4x,4y:0 ]
+Vertikal: [ 4y,1x:0 3y,1x:0 2y,1x:0 1y,1x:7 0y,1x:5 -1y,1x:0 -2y,1x:0 -3y,1x:0 -4y,1x:0 ]
+Kandidat: [ 1 2 3 4  ]
+
+TITIK 7 | PUSAT (2,4) = [0]
+Horizontal: [ -4x,4y:8 -3x,4y:0 -2x,4y:0 -1x,4y:0 0x,4y:0 1x,4y:0 2x,4y:0 3x,4y:0 4x,4y:0 ]
+Vertikal: [ 4y,2x:0 3y,2x:0 2y,2x:2 1y,2x:0 0y,2x:7 -1y,2x:0 -2y,2x:0 -3y,2x:0 -4y,2x:4 ]
+Kandidat: [ 1 3 5 6 9  ]
+
+TITIK 8 | PUSAT (3,4) = [0]
+Horizontal: [ -4x,4y:8 -3x,4y:0 -2x,4y:0 -1x,4y:0 0x,4y:0 1x,4y:0 2x,4y:0 3x,4y:0 4x,4y:0 ]
+Vertikal: [ 4y,3x:0 3y,3x:0 2y,3x:0 1y,3x:0 0y,3x:0 -1y,3x:3 -2y,3x:6 -3y,3x:1 -4y,3x:0 ]
+Kandidat: [ 4 5 7 9  ]
+
+TITIK 9 | PUSAT (4,4) = [0]
+Horizontal: [ -4x,4y:8 -3x,4y:0 -2x,4y:0 -1x,4y:0 0x,4y:0 1x,4y:0 2x,4y:0 3x,4y:0 4x,4y:0 ]
+Vertikal: [ 4y,4x:0 3y,4x:0 2y,4x:0 1y,4x:0 0y,4x:0 -1y,4x:0 -2y,4x:8 -3y,4x:0 -4y,4x:0 ]
+Kandidat: [ 1 3 4 5 6 7 9  ]
+
+TITIK 10 | PUSAT (-4,3) = [0]
+Horizontal: [ -4x,3y:0 -3x,3y:0 -2x,3y:3 -1x,3y:6 0x,3y:0 1x,3y:0 2x,3y:0 3x,3y:0 4x,3y:0 ]
+Vertikal: [ 4y,-4x:8 3y,-4x:0 2y,-4x:0 1y,-4x:0 0y,-4x:0 -1y,-4x:0 -2y,-4x:0 -3y,-4x:0 -4y,-4x:0 ]
+Kandidat: [ 1 2 4 5 9  ]
+
+TITIK 11 | PUSAT (-3,3) = [0]
+Horizontal: [ -4x,3y:0 -3x,3y:0 -2x,3y:3 -1x,3y:6 0x,3y:0 1x,3y:0 2x,3y:0 3x,3y:0 4x,3y:0 ]
+Vertikal: [ 4y,-3x:0 3y,-3x:0 2y,-3x:7 1y,-3x:5 0y,-3x:0 -1y,-3x:0 -2y,-3x:0 -3y,-3x:0 -4y,-3x:9 ]
+Kandidat: [ 1 2 4  ]
+
+TITIK 12 | PUSAT (-2,3) = [3]
+Horizontal: [ -4x,3y:0 -3x,3y:0 -2x,3y:3 -1x,3y:6 0x,3y:0 1x,3y:0 2x,3y:0 3x,3y:0 4x,3y:0 ]
+Vertikal: [ 4y,-2x:0 3y,-2x:3 2y,-2x:0 1y,-2x:0 0y,-2x:0 -1y,-2x:0 -2y,-2x:1 -3y,-2x:8 -4y,-2x:0 ]
+Kandidat: [ 3 ]
+
+TITIK 13 | PUSAT (-1,3) = [6]
+Horizontal: [ -4x,3y:0 -3x,3y:0 -2x,3y:3 -1x,3y:6 0x,3y:0 1x,3y:0 2x,3y:0 3x,3y:0 4x,3y:0 ]
+Vertikal: [ 4y,-1x:0 3y,-1x:6 2y,-1x:0 1y,-1x:0 0y,-1x:0 -1y,-1x:1 -2y,-1x:0 -3y,-1x:5 -4y,-1x:0 ]
+Kandidat: [ 6 ]
+
+TITIK 14 | PUSAT (0,3) = [0]
+Horizontal: [ -4x,3y:0 -3x,3y:0 -2x,3y:3 -1x,3y:6 0x,3y:0 1x,3y:0 2x,3y:0 3x,3y:0 4x,3y:0 ]
+Vertikal: [ 4y,0x:0 3y,0x:0 2y,0x:9 1y,0x:0 0y,0x:4 -1y,0x:0 -2y,0x:0 -3y,0x:0 -4y,0x:0 ]
+Kandidat: [ 1 2 5 7 8  ]
+
+TITIK 15 | PUSAT (1,3) = [0]
+Horizontal: [ -4x,3y:0 -3x,3y:0 -2x,3y:3 -1x,3y:6 0x,3y:0 1x,3y:0 2x,3y:0 3x,3y:0 4x,3y:0 ]
+Vertikal: [ 4y,1x:0 3y,1x:0 2y,1x:0 1y,1x:7 0y,1x:5 -1y,1x:0 -2y,1x:0 -3y,1x:0 -4y,1x:0 ]
+Kandidat: [ 1 2 4 8  ]
+
+TITIK 16 | PUSAT (2,3) = [0]
+Horizontal: [ -4x,3y:0 -3x,3y:0 -2x,3y:3 -1x,3y:6 0x,3y:0 1x,3y:0 2x,3y:0 3x,3y:0 4x,3y:0 ]
+Vertikal: [ 4y,2x:0 3y,2x:0 2y,2x:2 1y,2x:0 0y,2x:7 -1y,2x:0 -2y,2x:0 -3y,2x:0 -4y,2x:4 ]
+Kandidat: [ 1 5 8 9  ]
+
+TITIK 17 | PUSAT (3,3) = [0]
+Horizontal: [ -4x,3y:0 -3x,3y:0 -2x,3y:3 -1x,3y:6 0x,3y:0 1x,3y:0 2x,3y:0 3x,3y:0 4x,3y:0 ]
+Vertikal: [ 4y,3x:0 3y,3x:0 2y,3x:0 1y,3x:0 0y,3x:0 -1y,3x:3 -2y,3x:6 -3y,3x:1 -4y,3x:0 ]
+Kandidat: [ 4 5 7 8 9  ]
+
+TITIK 18 | PUSAT (4,3) = [0]
+Horizontal: [ -4x,3y:0 -3x,3y:0 -2x,3y:3 -1x,3y:6 0x,3y:0 1x,3y:0 2x,3y:0 3x,3y:0 4x,3y:0 ]
+Vertikal: [ 4y,4x:0 3y,4x:0 2y,4x:0 1y,4x:0 0y,4x:0 -1y,4x:0 -2y,4x:8 -3y,4x:0 -4y,4x:0 ]
+Kandidat: [ 1 4 5 7 9  ]
+
+TITIK 19 | PUSAT (-4,2) = [0]
+Horizontal: [ -4x,2y:0 -3x,2y:7 -2x,2y:0 -1x,2y:0 0x,2y:9 1x,2y:0 2x,2y:2 3x,2y:0 4x,2y:0 ]
+Vertikal: [ 4y,-4x:8 3y,-4x:0 2y,-4x:0 1y,-4x:0 0y,-4x:0 -1y,-4x:0 -2y,-4x:0 -3y,-4x:0 -4y,-4x:0 ]
+Kandidat: [ 1 4 5 6  ]
+
+TITIK 20 | PUSAT (-3,2) = [7]
+Horizontal: [ -4x,2y:0 -3x,2y:7 -2x,2y:0 -1x,2y:0 0x,2y:9 1x,2y:0 2x,2y:2 3x,2y:0 4x,2y:0 ]
+Vertikal: [ 4y,-3x:0 3y,-3x:0 2y,-3x:7 1y,-3x:5 0y,-3x:0 -1y,-3x:0 -2y,-3x:0 -3y,-3x:0 -4y,-3x:9 ]
+Kandidat: [ 7 ]
+
+TITIK 21 | PUSAT (-2,2) = [0]
+Horizontal: [ -4x,2y:0 -3x,2y:7 -2x,2y:0 -1x,2y:0 0x,2y:9 1x,2y:0 2x,2y:2 3x,2y:0 4x,2y:0 ]
+Vertikal: [ 4y,-2x:0 3y,-2x:3 2y,-2x:0 1y,-2x:0 0y,-2x:0 -1y,-2x:0 -2y,-2x:1 -3y,-2x:8 -4y,-2x:0 ]
+Kandidat: [ 4 5 6  ]
+
+TITIK 22 | PUSAT (-1,2) = [0]
+Horizontal: [ -4x,2y:0 -3x,2y:7 -2x,2y:0 -1x,2y:0 0x,2y:9 1x,2y:0 2x,2y:2 3x,2y:0 4x,2y:0 ]
+Vertikal: [ 4y,-1x:0 3y,-1x:6 2y,-1x:0 1y,-1x:0 0y,-1x:0 -1y,-1x:1 -2y,-1x:0 -3y,-1x:5 -4y,-1x:0 ]
+Kandidat: [ 3 4 8  ]
+
+TITIK 23 | PUSAT (0,2) = [9]
+Horizontal: [ -4x,2y:0 -3x,2y:7 -2x,2y:0 -1x,2y:0 0x,2y:9 1x,2y:0 2x,2y:2 3x,2y:0 4x,2y:0 ]
+Vertikal: [ 4y,0x:0 3y,0x:0 2y,0x:9 1y,0x:0 0y,0x:4 -1y,0x:0 -2y,0x:0 -3y,0x:0 -4y,0x:0 ]
+Kandidat: [ 9 ]
+
+TITIK 24 | PUSAT (1,2) = [0]
+Horizontal: [ -4x,2y:0 -3x,2y:7 -2x,2y:0 -1x,2y:0 0x,2y:9 1x,2y:0 2x,2y:2 3x,2y:0 4x,2y:0 ]
+Vertikal: [ 4y,1x:0 3y,1x:0 2y,1x:0 1y,1x:7 0y,1x:5 -1y,1x:0 -2y,1x:0 -3y,1x:0 -4y,1x:0 ]
+Kandidat: [ 1 3 4 8  ]
+
+TITIK 25 | PUSAT (2,2) = [2]
+Horizontal: [ -4x,2y:0 -3x,2y:7 -2x,2y:0 -1x,2y:0 0x,2y:9 1x,2y:0 2x,2y:2 3x,2y:0 4x,2y:0 ]
+Vertikal: [ 4y,2x:0 3y,2x:0 2y,2x:2 1y,2x:0 0y,2x:7 -1y,2x:0 -2y,2x:0 -3y,2x:0 -4y,2x:4 ]
+Kandidat: [ 2 ]
+
+TITIK 26 | PUSAT (3,2) = [0]
+Horizontal: [ -4x,2y:0 -3x,2y:7 -2x,2y:0 -1x,2y:0 0x,2y:9 1x,2y:0 2x,2y:2 3x,2y:0 4x,2y:0 ]
+Vertikal: [ 4y,3x:0 3y,3x:0 2y,3x:0 1y,3x:0 0y,3x:0 -1y,3x:3 -2y,3x:6 -3y,3x:1 -4y,3x:0 ]
+Kandidat: [ 4 5 8  ]
+
+TITIK 27 | PUSAT (4,2) = [0]
+Horizontal: [ -4x,2y:0 -3x,2y:7 -2x,2y:0 -1x,2y:0 0x,2y:9 1x,2y:0 2x,2y:2 3x,2y:0 4x,2y:0 ]
+Vertikal: [ 4y,4x:0 3y,4x:0 2y,4x:0 1y,4x:0 0y,4x:0 -1y,4x:0 -2y,4x:8 -3y,4x:0 -4y,4x:0 ]
+Kandidat: [ 1 3 4 5 6  ]
+
+TITIK 28 | PUSAT (-4,1) = [0]
+Horizontal: [ -4x,1y:0 -3x,1y:5 -2x,1y:0 -1x,1y:0 0x,1y:0 1x,1y:7 2x,1y:0 3x,1y:0 4x,1y:0 ]
+Vertikal: [ 4y,-4x:8 3y,-4x:0 2y,-4x:0 1y,-4x:0 0y,-4x:0 -1y,-4x:0 -2y,-4x:0 -3y,-4x:0 -4y,-4x:0 ]
+Kandidat: [ 1 2 3 4 6 9  ]
+
+TITIK 29 | PUSAT (-3,1) = [5]
+Horizontal: [ -4x,1y:0 -3x,1y:5 -2x,1y:0 -1x,1y:0 0x,1y:0 1x,1y:7 2x,1y:0 3x,1y:0 4x,1y:0 ]
+Vertikal: [ 4y,-3x:0 3y,-3x:0 2y,-3x:7 1y,-3x:5 0y,-3x:0 -1y,-3x:0 -2y,-3x:0 -3y,-3x:0 -4y,-3x:9 ]
+Kandidat: [ 5 ]
+
+TITIK 30 | PUSAT (-2,1) = [0]
+Horizontal: [ -4x,1y:0 -3x,1y:5 -2x,1y:0 -1x,1y:0 0x,1y:0 1x,1y:7 2x,1y:0 3x,1y:0 4x,1y:0 ]
+Vertikal: [ 4y,-2x:0 3y,-2x:3 2y,-2x:0 1y,-2x:0 0y,-2x:0 -1y,-2x:0 -2y,-2x:1 -3y,-2x:8 -4y,-2x:0 ]
+Kandidat: [ 2 4 6 9  ]
+
+TITIK 31 | PUSAT (-1,1) = [0]
+Horizontal: [ -4x,1y:0 -3x,1y:5 -2x,1y:0 -1x,1y:0 0x,1y:0 1x,1y:7 2x,1y:0 3x,1y:0 4x,1y:0 ]
+Vertikal: [ 4y,-1x:0 3y,-1x:6 2y,-1x:0 1y,-1x:0 0y,-1x:0 -1y,-1x:1 -2y,-1x:0 -3y,-1x:5 -4y,-1x:0 ]
+Kandidat: [ 2 3 8 9  ]
+
+TITIK 32 | PUSAT (0,1) = [0]
+Horizontal: [ -4x,1y:0 -3x,1y:5 -2x,1y:0 -1x,1y:0 0x,1y:0 1x,1y:7 2x,1y:0 3x,1y:0 4x,1y:0 ]
+Vertikal: [ 4y,0x:0 3y,0x:0 2y,0x:9 1y,0x:0 0y,0x:4 -1y,0x:0 -2y,0x:0 -3y,0x:0 -4y,0x:0 ]
+Kandidat: [ 2 3 6 8  ]
+
+TITIK 33 | PUSAT (1,1) = [7]
+Horizontal: [ -4x,1y:0 -3x,1y:5 -2x,1y:0 -1x,1y:0 0x,1y:0 1x,1y:7 2x,1y:0 3x,1y:0 4x,1y:0 ]
+Vertikal: [ 4y,1x:0 3y,1x:0 2y,1x:0 1y,1x:7 0y,1x:5 -1y,1x:0 -2y,1x:0 -3y,1x:0 -4y,1x:0 ]
+Kandidat: [ 7 ]
+
+TITIK 34 | PUSAT (2,1) = [0]
+Horizontal: [ -4x,1y:0 -3x,1y:5 -2x,1y:0 -1x,1y:0 0x,1y:0 1x,1y:7 2x,1y:0 3x,1y:0 4x,1y:0 ]
+Vertikal: [ 4y,2x:0 3y,2x:0 2y,2x:2 1y,2x:0 0y,2x:7 -1y,2x:0 -2y,2x:0 -3y,2x:0 -4y,2x:4 ]
+Kandidat: [ 1 6 8 9  ]
+
+TITIK 35 | PUSAT (3,1) = [0]
+Horizontal: [ -4x,1y:0 -3x,1y:5 -2x,1y:0 -1x,1y:0 0x,1y:0 1x,1y:7 2x,1y:0 3x,1y:0 4x,1y:0 ]
+Vertikal: [ 4y,3x:0 3y,3x:0 2y,3x:0 1y,3x:0 0y,3x:0 -1y,3x:3 -2y,3x:6 -3y,3x:1 -4y,3x:0 ]
+Kandidat: [ 2 4 8 9  ]
+
+TITIK 36 | PUSAT (4,1) = [0]
+Horizontal: [ -4x,1y:0 -3x,1y:5 -2x,1y:0 -1x,1y:0 0x,1y:0 1x,1y:7 2x,1y:0 3x,1y:0 4x,1y:0 ]
+Vertikal: [ 4y,4x:0 3y,4x:0 2y,4x:0 1y,4x:0 0y,4x:0 -1y,4x:0 -2y,4x:8 -3y,4x:0 -4y,4x:0 ]
+Kandidat: [ 1 2 4 6 9  ]
+
+TITIK 37 | PUSAT (-4,0) = [0]
+Horizontal: [ -4x,0y:0 -3x,0y:0 -2x,0y:0 -1x,0y:0 0x,0y:4 1x,0y:5 2x,0y:7 3x,0y:0 4x,0y:0 ]
+Vertikal: [ 4y,-4x:8 3y,-4x:0 2y,-4x:0 1y,-4x:0 0y,-4x:0 -1y,-4x:0 -2y,-4x:0 -3y,-4x:0 -4y,-4x:0 ]
+Kandidat: [ 1 2 3 6 9  ]
+
+TITIK 38 | PUSAT (-3,0) = [0]
+Horizontal: [ -4x,0y:0 -3x,0y:0 -2x,0y:0 -1x,0y:0 0x,0y:4 1x,0y:5 2x,0y:7 3x,0y:0 4x,0y:0 ]
+Vertikal: [ 4y,-3x:0 3y,-3x:0 2y,-3x:7 1y,-3x:5 0y,-3x:0 -1y,-3x:0 -2y,-3x:0 -3y,-3x:0 -4y,-3x:9 ]
+Kandidat: [ 1 2 3 6 8  ]
+
+TITIK 39 | PUSAT (-2,0) = [0]
+Horizontal: [ -4x,0y:0 -3x,0y:0 -2x,0y:0 -1x,0y:0 0x,0y:4 1x,0y:5 2x,0y:7 3x,0y:0 4x,0y:0 ]
+Vertikal: [ 4y,-2x:0 3y,-2x:3 2y,-2x:0 1y,-2x:0 0y,-2x:0 -1y,-2x:0 -2y,-2x:1 -3y,-2x:8 -4y,-2x:0 ]
+Kandidat: [ 2 6 9  ]
+
+TITIK 40 | PUSAT (-1,0) = [0]
+Horizontal: [ -4x,0y:0 -3x,0y:0 -2x,0y:0 -1x,0y:0 0x,0y:4 1x,0y:5 2x,0y:7 3x,0y:0 4x,0y:0 ]
+Vertikal: [ 4y,-1x:0 3y,-1x:6 2y,-1x:0 1y,-1x:0 0y,-1x:0 -1y,-1x:1 -2y,-1x:0 -3y,-1x:5 -4y,-1x:0 ]
+Kandidat: [ 2 3 8 9  ]
+
+TITIK 41 | PUSAT (0,0) = [4]
+Horizontal: [ -4x,0y:0 -3x,0y:0 -2x,0y:0 -1x,0y:0 0x,0y:4 1x,0y:5 2x,0y:7 3x,0y:0 4x,0y:0 ]
+Vertikal: [ 4y,0x:0 3y,0x:0 2y,0x:9 1y,0x:0 0y,0x:4 -1y,0x:0 -2y,0x:0 -3y,0x:0 -4y,0x:0 ]
+Kandidat: [ 4 ]
+
+TITIK 42 | PUSAT (1,0) = [5]
+Horizontal: [ -4x,0y:0 -3x,0y:0 -2x,0y:0 -1x,0y:0 0x,0y:4 1x,0y:5 2x,0y:7 3x,0y:0 4x,0y:0 ]
+Vertikal: [ 4y,1x:0 3y,1x:0 2y,1x:0 1y,1x:7 0y,1x:5 -1y,1x:0 -2y,1x:0 -3y,1x:0 -4y,1x:0 ]
+Kandidat: [ 5 ]
+
+TITIK 43 | PUSAT (2,0) = [7]
+Horizontal: [ -4x,0y:0 -3x,0y:0 -2x,0y:0 -1x,0y:0 0x,0y:4 1x,0y:5 2x,0y:7 3x,0y:0 4x,0y:0 ]
+Vertikal: [ 4y,2x:0 3y,2x:0 2y,2x:2 1y,2x:0 0y,2x:7 -1y,2x:0 -2y,2x:0 -3y,2x:0 -4y,2x:4 ]
+Kandidat: [ 7 ]
+
+TITIK 44 | PUSAT (3,0) = [0]
+Horizontal: [ -4x,0y:0 -3x,0y:0 -2x,0y:0 -1x,0y:0 0x,0y:4 1x,0y:5 2x,0y:7 3x,0y:0 4x,0y:0 ]
+Vertikal: [ 4y,3x:0 3y,3x:0 2y,3x:0 1y,3x:0 0y,3x:0 -1y,3x:3 -2y,3x:6 -3y,3x:1 -4y,3x:0 ]
+Kandidat: [ 2 8 9  ]
+
+TITIK 45 | PUSAT (4,0) = [0]
+Horizontal: [ -4x,0y:0 -3x,0y:0 -2x,0y:0 -1x,0y:0 0x,0y:4 1x,0y:5 2x,0y:7 3x,0y:0 4x,0y:0 ]
+Vertikal: [ 4y,4x:0 3y,4x:0 2y,4x:0 1y,4x:0 0y,4x:0 -1y,4x:0 -2y,4x:8 -3y,4x:0 -4y,4x:0 ]
+Kandidat: [ 1 2 6 9  ]
+
+TITIK 46 | PUSAT (-4,-1) = [0]
+Horizontal: [ -4x,-1y:0 -3x,-1y:0 -2x,-1y:0 -1x,-1y:1 0x,-1y:0 1x,-1y:0 2x,-1y:0 3x,-1y:3 4x,-1y:0 ]
+Vertikal: [ 4y,-4x:8 3y,-4x:0 2y,-4x:0 1y,-4x:0 0y,-4x:0 -1y,-4x:0 -2y,-4x:0 -3y,-4x:0 -4y,-4x:0 ]
+Kandidat: [ 2 4 6 7 9  ]
+
+TITIK 47 | PUSAT (-3,-1) = [0]
+Horizontal: [ -4x,-1y:0 -3x,-1y:0 -2x,-1y:0 -1x,-1y:1 0x,-1y:0 1x,-1y:0 2x,-1y:0 3x,-1y:3 4x,-1y:0 ]
+Vertikal: [ 4y,-3x:0 3y,-3x:0 2y,-3x:7 1y,-3x:5 0y,-3x:0 -1y,-3x:0 -2y,-3x:0 -3y,-3x:0 -4y,-3x:9 ]
+Kandidat: [ 2 4 6 8  ]
+
+TITIK 48 | PUSAT (-2,-1) = [0]
+Horizontal: [ -4x,-1y:0 -3x,-1y:0 -2x,-1y:0 -1x,-1y:1 0x,-1y:0 1x,-1y:0 2x,-1y:0 3x,-1y:3 4x,-1y:0 ]
+Vertikal: [ 4y,-2x:0 3y,-2x:3 2y,-2x:0 1y,-2x:0 0y,-2x:0 -1y,-2x:0 -2y,-2x:1 -3y,-2x:8 -4y,-2x:0 ]
+Kandidat: [ 2 4 6 7 9  ]
+
+TITIK 49 | PUSAT (-1,-1) = [1]
+Horizontal: [ -4x,-1y:0 -3x,-1y:0 -2x,-1y:0 -1x,-1y:1 0x,-1y:0 1x,-1y:0 2x,-1y:0 3x,-1y:3 4x,-1y:0 ]
+Vertikal: [ 4y,-1x:0 3y,-1x:6 2y,-1x:0 1y,-1x:0 0y,-1x:0 -1y,-1x:1 -2y,-1x:0 -3y,-1x:5 -4y,-1x:0 ]
+Kandidat: [ 1 ]
+
+TITIK 50 | PUSAT (0,-1) = [0]
+Horizontal: [ -4x,-1y:0 -3x,-1y:0 -2x,-1y:0 -1x,-1y:1 0x,-1y:0 1x,-1y:0 2x,-1y:0 3x,-1y:3 4x,-1y:0 ]
+Vertikal: [ 4y,0x:0 3y,0x:0 2y,0x:9 1y,0x:0 0y,0x:4 -1y,0x:0 -2y,0x:0 -3y,0x:0 -4y,0x:0 ]
+Kandidat: [ 2 6 8  ]
+
+TITIK 51 | PUSAT (1,-1) = [0]
+Horizontal: [ -4x,-1y:0 -3x,-1y:0 -2x,-1y:0 -1x,-1y:1 0x,-1y:0 1x,-1y:0 2x,-1y:0 3x,-1y:3 4x,-1y:0 ]
+Vertikal: [ 4y,1x:0 3y,1x:0 2y,1x:0 1y,1x:7 0y,1x:5 -1y,1x:0 -2y,1x:0 -3y,1x:0 -4y,1x:0 ]
+Kandidat: [ 2 6 8 9  ]
+
+TITIK 52 | PUSAT (2,-1) = [0]
+Horizontal: [ -4x,-1y:0 -3x,-1y:0 -2x,-1y:0 -1x,-1y:1 0x,-1y:0 1x,-1y:0 2x,-1y:0 3x,-1y:3 4x,-1y:0 ]
+Vertikal: [ 4y,2x:0 3y,2x:0 2y,2x:2 1y,2x:0 0y,2x:7 -1y,2x:0 -2y,2x:0 -3y,2x:0 -4y,2x:4 ]
+Kandidat: [ 5 6 8 9  ]
+
+TITIK 53 | PUSAT (3,-1) = [3]
+Horizontal: [ -4x,-1y:0 -3x,-1y:0 -2x,-1y:0 -1x,-1y:1 0x,-1y:0 1x,-1y:0 2x,-1y:0 3x,-1y:3 4x,-1y:0 ]
+Vertikal: [ 4y,3x:0 3y,3x:0 2y,3x:0 1y,3x:0 0y,3x:0 -1y,3x:3 -2y,3x:6 -3y,3x:1 -4y,3x:0 ]
+Kandidat: [ 3 ]
+
+TITIK 54 | PUSAT (4,-1) = [0]
+Horizontal: [ -4x,-1y:0 -3x,-1y:0 -2x,-1y:0 -1x,-1y:1 0x,-1y:0 1x,-1y:0 2x,-1y:0 3x,-1y:3 4x,-1y:0 ]
+Vertikal: [ 4y,4x:0 3y,4x:0 2y,4x:0 1y,4x:0 0y,4x:0 -1y,4x:0 -2y,4x:8 -3y,4x:0 -4y,4x:0 ]
+Kandidat: [ 2 4 5 6 9  ]
+
+TITIK 55 | PUSAT (-4,-2) = [0]
+Horizontal: [ -4x,-2y:0 -3x,-2y:0 -2x,-2y:1 -1x,-2y:0 0x,-2y:0 1x,-2y:0 2x,-2y:0 3x,-2y:6 4x,-2y:8 ]
+Vertikal: [ 4y,-4x:8 3y,-4x:0 2y,-4x:0 1y,-4x:0 0y,-4x:0 -1y,-4x:0 -2y,-4x:0 -3y,-4x:0 -4y,-4x:0 ]
+Kandidat: [ 2 3 4 5 7  ]
+
+TITIK 56 | PUSAT (-3,-2) = [0]
+Horizontal: [ -4x,-2y:0 -3x,-2y:0 -2x,-2y:1 -1x,-2y:0 0x,-2y:0 1x,-2y:0 2x,-2y:0 3x,-2y:6 4x,-2y:8 ]
+Vertikal: [ 4y,-3x:0 3y,-3x:0 2y,-3x:7 1y,-3x:5 0y,-3x:0 -1y,-3x:0 -2y,-3x:0 -3y,-3x:0 -4y,-3x:9 ]
+Kandidat: [ 2 3 4  ]
+
+TITIK 57 | PUSAT (-2,-2) = [1]
+Horizontal: [ -4x,-2y:0 -3x,-2y:0 -2x,-2y:1 -1x,-2y:0 0x,-2y:0 1x,-2y:0 2x,-2y:0 3x,-2y:6 4x,-2y:8 ]
+Vertikal: [ 4y,-2x:0 3y,-2x:3 2y,-2x:0 1y,-2x:0 0y,-2x:0 -1y,-2x:0 -2y,-2x:1 -3y,-2x:8 -4y,-2x:0 ]
+Kandidat: [ 1 ]
+
+TITIK 58 | PUSAT (-1,-2) = [0]
+Horizontal: [ -4x,-2y:0 -3x,-2y:0 -2x,-2y:1 -1x,-2y:0 0x,-2y:0 1x,-2y:0 2x,-2y:0 3x,-2y:6 4x,-2y:8 ]
+Vertikal: [ 4y,-1x:0 3y,-1x:6 2y,-1x:0 1y,-1x:0 0y,-1x:0 -1y,-1x:1 -2y,-1x:0 -3y,-1x:5 -4y,-1x:0 ]
+Kandidat: [ 2 3 4 7 9  ]
+
+TITIK 59 | PUSAT (0,-2) = [0]
+Horizontal: [ -4x,-2y:0 -3x,-2y:0 -2x,-2y:1 -1x,-2y:0 0x,-2y:0 1x,-2y:0 2x,-2y:0 3x,-2y:6 4x,-2y:8 ]
+Vertikal: [ 4y,0x:0 3y,0x:0 2y,0x:9 1y,0x:0 0y,0x:4 -1y,0x:0 -2y,0x:0 -3y,0x:0 -4y,0x:0 ]
+Kandidat: [ 2 3 7  ]
+
+TITIK 60 | PUSAT (1,-2) = [0]
+Horizontal: [ -4x,-2y:0 -3x,-2y:0 -2x,-2y:1 -1x,-2y:0 0x,-2y:0 1x,-2y:0 2x,-2y:0 3x,-2y:6 4x,-2y:8 ]
+Vertikal: [ 4y,1x:0 3y,1x:0 2y,1x:0 1y,1x:7 0y,1x:5 -1y,1x:0 -2y,1x:0 -3y,1x:0 -4y,1x:0 ]
+Kandidat: [ 2 3 4 9  ]
+
+TITIK 61 | PUSAT (2,-2) = [0]
+Horizontal: [ -4x,-2y:0 -3x,-2y:0 -2x,-2y:1 -1x,-2y:0 0x,-2y:0 1x,-2y:0 2x,-2y:0 3x,-2y:6 4x,-2y:8 ]
+Vertikal: [ 4y,2x:0 3y,2x:0 2y,2x:2 1y,2x:0 0y,2x:7 -1y,2x:0 -2y,2x:0 -3y,2x:0 -4y,2x:4 ]
+Kandidat: [ 3 5 9  ]
+
+TITIK 62 | PUSAT (3,-2) = [6]
+Horizontal: [ -4x,-2y:0 -3x,-2y:0 -2x,-2y:1 -1x,-2y:0 0x,-2y:0 1x,-2y:0 2x,-2y:0 3x,-2y:6 4x,-2y:8 ]
+Vertikal: [ 4y,3x:0 3y,3x:0 2y,3x:0 1y,3x:0 0y,3x:0 -1y,3x:3 -2y,3x:6 -3y,3x:1 -4y,3x:0 ]
+Kandidat: [ 6 ]
+
+TITIK 63 | PUSAT (4,-2) = [8]
+Horizontal: [ -4x,-2y:0 -3x,-2y:0 -2x,-2y:1 -1x,-2y:0 0x,-2y:0 1x,-2y:0 2x,-2y:0 3x,-2y:6 4x,-2y:8 ]
+Vertikal: [ 4y,4x:0 3y,4x:0 2y,4x:0 1y,4x:0 0y,4x:0 -1y,4x:0 -2y,4x:8 -3y,4x:0 -4y,4x:0 ]
+Kandidat: [ 8 ]
+
+TITIK 64 | PUSAT (-4,-3) = [0]
+Horizontal: [ -4x,-3y:0 -3x,-3y:0 -2x,-3y:8 -1x,-3y:5 0x,-3y:0 1x,-3y:0 2x,-3y:0 3x,-3y:1 4x,-3y:0 ]
+Vertikal: [ 4y,-4x:8 3y,-4x:0 2y,-4x:0 1y,-4x:0 0y,-4x:0 -1y,-4x:0 -2y,-4x:0 -3y,-4x:0 -4y,-4x:0 ]
+Kandidat: [ 2 3 4 6 7  ]
+
+TITIK 65 | PUSAT (-3,-3) = [0]
+Horizontal: [ -4x,-3y:0 -3x,-3y:0 -2x,-3y:8 -1x,-3y:5 0x,-3y:0 1x,-3y:0 2x,-3y:0 3x,-3y:1 4x,-3y:0 ]
+Vertikal: [ 4y,-3x:0 3y,-3x:0 2y,-3x:7 1y,-3x:5 0y,-3x:0 -1y,-3x:0 -2y,-3x:0 -3y,-3x:0 -4y,-3x:9 ]
+Kandidat: [ 2 3 4 6  ]
+
+TITIK 66 | PUSAT (-2,-3) = [8]
+Horizontal: [ -4x,-3y:0 -3x,-3y:0 -2x,-3y:8 -1x,-3y:5 0x,-3y:0 1x,-3y:0 2x,-3y:0 3x,-3y:1 4x,-3y:0 ]
+Vertikal: [ 4y,-2x:0 3y,-2x:3 2y,-2x:0 1y,-2x:0 0y,-2x:0 -1y,-2x:0 -2y,-2x:1 -3y,-2x:8 -4y,-2x:0 ]
+Kandidat: [ 8 ]
+
+TITIK 67 | PUSAT (-1,-3) = [5]
+Horizontal: [ -4x,-3y:0 -3x,-3y:0 -2x,-3y:8 -1x,-3y:5 0x,-3y:0 1x,-3y:0 2x,-3y:0 3x,-3y:1 4x,-3y:0 ]
+Vertikal: [ 4y,-1x:0 3y,-1x:6 2y,-1x:0 1y,-1x:0 0y,-1x:0 -1y,-1x:1 -2y,-1x:0 -3y,-1x:5 -4y,-1x:0 ]
+Kandidat: [ 5 ]
+
+TITIK 68 | PUSAT (0,-3) = [0]
+Horizontal: [ -4x,-3y:0 -3x,-3y:0 -2x,-3y:8 -1x,-3y:5 0x,-3y:0 1x,-3y:0 2x,-3y:0 3x,-3y:1 4x,-3y:0 ]
+Vertikal: [ 4y,0x:0 3y,0x:0 2y,0x:9 1y,0x:0 0y,0x:4 -1y,0x:0 -2y,0x:0 -3y,0x:0 -4y,0x:0 ]
+Kandidat: [ 2 3 6 7  ]
+
+TITIK 69 | PUSAT (1,-3) = [0]
+Horizontal: [ -4x,-3y:0 -3x,-3y:0 -2x,-3y:8 -1x,-3y:5 0x,-3y:0 1x,-3y:0 2x,-3y:0 3x,-3y:1 4x,-3y:0 ]
+Vertikal: [ 4y,1x:0 3y,1x:0 2y,1x:0 1y,1x:7 0y,1x:5 -1y,1x:0 -2y,1x:0 -3y,1x:0 -4y,1x:0 ]
+Kandidat: [ 2 3 4 6 9  ]
+
+TITIK 70 | PUSAT (2,-3) = [0]
+Horizontal: [ -4x,-3y:0 -3x,-3y:0 -2x,-3y:8 -1x,-3y:5 0x,-3y:0 1x,-3y:0 2x,-3y:0 3x,-3y:1 4x,-3y:0 ]
+Vertikal: [ 4y,2x:0 3y,2x:0 2y,2x:2 1y,2x:0 0y,2x:7 -1y,2x:0 -2y,2x:0 -3y,2x:0 -4y,2x:4 ]
+Kandidat: [ 3 9  ]
+
+TITIK 71 | PUSAT (3,-3) = [1]
+Horizontal: [ -4x,-3y:0 -3x,-3y:0 -2x,-3y:8 -1x,-3y:5 0x,-3y:0 1x,-3y:0 2x,-3y:0 3x,-3y:1 4x,-3y:0 ]
+Vertikal: [ 4y,3x:0 3y,3x:0 2y,3x:0 1y,3x:0 0y,3x:0 -1y,3x:3 -2y,3x:6 -3y,3x:1 -4y,3x:0 ]
+Kandidat: [ 1 ]
+
+TITIK 72 | PUSAT (4,-3) = [0]
+Horizontal: [ -4x,-3y:0 -3x,-3y:0 -2x,-3y:8 -1x,-3y:5 0x,-3y:0 1x,-3y:0 2x,-3y:0 3x,-3y:1 4x,-3y:0 ]
+Vertikal: [ 4y,4x:0 3y,4x:0 2y,4x:0 1y,4x:0 0y,4x:0 -1y,4x:0 -2y,4x:8 -3y,4x:0 -4y,4x:0 ]
+Kandidat: [ 2 3 7 9  ]
+
+TITIK 73 | PUSAT (-4,-4) = [0]
+Horizontal: [ -4x,-4y:0 -3x,-4y:9 -2x,-4y:0 -1x,-4y:0 0x,-4y:0 1x,-4y:0 2x,-4y:4 3x,-4y:0 4x,-4y:0 ]
+Vertikal: [ 4y,-4x:8 3y,-4x:0 2y,-4x:0 1y,-4x:0 0y,-4x:0 -1y,-4x:0 -2y,-4x:0 -3y,-4x:0 -4y,-4x:0 ]
+Kandidat: [ 2 3 5 6 7  ]
+
+TITIK 74 | PUSAT (-3,-4) = [9]
+Horizontal: [ -4x,-4y:0 -3x,-4y:9 -2x,-4y:0 -1x,-4y:0 0x,-4y:0 1x,-4y:0 2x,-4y:4 3x,-4y:0 4x,-4y:0 ]
+Vertikal: [ 4y,-3x:0 3y,-3x:0 2y,-3x:7 1y,-3x:5 0y,-3x:0 -1y,-3x:0 -2y,-3x:0 -3y,-3x:0 -4y,-3x:9 ]
+Kandidat: [ 9 ]
+
+TITIK 75 | PUSAT (-2,-4) = [0]
+Horizontal: [ -4x,-4y:0 -3x,-4y:9 -2x,-4y:0 -1x,-4y:0 0x,-4y:0 1x,-4y:0 2x,-4y:4 3x,-4y:0 4x,-4y:0 ]
+Vertikal: [ 4y,-2x:0 3y,-2x:3 2y,-2x:0 1y,-2x:0 0y,-2x:0 -1y,-2x:0 -2y,-2x:1 -3y,-2x:8 -4y,-2x:0 ]
+Kandidat: [ 2 5 6 7  ]
+
+TITIK 76 | PUSAT (-1,-4) = [0]
+Horizontal: [ -4x,-4y:0 -3x,-4y:9 -2x,-4y:0 -1x,-4y:0 0x,-4y:0 1x,-4y:0 2x,-4y:4 3x,-4y:0 4x,-4y:0 ]
+Vertikal: [ 4y,-1x:0 3y,-1x:6 2y,-1x:0 1y,-1x:0 0y,-1x:0 -1y,-1x:1 -2y,-1x:0 -3y,-1x:5 -4y,-1x:0 ]
+Kandidat: [ 2 3 7 8  ]
+
+TITIK 77 | PUSAT (0,-4) = [0]
+Horizontal: [ -4x,-4y:0 -3x,-4y:9 -2x,-4y:0 -1x,-4y:0 0x,-4y:0 1x,-4y:0 2x,-4y:4 3x,-4y:0 4x,-4y:0 ]
+Vertikal: [ 4y,0x:0 3y,0x:0 2y,0x:9 1y,0x:0 0y,0x:4 -1y,0x:0 -2y,0x:0 -3y,0x:0 -4y,0x:0 ]
+Kandidat: [ 1 2 3 6 7 8  ]
+
+TITIK 78 | PUSAT (1,-4) = [0]
+Horizontal: [ -4x,-4y:0 -3x,-4y:9 -2x,-4y:0 -1x,-4y:0 0x,-4y:0 1x,-4y:0 2x,-4y:4 3x,-4y:0 4x,-4y:0 ]
+Vertikal: [ 4y,1x:0 3y,1x:0 2y,1x:0 1y,1x:7 0y,1x:5 -1y,1x:0 -2y,1x:0 -3y,1x:0 -4y,1x:0 ]
+Kandidat: [ 1 2 3 6 8  ]
+
+TITIK 79 | PUSAT (2,-4) = [4]
+Horizontal: [ -4x,-4y:0 -3x,-4y:9 -2x,-4y:0 -1x,-4y:0 0x,-4y:0 1x,-4y:0 2x,-4y:4 3x,-4y:0 4x,-4y:0 ]
+Vertikal: [ 4y,2x:0 3y,2x:0 2y,2x:2 1y,2x:0 0y,2x:7 -1y,2x:0 -2y,2x:0 -3y,2x:0 -4y,2x:4 ]
+Kandidat: [ 4 ]
+
+TITIK 80 | PUSAT (3,-4) = [0]
+Horizontal: [ -4x,-4y:0 -3x,-4y:9 -2x,-4y:0 -1x,-4y:0 0x,-4y:0 1x,-4y:0 2x,-4y:4 3x,-4y:0 4x,-4y:0 ]
+Vertikal: [ 4y,3x:0 3y,3x:0 2y,3x:0 1y,3x:0 0y,3x:0 -1y,3x:3 -2y,3x:6 -3y,3x:1 -4y,3x:0 ]
+Kandidat: [ 2 5 7  ]
+
+TITIK 81 | PUSAT (4,-4) = [0]
+Horizontal: [ -4x,-4y:0 -3x,-4y:9 -2x,-4y:0 -1x,-4y:0 0x,-4y:0 1x,-4y:0 2x,-4y:4 3x,-4y:0 4x,-4y:0 ]
+Vertikal: [ 4y,4x:0 3y,4x:0 2y,4x:0 1y,4x:0 0y,4x:0 -1y,4x:0 -2y,4x:8 -3y,4x:0 -4y,4x:0 ]
+Kandidat: [ 2 3 5 7  ]
+
