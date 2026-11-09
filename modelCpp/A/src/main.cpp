@@ -124,7 +124,7 @@ std::string get_flag_str(const std::vector<std::string>& args, const std::string
 }
 
 // ==========================================
-// CONFIG CLI OVERRIDE (baru)
+// CONFIG CLI OVERRIDE
 // ==========================================
 void apply_config_overrides(int argc, char* argv[], NolConfig& cfg) {
     for (int i = 1; i < argc; ++i) {
@@ -156,6 +156,42 @@ void apply_config_overrides(int argc, char* argv[], NolConfig& cfg) {
             std::cerr << "Warning: invalid value for " << arg << "\n";
         }
     }
+}
+
+static bool load_model_and_vocab(const std::string& model_name) {
+    g_current_model_name = model_name;
+    g_model = new NolModel(g_cfg);
+
+    std::string path = model_name + ".safetensors";
+    if (!load_safetensors(*g_model, path)) {
+        std::cerr << "Error: Model '" << model_name << "' not found.\n";
+        delete g_model;
+        g_model = nullptr;
+        return false;
+    }
+
+    CheckpointMeta meta;
+    std::string log_path = model_name + ".log";
+    if (load_checkpoint_meta(meta, log_path)) {
+        g_status.remaining_epochs = meta.remaining_epochs;
+        g_status.completed_steps = meta.completed_steps;
+        g_status.last_loss = meta.last_loss;
+        g_status.last_acc = meta.last_acc;
+        g_status.last_ppl = meta.last_ppl;
+        g_status.context_proficiency = meta.context_proficiency;
+    }
+
+    g_tokenizer = new BPETokenizer();
+    std::string vocab_path = model_name + ".vocab";
+    if (g_tokenizer->load_vocab(vocab_path)) {
+        g_vocab_ready = true;
+        std::cout << "✅ Vocab loaded: " << g_tokenizer->vocab_size() << " tokens\n";
+    } else {
+        g_vocab_ready = false;
+        std::cout << "⚠️  Vocab not found (run /build-vocab to create one)\n";
+    }
+
+    return true;
 }
 
 // ==========================================
@@ -334,38 +370,13 @@ void handle_switch(const std::vector<std::string>& args) {
         delete g_model;
         g_model = nullptr;
     }
+    if (g_tokenizer) { delete g_tokenizer; g_tokenizer = nullptr; }
+    if (g_dataset) { delete g_dataset; g_dataset = nullptr; }
+    g_vocab_ready = false;
 
-    g_model = new NolModel(g_cfg);
-    std::string path = new_model + ".safetensors";
-    if (!load_safetensors(*g_model, path)) {
-        std::cout << "Error: Model '" << new_model << "' not found.\n";
-        delete g_model;
-        g_model = nullptr;
-        return;
+    if (load_model_and_vocab(new_model)) {
+        std::cout << "Switched to model: " << new_model << "\n";
     }
-
-    g_current_model_name = new_model;
-
-    CheckpointMeta meta;
-    if (load_checkpoint_meta(meta, new_model + ".log")) {
-        g_status.remaining_epochs = meta.remaining_epochs;
-        g_status.completed_steps = meta.completed_steps;
-        g_status.last_loss = meta.last_loss;
-        g_status.last_acc = meta.last_acc;
-        g_status.last_ppl = meta.last_ppl;
-        g_status.context_proficiency = meta.context_proficiency;
-    }
-
-    if (g_tokenizer) {
-        std::string vocab_path = new_model + ".vocab";
-        if (g_tokenizer->load_vocab(vocab_path)) {
-            g_vocab_ready = true;
-        } else {
-            g_vocab_ready = false;
-        }
-    }
-
-    std::cout << "Switched to model: " << new_model << "\n";
 }
 
 void handle_resume() {
@@ -386,11 +397,11 @@ int main(int argc, char* argv[]) {
 
     g_cfg = get_default_config();
 
-    // Apply CLI config overrides SEBELUM parsing model-name/resume
     apply_config_overrides(argc, argv, g_cfg);
 
     std::string model_name;
     std::string resume_model;
+    std::string login_model;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -398,10 +409,11 @@ int main(int argc, char* argv[]) {
             model_name = argv[++i];
         } else if (arg == "--resume" && i + 1 < argc) {
             resume_model = argv[++i];
+        } else if (arg == "--login" && i + 1 < argc) {
+            login_model = argv[++i];
         }
     }
 
-    // Mode: Create new model
     if (!model_name.empty()) {
         print_config(g_cfg);
         std::cout << "Create model '" << model_name << "' with above config? (y/n): ";
@@ -410,71 +422,56 @@ int main(int argc, char* argv[]) {
 
         if (confirm == "y" || confirm == "Y") {
             create_new_model(g_cfg, model_name);
-            g_current_model_name = model_name;
-            g_model = new NolModel(g_cfg);
-            load_safetensors(*g_model, model_name + ".safetensors");
-
-            CheckpointMeta meta;
-            load_checkpoint_meta(meta, model_name + ".log");
-            g_status.remaining_epochs = meta.remaining_epochs;
-            g_status.completed_steps = meta.completed_steps;
-
-            g_tokenizer = new BPETokenizer();
-            std::string vocab_path = model_name + ".vocab";
-            if (g_tokenizer->load_vocab(vocab_path)) {
-                g_vocab_ready = true;
-                std::cout << "Vocab loaded: " << g_tokenizer->vocab_size() << " tokens\n";
+            if (!load_model_and_vocab(model_name)) {
+                return 1;
             }
         } else {
             std::cout << "Cancelled.\n";
             return 0;
         }
     }
-    // Mode: Resume
     else if (!resume_model.empty()) {
-        g_current_model_name = resume_model;
-        g_model = new NolModel(g_cfg);
-
-        if (!load_safetensors(*g_model, resume_model + ".safetensors")) {
-            std::cerr << "Error: Model '" << resume_model << "' not found.\n";
-            delete g_model;
+        if (!load_model_and_vocab(resume_model)) {
             return 1;
         }
-
-        CheckpointMeta meta;
-        if (load_checkpoint_meta(meta, resume_model + ".log")) {
-            g_status.remaining_epochs = meta.remaining_epochs;
-            g_status.completed_steps = meta.completed_steps;
-            g_status.last_loss = meta.last_loss;
-            g_status.last_acc = meta.last_acc;
-            g_status.last_ppl = meta.last_ppl;
-            g_status.context_proficiency = meta.context_proficiency;
+        std::cout << "🔄 Resuming model: " << resume_model << "\n";
+        if (g_status.remaining_epochs > 0) {
+            handle_resume();
         }
-
-        g_tokenizer = new BPETokenizer();
-        std::string vocab_path = resume_model + ".vocab";
-        if (g_tokenizer->load_vocab(vocab_path)) {
-            g_vocab_ready = true;
-        }
-
-        std::cout << "Resuming model: " << resume_model << "\n";
-        handle_resume();
         print_lobby_header();
     }
-    // Mode: No arguments
+    else if (!login_model.empty()) {
+        if (!load_model_and_vocab(login_model)) {
+            return 1;
+        }
+        std::cout << "🔐 Logged in to model: " << login_model << "\n";
+        std::cout << "   Status: " << g_status.completed_steps << " steps completed, "
+                  << g_status.remaining_epochs << " epochs remaining\n";
+        if (g_status.remaining_epochs > 0) {
+            std::cout << "   💡 Use '/resume' to continue training, or '/training --epochs N' for new training\n";
+        }
+        print_lobby_header();
+    }
     else {
+        std::cout << "\n\033[1;36m╔═══════════════════════════════════════════════════════════╗\033[0m\n";
+        std::cout << "\033[1;36m║              MODEL NOL - PLAYGROUND CLI                 ║\033[0m\n";
+        std::cout << "\033[1;36m╚═══════════════════════════════════════════════════════════╝\033[0m\n\n";
         std::cout << "Usage:\n";
-        std::cout << "  ./proyek --model-name \"name\"   Create new model\n";
-        std::cout << "  ./proyek --resume \"name\"       Resume training\n";
-        std::cout << "\nConfig overrides:\n";
+        std::cout << "  \033[1;32m./proyek --model-name \"name\"\033[0m   Create new model\n";
+        std::cout << "  \033[1;32m./proyek --login \"name\"\033[0m        Login to existing model (no auto-train)\n";
+        std::cout << "  \033[1;32m./proyek --resume \"name\"\033[0m       Resume training auto\n";
+        std::cout << "\n\033[1;33mConfig overrides:\033[0m\n";
         std::cout << "  --vocab-size N  --d-model N  --n-layers N  --n-heads N\n";
         std::cout << "  --ffn-hidden N  --max-seq-len N  --n-hyp-heads N  --d-hyp N\n";
         std::cout << "  --n-top-anchors N  --n-children N  --epochs N  --batch-size N\n";
         std::cout << "  --lr F  --warmup-steps N  --self-evo-steps N\n";
+        std::cout << "\n\033[1;35mPerbedaan mode:\033[0m\n";
+        std::cout << "  --model-name : Buat model BARU dari config (overwrite jika sudah ada)\n";
+        std::cout << "  --login      : Login ke model yang SUDAH ADA, langsung ke lobby\n";
+        std::cout << "  --resume     : Login + auto-lanjutkan training jika ada sisa epoch\n";
         return 0;
     }
 
-    // Playground Lobby Loop
     while (!g_interrupted) {
         print_lobby_header();
         std::cout << "> ";
@@ -506,7 +503,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Cleanup
     if (g_model) {
         save_safetensors(*g_model, g_current_model_name + ".safetensors");
         CheckpointMeta meta;
