@@ -234,28 +234,28 @@ class TrainingConfig:
     
     # Learning rate: moderat untuk model medium
     # Standard untuk GPT-2 (117M) = 2.5e-4, untuk 40M bisa sedikit lebih tinggi
-    learning_rate: float = 2e-4
+    learning_rate: float = 1e-3
     
     # Batch size: 4-8 optimal untuk sequence_length 256 di CPU
     # Memory estimate: ~2-3GB dengan batch=4, seq=256, 40M params
-    batch_size: int = 4
+    batch_size: int = 2
     
     # Epochs: 3 sudah cukup untuk 142K samples
     # Lebih dari itu = overfitting
     epochs: int = 3
     
     # Sequence length: cukup untuk context (300 tokens) + Q (20) + A (30) + special (10)
-    sequence_length: int = 384
+    sequence_length: int = 192
     
     # ================================================================
     # REGULARIZATION (rendah karena data besar)
     # ================================================================
     
     # Dropout: rendah (0.1), data besar sudah cukup regularize
-    dropout_rate: float = 0.1
+    dropout_rate: float = 0.05
     
     # Weight decay: standard (0.01), tidak terlalu agresif
-    weight_decay: float = 0.01
+    weight_decay: float = 0.001
     
     # Gradient clipping
     grad_clip_norm: float = 1.0
@@ -272,7 +272,7 @@ class TrainingConfig:
     # ================================================================
     
     # Warmup: 1000 steps (~250 batches) untuk stability di awal
-    lr_warmup_steps: int = 1000
+    lr_warmup_steps: int = 50
     
     # Cosine decay: tidak pakai (biar constant LR untuk simplicity)
     lr_decay_steps: int = 0
@@ -290,8 +290,8 @@ class TrainingConfig:
     early_stopping_patience: int = 0
 
     # Evaluasi dan checkpoint
-    eval_every_n_steps: int = 5000  # Evaluate setiap 5000 steps
-    save_checkpoint_every_n_steps: int = 5000  # Checkpoint setiap 5000 steps
+    eval_every_n_steps: int = 100  # Evaluate setiap 5000 steps
+    save_checkpoint_every_n_steps: int = 50  # Checkpoint setiap 5000 steps
     
     # Inline training dari playground
     inline_training_steps: int = 100
@@ -479,25 +479,25 @@ class ModelConfig:
     
     # Vocab size: 8000 cukup untuk English + Indonesian
     # SQuAD mostly English, tapi butuh coverage untuk both languages
-    vocab_size: int = 8000
+    vocab_size: int = 1800
     
     # Hidden dimension
-    embedding_dim: int = 512
+    embedding_dim: int = 96
     
     # Attention heads
-    num_attention_heads: int = 8
+    num_attention_heads: int = 4
     
     # Layers: 8 cukup untuk model medium
-    num_layers: int = 8
+    num_layers: int = 2
     
     # Context length: 512 tokens (context 300 + Q 20 + A 30 + special)
-    max_position_embeddings: int = 512
+    max_position_embeddings: int = 256
     
     # LayerNorm epsilon
     layer_norm_eps: float = 1e-5
     
     # FFN dimension: 4x embedding (standard)
-    ffn_hidden_dim: int = 2048
+    ffn_hidden_dim: int = 128
     
     # ================================================================
     # PRECISION

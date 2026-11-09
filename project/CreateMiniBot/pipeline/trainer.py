@@ -2,7 +2,7 @@
 #
 # Trainer / Training Loop Engine untuk RAG-based Training Pipeline.
 #
-# VERSI v2.3 (FINAL):
+# VERSI v2.3.3 (FINAL):
 # Arsitektur: Single-Head + RAG + Constrained Generation
 #
 # 🎯 SELF-CORRECTING TRAINING PHILOSOPHY:
@@ -31,12 +31,17 @@
 # - get_resume_info() untuk main.py auto-continue
 # - Metrics persisten di checkpoint untuk resume + /status
 #
+# 🆕 Fitur v2.3.3:
+# - Auto-convert .txt files ke QA format jika dataset belum ada
+# - Memungkinkan sanity check cepat tanpa manual preparation
+#
 # Keterhubungan:
 # - config.py              : hyperparameter training + RAG
 # - core/tokenizer.py      : encode QA samples
 # - core/architecture.py   : model (single LM head + cross-attention)
 # - core/retriever.py      : build index setelah training (optional)
 # - core/model_exporter.py : export otak model
+# - scripts/convert_dataset.py : auto-convert .txt → QA (v2.3.3)
 # - pipeline/evaluator.py  : menghitung loss dan gradient
 # - pipeline/weight_manager.py : memperbarui bobot + track metrics
 
@@ -46,6 +51,7 @@ import json
 import math
 import random
 import re
+import subprocess
 import sys
 from collections import deque
 from pathlib import Path
@@ -121,6 +127,9 @@ class Trainer:
     🆕 Fitur v2.3:
     - Metrics tracking (loss, PPL, accuracy) di setiap checkpoint
     - Resume info untuk auto-continue di main.py
+    
+    🆕 Fitur v2.3.3:
+    - Auto-convert .txt files ke QA format jika dataset belum ada
     """
 
     LOG_EVERY_STEPS = 10
@@ -204,6 +213,9 @@ class Trainer:
         )
         self.max_context_paragraphs = int(
             getattr(config.training, 'max_context_paragraphs', 3)
+        )
+        self.augmentation_factor = int(
+            getattr(config.training, 'augmentation_factor', 1)
         )
 
         # ================================================================
@@ -759,12 +771,26 @@ class Trainer:
         self.start_global_step = max(0, int(global_step))
 
     # ========================================================================
-    # DATASET LOADING
+    # 🆕 v2.3.3: DATASET LOADING DENGAN AUTO-CONVERT
     # ========================================================================
 
     def load_qa_dataset(self, path: Optional[Path] = None, verbose: bool = True) -> int:
-        """Load QA dataset."""
+        """
+        Load QA dataset dari file JSON.
+        
+        🆕 v2.3.3: AUTO-CONVERT FALLBACK
+        Jika qa_dataset.json tidak ada, otomatis jalankan convert_dataset.py
+        untuk convert .txt files di datasets/ ke QA format.
+        
+        Flow:
+        1. Cek merged dataset (SQuAD) - priority tertinggi
+        2. Cek qa_dataset.json (custom)
+        3. Jika tidak ada, cari .txt files di datasets/
+        4. Jika ada .txt, jalankan convert_dataset.py otomatis
+        5. Load hasil convert
+        """
         if path is None:
+            # Coba load merged dataset dulu (SQuAD prepared)
             merged_train = Path(self.config.paths.merged_qa_train_path)
             if merged_train.exists():
                 path = merged_train
@@ -776,11 +802,102 @@ class Trainer:
             path = Path(path)
 
         if not path.exists():
+            # ============================================================
+            # 🆕 v2.3.3: AUTO-CONVERT FALLBACK
+            # ============================================================
             if verbose:
                 print(f"[Trainer] ⚠️ QA dataset tidak ditemukan: {path}")
-                print(f"[Trainer] Jalankan: python scripts/prepare_datasets.py")
-            return 0
+            
+            # Cek apakah ada .txt files di datasets/
+            txt_files = []
+            if self.datasets_dir.exists():
+                # Skip subdirectories (squad, tydi, indoqa, merged)
+                skip_dirs = {"squad", "tydi", "indoqa", "merged"}
+                txt_files = [
+                    f for f in self.datasets_dir.glob("*.txt")
+                    if f.parent.name not in skip_dirs
+                ]
+            
+            if txt_files:
+                if verbose:
+                    print(f"[Trainer] 🔄 Menemukan {len(txt_files)} .txt files, mencoba auto-convert...")
+                    for f in txt_files[:5]:
+                        print(f"[Trainer]    📄 {f.name}")
+                    if len(txt_files) > 5:
+                        print(f"[Trainer]    ... dan {len(txt_files) - 5} files lainnya")
+                
+                # Panggil convert_dataset.py via subprocess
+                convert_script = _PROJECT_ROOT / "scripts" / "convert_dataset.py"
+                
+                if convert_script.exists():
+                    try:
+                        cmd = [
+                            sys.executable,
+                            str(convert_script),
+                            "--datasets-dir", str(self.datasets_dir),
+                            "--output", str(self.qa_dataset_path),
+                            "--augmentation-factor", str(self.augmentation_factor),
+                        ]
+                        
+                        if verbose:
+                            print(f"[Trainer] 🚀 Running auto-convert...")
+                            print(f"[Trainer]    Command: {' '.join(cmd)}")
+                        
+                        result = subprocess.run(
+                            cmd,
+                            capture_output=not verbose,
+                            text=True,
+                            timeout=300,  # 5 menit timeout
+                        )
+                        
+                        if result.returncode != 0:
+                            if verbose:
+                                print(f"[Trainer] ❌ Auto-convert gagal dengan return code {result.returncode}")
+                                if result.stdout:
+                                    print(f"[Trainer] STDOUT:\n{result.stdout[:500]}")
+                                if result.stderr:
+                                    print(f"[Trainer] STDERR:\n{result.stderr[:500]}")
+                            return 0
+                        
+                        if verbose and result.stdout:
+                            # Print summary saja (jangan terlalu verbose)
+                            lines = result.stdout.split('\n')
+                            for line in lines:
+                                if any(kw in line for kw in ['✅', 'samples', 'Loaded', 'Saved', 'Konversi']):
+                                    print(f"[Trainer] {line}")
+                        
+                        # Reload path setelah convert
+                        path = self.qa_dataset_path
+                        
+                        if not path.exists():
+                            if verbose:
+                                print(f"[Trainer] ❌ Convert selesai tapi file tidak dibuat: {path}")
+                            return 0
+                        
+                    except subprocess.TimeoutExpired:
+                        if verbose:
+                            print(f"[Trainer] ❌ Auto-convert timeout (> 5 menit)")
+                        return 0
+                    except Exception as e:
+                        if verbose:
+                            print(f"[Trainer] ❌ Error saat auto-convert: {e}")
+                        return 0
+                else:
+                    if verbose:
+                        print(f"[Trainer] ❌ Script convert_dataset.py tidak ditemukan: {convert_script}")
+                        print(f"[Trainer]    Jalankan manual: python scripts/convert_dataset.py")
+                    return 0
+            else:
+                if verbose:
+                    print(f"[Trainer] ❌ Tidak ada .txt files untuk di-convert")
+                    print(f"[Trainer]    Options:")
+                    print(f"[Trainer]    1. Jalankan: python scripts/prepare_datasets.py (untuk SQuAD)")
+                    print(f"[Trainer]    2. Tambahkan .txt files ke: {self.datasets_dir}")
+                return 0
 
+        # ============================================================
+        # Load dari file (existing logic)
+        # ============================================================
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -1116,7 +1233,7 @@ class Trainer:
 
         if verbose:
             print("=" * 70)
-            print("🎯 SOTA RAG TRAINING (v2.3 FINAL)")
+            print("🎯 SOTA RAG TRAINING (v2.3.3 FINAL)")
             print("=" * 70)
             print(f"  QA samples          : {len(self.qa_samples):,}")
             print(f"  Total epochs        : {total_epochs}")
