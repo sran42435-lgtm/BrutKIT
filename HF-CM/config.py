@@ -17,6 +17,9 @@ class FastMemoryLimits:
     MAX_CLARIFICATION_ROUNDS: Final[int] = 3
     PENDING_RELEVANCE_THRESHOLD: Final[float] = 0.60
     PENDING_EXPIRATION_HOURS: Final[int] = 24
+    # [NEW] Ditambahkan sesuai Spesifikasi Penguatan
+    PENDING_SWITCH_THRESHOLD: Final[float] = 0.30
+    PENDING_TTL_SECONDS: Final[int] = 86400
 
 @dataclass(frozen=True)
 class SignalConstants:
@@ -42,12 +45,22 @@ class DecisionThresholds:
     CLEAR_MARGIN: Final[float] = 0.15 
     AMBIGUITY_MARGIN: Final[float] = 0.05
     MINIMUM_RETRIEVAL_SCORE: Final[float] = 0.10  # [FIX] Diturunkan dari 0.30 ke 0.10 agar query pendek tidak langsung digugurkan (NO_MATCH) sebelum masuk Ambiguity Gate.
+    # [NEW] Ditambahkan sesuai Spesifikasi Penguatan
+    MIN_TOPIC_ACTIVATION_SCORE: Final[float] = 0.15
+    MIN_CONFIDENT_MARGIN: Final[float] = 0.20
+    MAX_CANDIDATES: Final[int] = 5
 
 @dataclass(frozen=True)
 class TemporalConstants:
     TEMPORAL_MATCH_WEIGHT: Final[float] = 0.80
     TEMPORAL_TOLERANCE_HOURS: Final[int] = 2
     MAX_TEMPORAL_CANDIDATES: Final[int] = 5
+    # [NEW] Ditambahkan sesuai Spesifikasi Penguatan
+    TEMPORAL_DAY_WINDOW: Final[int] = 1
+    TEMPORAL_WEEK_WINDOW: Final[int] = 7
+    TEMPORAL_MONTH_WINDOW: Final[int] = 30
+    TEMPORAL_YEAR_WINDOW: Final[int] = 365
+    TEMPORAL_HOUR_TOLERANCE: Final[int] = 2
 
 @dataclass(frozen=True)
 class RetrievalLimits:
@@ -84,6 +97,16 @@ class ContinuityConstants:
     CONTINUITY_WINDOW_SIZE: Final[int] = 4
     MEDIAN_CONTINUITY_THRESHOLD: Final[float] = 0.60
     MIN_SUBSTANTIVE_SCORE: Final[float] = 0.50
+    # [NEW] Ditambahkan sesuai Spesifikasi Penguatan
+    MIN_CONTINUITY_SCORE: Final[float] = 0.40
+    CONTINUITY_STABILITY_THRESHOLD: Final[float] = 0.65
+
+# [NEW] Class baru sesuai Spesifikasi Penguatan
+@dataclass(frozen=True)
+class TopicSwitchConstants:
+    NOVELTY_THRESHOLD: Final[float] = 0.70
+    MIN_ACTIVE_TOPIC_OVERLAP: Final[float] = 0.15
+    TOPIC_SWITCH_THRESHOLD: Final[float] = 0.60
 
 @dataclass(frozen=True)
 class GraphConstants:
@@ -112,6 +135,7 @@ class HF_CMConfig:
     context: Final[ContextBudget] = ContextBudget()
     llm: Final[LLMConstants] = LLMConstants()
     continuity: Final[ContinuityConstants] = ContinuityConstants()
+    topic_switch: Final[TopicSwitchConstants] = TopicSwitchConstants() # [NEW]
     graph: Final[GraphConstants] = GraphConstants()
     storage: Final[StorageConstants] = StorageConstants()
 

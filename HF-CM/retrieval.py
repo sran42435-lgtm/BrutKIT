@@ -40,6 +40,8 @@ class RetrievalResult(BaseModel):
     selected_fragment_ids: List[str] = Field(default_factory=list)
     temporal_constraint: Optional[str] = None
     analysis_notes: str = ""
+    # [NEW] Ditambahkan sesuai Spesifikasi Penguatan untuk output klarifikasi informatif
+    clarification_message: str = ""
 
 # ==========================================
 # 1. SIGNAL EXTRACTION (LAYER 3)
@@ -83,15 +85,29 @@ class SignalExtractor:
 
         # 3. Unique Terms (untuk matching)
         unique_terms = list(set(normalized_tokens))
+        
+        # [NEW] 4. Co-occurrence Signals (Pasangan token berurutan untuk bukti asosiatif)
+        co_occurrence_signals = []
+        for i in range(len(normalized_tokens) - 1):
+            pair = f"{normalized_tokens[i]}↔{normalized_tokens[i+1]}"
+            co_occurrence_signals.append(pair)
+            
+        # [NEW] 5. Topic Signals (Untuk PoC leksikal, sama dengan unique terms)
+        topic_signals = unique_terms[:]
 
         # Confidence sederhana: semakin banyak token unik, semakin tinggi (sampai batas)
         confidence = min(1.0, len(unique_terms) / 10.0)
 
         return SignalProfile(
+            raw_tokens=raw_tokens,
             tokens=raw_tokens,
             normalized_tokens=normalized_tokens,
             unique_terms=unique_terms,
+            unique_tokens=unique_terms,
+            topic_signals=topic_signals,
+            co_occurrence_signals=co_occurrence_signals,
             temporal_signals=temporal_signals,
+            novel_tokens=[], # Akan dihitung di Engine berdasarkan global keys
             confidence=confidence
         )
 
@@ -163,20 +179,21 @@ class TopicKeyScorer:
         signal: SignalProfile, 
         key: TopicKey, 
         is_active_topic: bool,
-        continuity_score: float
+        continuity_score: float,
+        cross_session_score: float = 0.0 # [NEW] Bukti lintas sesi (Layer 16/Graph)
     ) -> CandidateScore:
         """
         Menghitung skor komposit.
-        Rumus: (Token * W) + (Desc * W) + (CoOcc * W) + (Cont * W)
+        Rumus: S = (T * W) + (D * W) + (C * W) + (Cont * W) + (U * W) + (X * W)
         """
         if not signal.unique_terms:
             return CandidateScore(key_id=key.key_id, title=key.title, final_score=0.0)
 
-        # A. Token Score (Query Recall)
-        # [FIX] Mengubah dari Jaccard (intersection/union) menjadi Query Recall (intersection/query_len).
-        # Ini mencegah query pendek dihukum secara tidak adil oleh union yang besar.
-        key_tokens = set(key.token_profile.keys())
         signal_tokens = set(signal.unique_terms)
+
+        # A. Token Score (Query Recall)
+        # Mengubah dari Jaccard (intersection/union) menjadi Query Recall (intersection/query_len).
+        key_tokens = set(key.token_profile.keys())
         intersection = signal_tokens.intersection(key_tokens)
         token_score = len(intersection) / len(signal_tokens) if signal_tokens else 0.0
 
@@ -188,17 +205,34 @@ class TopicKeyScorer:
         description_score = 1.0 if desc_matches > 0 else 0.0
 
         # C. Co-occurrence Score
-        # Cek profil co-occurrence (kata yang sering muncul bersama topik ini)
+        # [NEW] Cek profil co-occurrence (pasangan kata dan kata individual)
         cooc_score = 0.0
         if key.co_occurrence_profile:
-            total_weight = sum(key.co_occurrence_profile.values())
-            matched_weight = sum(key.co_occurrence_profile.get(t, 0) for t in signal_tokens)
-            if total_weight > 0:
-                cooc_score = matched_weight / total_weight
+            # Cek pasangan (pairs)
+            matched_pairs = 0
+            total_pairs = len(signal.co_occurrence_signals)
+            for pair in signal.co_occurrence_signals:
+                if pair in key.co_occurrence_profile:
+                    matched_pairs += 1
+            
+            if total_pairs > 0:
+                cooc_score = matched_pairs / total_pairs
+            else:
+                # Fallback ke token individual jika tidak ada pasangan
+                total_weight = sum(key.co_occurrence_profile.values())
+                matched_weight = sum(key.co_occurrence_profile.get(t, 0) for t in signal_tokens)
+                if total_weight > 0:
+                    cooc_score = matched_weight / total_weight
 
         # D. Continuity Score
         # Bonus jika ini adalah topik yang sedang aktif dan stabil
         cont_score = continuity_score if is_active_topic else 0.0
+        
+        # [NEW] U. Unique Token Evidence (Bonus untuk token unik yang cocok)
+        unique_score = token_score 
+        
+        # [NEW] X. Cross-session Evidence
+        x_score = cross_session_score
 
         # E. Hitung Final Score (Weighted Sum)
         w = CONFIG.activation
@@ -206,7 +240,9 @@ class TopicKeyScorer:
             (token_score * w.TOKEN_WEIGHT) +
             (description_score * w.DESCRIPTION_WEIGHT) +
             (cooc_score * w.CO_OCCURRENCE_WEIGHT) +
-            (cont_score * w.CONTINUITY_WEIGHT)
+            (cont_score * w.CONTINUITY_WEIGHT) +
+            (unique_score * 0.05) + # [NEW] Bobot U
+            (x_score * 0.05)        # [NEW] Bobot X
         )
 
         return CandidateScore(
@@ -260,9 +296,13 @@ class RetrievalEngine:
 
         # 2. Score Candidates
         candidates = []
+        key_map = {k.key_id: k for k in keys} # [NEW] Untuk deskripsi klarifikasi
+        
         for key in keys:
             is_active = (key.key_id == active_topic_id)
-            score = self.scorer.score(signal, key, is_active, continuity_score)
+            # [NEW] Cross session score placeholder (bisa diisi dari graph evidence nanti)
+            x_score = 0.0 
+            score = self.scorer.score(signal, key, is_active, continuity_score, x_score)
             if score.final_score >= CONFIG.decision.MINIMUM_RETRIEVAL_SCORE:
                 candidates.append(score)
 
@@ -280,6 +320,7 @@ class RetrievalEngine:
         decision_type = DecisionType.CLEAR
         selected_key_id = top_candidate.key_id
         notes = f"Top: {top_candidate.title} ({top_candidate.final_score:.2f})"
+        clarification_message = ""
 
         if second_candidate:
             margin = top_candidate.final_score - second_candidate.final_score
@@ -287,6 +328,14 @@ class RetrievalEngine:
                 decision_type = DecisionType.AMBIGUOUS
                 selected_key_id = None # Belum boleh dipilih
                 notes = f"Ambigu: {top_candidate.title} vs {second_candidate.title} (Diff: {margin:.2f})"
+                
+                # [NEW] 6. Informative Clarification Output
+                msg_parts = ["Saya menemukan beberapa topik yang mungkin Anda maksud:\n"]
+                for i, cand in enumerate(candidates[:3], 1):
+                    desc = key_map[cand.key_id].helper_description if cand.key_id in key_map else "pembahasan terkait."
+                    msg_parts.append(f"{i}. {cand.title} — {desc}")
+                msg_parts.append("\nYang mana yang ingin Anda lanjutkan?")
+                clarification_message = "\n".join(msg_parts)
 
         # 4. Temporal Disambiguation (Layer 6)
         # Jika AMBIGU tapi ada sinyal waktu, coba gunakan waktu untuk memecah kebuntuan
@@ -301,6 +350,7 @@ class RetrievalEngine:
                 decision_type = DecisionType.CLEAR
                 selected_key_id = resolved_key_id
                 notes += " | Resolved by Temporal Evidence."
+                clarification_message = "" # Reset karena sudah resolved
 
         # 5. Fragment Selection (Jika CLEAR)
         selected_fragments = []
@@ -315,7 +365,8 @@ class RetrievalEngine:
             selected_key_id=selected_key_id,
             selected_fragment_ids=selected_fragments,
             temporal_constraint=str(temporal_range) if temporal_range else None,
-            analysis_notes=notes
+            analysis_notes=notes,
+            clarification_message=clarification_message
         )
 
     def _try_temporal_resolution(

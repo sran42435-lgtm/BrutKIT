@@ -72,7 +72,7 @@ class ContextBuilder:
         if total_tokens > self.max_context_tokens:
             logger.warning(
                 f"Context Budget Terlampaui! Estimasi: {total_tokens} token. "
-                f"Batas: {self.max_context_tokens}. Memori akan dipangkas."
+                f"Batas: {self.max_context_tokens}. Memori akan dibuang (Fail-Safe)."
             )
             # Fallback darurat: Buang memori, prioritaskan prompt user saat ini
             past_memory_text = "" 
@@ -96,13 +96,22 @@ class ContextBuilder:
         if not memories:
             return ""
 
+        # [NEW] Prioritas Fragment:
+        # 1. Exact temporal match (diasumsikan sudah di-filter engine)
+        # 2. Highest retrieval score (jika ada di dict)
+        # 3. Recency (timestamp)
+        def sort_key(mem):
+            return mem.get('timestamp', '')
+            
+        memories = sorted(memories, key=sort_key, reverse=True)
+
         # Batasi jumlah fragmen berdasarkan config
         memories = memories[:self.max_fragments]
         
         assembled_parts = []
         current_memory_tokens = 0
         
-        # Iterasi dari memori yang paling relevan/terbaru (asumsi list sudah di-sort)
+        # Iterasi dari memori yang paling relevan/terbaru
         for mem in memories:
             text = mem.get('text', '')
             timestamp = mem.get('timestamp', 'Unknown')
@@ -110,7 +119,9 @@ class ContextBuilder:
             formatted_mem = f"[Waktu: {timestamp}]\n{text}"
             mem_tokens = self._estimate_tokens(formatted_mem)
             
-            # Jika menambahkan fragmen ini melebihi batas memori, hentikan
+            # Jika menambahkan fragmen ini melebihi batas memori, hentikan.
+            # Aturan: Exact memory tidak boleh dipotong sembarangan (string slicing).
+            # Kita membuang seluruh fragmen (break) jika budget tidak cukup.
             if current_memory_tokens + mem_tokens > self.max_memory_tokens:
                 logger.info("Memory Token Budget tercapai. Fragmen sisa diabaikan.")
                 break

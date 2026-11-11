@@ -58,12 +58,16 @@ class InputEnvelope(BaseModel):
 
 class SignalProfile(BaseModel):
     """Hasil ekstraksi sinyal dari bahasa manusia."""
+    # [NEW] Field diperkuat sesuai Spesifikasi Penguatan
+    raw_tokens: list[str] = Field(default_factory=list)
     tokens: list[str] = Field(default_factory=list)
     normalized_tokens: list[str] = Field(default_factory=list)
     unique_terms: list[str] = Field(default_factory=list)
+    unique_tokens: list[str] = Field(default_factory=list)
     topic_signals: list[str] = Field(default_factory=list)
     co_occurrence_signals: list[str] = Field(default_factory=list)
     temporal_signals: list[str] = Field(default_factory=list)
+    novel_tokens: list[str] = Field(default_factory=list)
     confidence: float = 0.0
 
 # ==========================================
@@ -75,9 +79,15 @@ class TopicKey(BaseModel):
     key_id: str
     title: str
     helper_description: str
+    # [NEW] Field diperkuat sesuai Spesifikasi Penguatan
+    representative_tokens: list[str] = Field(default_factory=list)
+    unique_tokens: list[str] = Field(default_factory=list)
     token_profile: dict[str, int] = Field(default_factory=dict)
     co_occurrence_profile: dict[str, int] = Field(default_factory=dict)
     created_at: datetime
+    updated_at: Optional[datetime] = None
+    activation_count: int = 0
+    related_fragment_ids: list[str] = Field(default_factory=list)
     status: str = "ACTIVE"
 
 class CandidateScore(BaseModel):
@@ -105,6 +115,11 @@ class FragmentMetadata(BaseModel):
     created_at: datetime
     temporal_index: Optional[datetime] = None
     payload_reference: str # Merujuk ke payload_id
+    # [NEW] Field diperkuat sesuai Spesifikasi Penguatan
+    content_hash: Optional[str] = None
+    sequence_index: int = 0
+    source_fragment_ids: list[str] = Field(default_factory=list)
+    relationship_strength: float = 0.0
 
 class CompressedPayload(BaseModel):
     """Memori besar yang dikompresi lossless."""
@@ -131,8 +146,11 @@ class PendingState(BaseModel):
     assistant_question: str
     clarification_round: int = 1
     created_at: datetime
+    # [NEW] Field diperkuat sesuai Spesifikasi Penguatan
+    last_updated_at: Optional[datetime] = None
     status: PendingStatus = PendingStatus.ACTIVE
     temporal_reference: Optional[str] = None
+    origin_session_id: Optional[str] = None
 
 # ==========================================
 # LAYER 13: GRAPH RELATIONSHIPS
@@ -141,10 +159,14 @@ class PendingState(BaseModel):
 class MemoryGraphEdge(BaseModel):
     """Hubungan antar node dalam graf memori."""
     edge_id: str
-    source_id: str # Bisa TopicKey ID atau Fragment ID
-    target_id: str
+    # [NEW] Renamed dari source_id/target_id agar eksplisit node-based sesuai Spesifikasi
+    source_node_id: str # Bisa TopicKey ID atau Fragment ID
+    target_node_id: str
     relationship_type: RelationshipType
     weight: float = 1.0
+    # [NEW] Field diperkuat sesuai Spesifikasi Penguatan
+    strength: float = 1.0
+    evidence: str = ""
     created_at: datetime
 
 # ==========================================

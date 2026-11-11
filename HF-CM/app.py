@@ -20,6 +20,9 @@ from storage import MemoryStorage
 from retrieval import RetrievalEngine
 from compression import PayloadCompressor
 from memory_engine import MemoryEngine
+# [NEW] Import untuk Composition Root (Spec 11)
+from context_builder import ContextBuilder
+from llm_client import FakeLLMClient
 
 # Setup logging untuk melihat apa yang terjadi di belakang layar (bisa disesuaikan ke WARNING jika terlalu berisik)
 logging.basicConfig(
@@ -40,8 +43,18 @@ class HF_CMApp:
         self.retrieval = RetrievalEngine()
         self.compressor = PayloadCompressor()
         
+        # [NEW] Inisialisasi Context Builder & LLM Client (Spec 11: Composition Root)
+        self.context_builder = ContextBuilder()
+        self.llm_client = FakeLLMClient() # Menggunakan Fake untuk PoC CLI
+        
         # 2. Rakit Orchestrator Utama
-        self.engine = MemoryEngine(self.storage, self.retrieval, self.compressor)
+        self.engine = MemoryEngine(
+            storage=self.storage, 
+            retrieval=self.retrieval, 
+            compressor=self.compressor,
+            context_builder=self.context_builder,
+            llm_client=self.llm_client
+        )
         
         # 3. State Aplikasi (Session Management)
         self.current_session_id = str(uuid.uuid4())[:8] # ID pendek agar mudah dibaca

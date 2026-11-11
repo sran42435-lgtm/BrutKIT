@@ -43,9 +43,15 @@ class TopicKeyDB(Base):
     id = Column(String, primary_key=True)
     title = Column(String, nullable=False)
     helper_description = Column(String, nullable=False)
+    # [NEW] Field diperkuat sesuai Spesifikasi Penguatan
+    representative_tokens = Column(JSON, default=list)
+    unique_tokens = Column(JSON, default=list)
     token_profile = Column(JSON, default=dict)
     co_occurrence_profile = Column(JSON, default=dict)
     created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=True)
+    activation_count = Column(Integer, default=0)
+    related_fragment_ids = Column(JSON, default=list)
     status = Column(String, default="ACTIVE")
     
     # Relationship (Lazy loading untuk menghemat memori)
@@ -60,6 +66,8 @@ class PayloadDB(Base):
     compression_algorithm = Column(String, nullable=False)
     original_size = Column(Integer, nullable=False)
     compressed_size = Column(Integer, nullable=False)
+    # [NEW] Versi kompresi untuk tracking
+    compression_version = Column(String, default="1.0")
 
 class FragmentDB(Base):
     __tablename__ = "fragments"
@@ -69,6 +77,11 @@ class FragmentDB(Base):
     payload_id = Column(String, ForeignKey("payloads.id"), nullable=False)
     created_at = Column(DateTime, nullable=False)
     temporal_index = Column(DateTime, nullable=True)
+    # [NEW] Field diperkuat sesuai Spesifikasi Penguatan
+    content_hash = Column(String, nullable=True)
+    sequence_index = Column(Integer, default=0)
+    source_fragment_ids = Column(JSON, default=list)
+    relationship_strength = Column(Float, default=0.0)
     
     # Indexing untuk Temporal Filtering & Fast Retrieval (Spek Tinggi)
     __table_args__ = (
@@ -83,10 +96,14 @@ class FragmentDB(Base):
 class GraphEdgeDB(Base):
     __tablename__ = "graph_edges"
     id = Column(String, primary_key=True)
-    source_id = Column(String, nullable=False)
-    target_id = Column(String, nullable=False)
+    # [NEW] Renamed dari source_id/target_id agar eksplisit node-based
+    source_node_id = Column(String, nullable=False)
+    target_node_id = Column(String, nullable=False)
     relationship_type = Column(String, nullable=False)
     weight = Column(Float, default=1.0)
+    # [NEW] Field diperkuat
+    strength = Column(Float, default=1.0)
+    evidence = Column(String, default="")
     created_at = Column(DateTime, nullable=False)
 
 class PendingStateDB(Base):
@@ -99,8 +116,11 @@ class PendingStateDB(Base):
     assistant_question = Column(String, nullable=False)
     clarification_round = Column(Integer, default=1)
     created_at = Column(DateTime, nullable=False)
+    # [NEW] Field diperkuat sesuai Spesifikasi Penguatan
+    last_updated_at = Column(DateTime, nullable=True)
     status = Column(String, default="ACTIVE")
     temporal_reference = Column(String, nullable=True)
+    origin_session_id = Column(String, nullable=True)
     
     __table_args__ = (
         Index('idx_pending_status', 'status'),
@@ -168,43 +188,75 @@ class MemoryStorage:
     
     def save_topic_key(self, session: Session, key: models.TopicKey):
         db_obj = TopicKeyDB(
-            id=key.key_id, title=key.title, helper_description=key.helper_description,
-            token_profile=key.token_profile, co_occurrence_profile=key.co_occurrence_profile,
-            created_at=key.created_at, status=key.status
+            id=key.key_id, 
+            title=key.title, 
+            helper_description=key.helper_description,
+            representative_tokens=key.representative_tokens,
+            unique_tokens=key.unique_tokens,
+            token_profile=key.token_profile, 
+            co_occurrence_profile=key.co_occurrence_profile,
+            created_at=key.created_at, 
+            updated_at=key.updated_at,
+            activation_count=key.activation_count,
+            related_fragment_ids=key.related_fragment_ids,
+            status=key.status
         )
         session.merge(db_obj) # Merge mencegah error jika Key sudah ada (Update profile)
 
     def save_payload(self, session: Session, payload: models.CompressedPayload):
         db_obj = PayloadDB(
-            id=payload.payload_id, compressed_blob=payload.compressed_blob,
-            checksum=payload.checksum, compression_algorithm=payload.compression_algorithm,
-            original_size=payload.original_size, compressed_size=payload.compressed_size
+            id=payload.payload_id, 
+            compressed_blob=payload.compressed_blob,
+            checksum=payload.checksum, 
+            compression_algorithm=payload.compression_algorithm,
+            original_size=payload.original_size, 
+            compressed_size=payload.compressed_size,
+            compression_version="1.0"  # Default version
         )
         session.add(db_obj)
 
     def save_fragment(self, session: Session, fragment: models.FragmentMetadata):
         db_obj = FragmentDB(
-            id=fragment.fragment_id, topic_key_id=fragment.topic_key_id,
-            session_id=fragment.session_id, payload_id=fragment.payload_reference,
-            created_at=fragment.created_at, temporal_index=fragment.temporal_index
+            id=fragment.fragment_id, 
+            topic_key_id=fragment.topic_key_id,
+            session_id=fragment.session_id, 
+            payload_id=fragment.payload_reference,
+            created_at=fragment.created_at, 
+            temporal_index=fragment.temporal_index,
+            content_hash=fragment.content_hash,
+            sequence_index=fragment.sequence_index,
+            source_fragment_ids=fragment.source_fragment_ids,
+            relationship_strength=fragment.relationship_strength
         )
         session.add(db_obj)
 
     def save_graph_edge(self, session: Session, edge: models.MemoryGraphEdge):
         db_obj = GraphEdgeDB(
-            id=edge.edge_id, source_id=edge.source_id, target_id=edge.target_id,
-            relationship_type=edge.relationship_type.value, weight=edge.weight,
+            id=edge.edge_id, 
+            source_node_id=edge.source_node_id,  # [NEW] Renamed field
+            target_node_id=edge.target_node_id,  # [NEW] Renamed field
+            relationship_type=edge.relationship_type.value, 
+            weight=edge.weight,
+            strength=edge.strength,
+            evidence=edge.evidence,
             created_at=edge.created_at
         )
         session.add(db_obj)
 
     def save_pending_state(self, session: Session, pending: models.PendingState):
         db_obj = PendingStateDB(
-            id=pending.pending_id, session_id=pending.session_id,
-            original_input=pending.original_input, candidate_keys=pending.candidate_keys,
-            candidate_scores=pending.candidate_scores, assistant_question=pending.assistant_question,
-            clarification_round=pending.clarification_round, created_at=pending.created_at,
-            status=pending.status.value, temporal_reference=pending.temporal_reference
+            id=pending.pending_id, 
+            session_id=pending.session_id,
+            original_input=pending.original_input, 
+            candidate_keys=pending.candidate_keys,
+            candidate_scores=pending.candidate_scores, 
+            assistant_question=pending.assistant_question,
+            clarification_round=pending.clarification_round, 
+            created_at=pending.created_at,
+            last_updated_at=pending.last_updated_at,
+            status=pending.status.value, 
+            temporal_reference=pending.temporal_reference,
+            origin_session_id=pending.origin_session_id
         )
         session.merge(db_obj)
 
@@ -218,11 +270,41 @@ class MemoryStorage:
             db_keys = session.query(TopicKeyDB).filter_by(status="ACTIVE").all()
             return [
                 models.TopicKey(
-                    key_id=k.id, title=k.title, helper_description=k.helper_description,
-                    token_profile=k.token_profile or {}, co_occurrence_profile=k.co_occurrence_profile or {},
-                    created_at=k.created_at, status=k.status
+                    key_id=k.id, 
+                    title=k.title, 
+                    helper_description=k.helper_description,
+                    representative_tokens=k.representative_tokens or [],
+                    unique_tokens=k.unique_tokens or [],
+                    token_profile=k.token_profile or {}, 
+                    co_occurrence_profile=k.co_occurrence_profile or {},
+                    created_at=k.created_at, 
+                    updated_at=k.updated_at,
+                    activation_count=k.activation_count or 0,
+                    related_fragment_ids=k.related_fragment_ids or [],
+                    status=k.status
                 ) for k in db_keys
             ]
+
+    def get_topic_key(self, key_id: str) -> Optional[models.TopicKey]:
+        """[NEW] Mengambil satu Topic Key berdasarkan ID."""
+        with self.SessionLocal() as session:
+            k = session.query(TopicKeyDB).filter_by(id=key_id, status="ACTIVE").first()
+            if not k:
+                return None
+            return models.TopicKey(
+                key_id=k.id, 
+                title=k.title, 
+                helper_description=k.helper_description,
+                representative_tokens=k.representative_tokens or [],
+                unique_tokens=k.unique_tokens or [],
+                token_profile=k.token_profile or {}, 
+                co_occurrence_profile=k.co_occurrence_profile or {},
+                created_at=k.created_at, 
+                updated_at=k.updated_at,
+                activation_count=k.activation_count or 0,
+                related_fragment_ids=k.related_fragment_ids or [],
+                status=k.status
+            )
 
     def get_active_pending_state(self, session_id: str) -> Optional[models.PendingState]:
         """Mencari Pending State yang masih ACTIVE untuk sesi tertentu."""
@@ -236,11 +318,39 @@ class MemoryStorage:
                 return None
                 
             return models.PendingState(
-                pending_id=db_pending.id, session_id=db_pending.session_id,
-                original_input=db_pending.original_input, candidate_keys=db_pending.candidate_keys,
-                candidate_scores=db_pending.candidate_scores, assistant_question=db_pending.assistant_question,
-                clarification_round=db_pending.clarification_round, created_at=db_pending.created_at,
-                status=models.PendingStatus(db_pending.status), temporal_reference=db_pending.temporal_reference
+                pending_id=db_pending.id, 
+                session_id=db_pending.session_id,
+                original_input=db_pending.original_input, 
+                candidate_keys=db_pending.candidate_keys,
+                candidate_scores=db_pending.candidate_scores, 
+                assistant_question=db_pending.assistant_question,
+                clarification_round=db_pending.clarification_round, 
+                created_at=db_pending.created_at,
+                last_updated_at=db_pending.last_updated_at,
+                status=models.PendingStatus(db_pending.status), 
+                temporal_reference=db_pending.temporal_reference,
+                origin_session_id=db_pending.origin_session_id
+            )
+
+    def get_pending_by_reference(self, pending_id: str) -> Optional[models.PendingState]:
+        """[NEW] Mengambil Pending State berdasarkan ID-nya."""
+        with self.SessionLocal() as session:
+            db_pending = session.query(PendingStateDB).filter_by(id=pending_id).first()
+            if not db_pending:
+                return None
+            return models.PendingState(
+                pending_id=db_pending.id, 
+                session_id=db_pending.session_id,
+                original_input=db_pending.original_input, 
+                candidate_keys=db_pending.candidate_keys,
+                candidate_scores=db_pending.candidate_scores, 
+                assistant_question=db_pending.assistant_question,
+                clarification_round=db_pending.clarification_round, 
+                created_at=db_pending.created_at,
+                last_updated_at=db_pending.last_updated_at,
+                status=models.PendingStatus(db_pending.status), 
+                temporal_reference=db_pending.temporal_reference,
+                origin_session_id=db_pending.origin_session_id
             )
 
     def get_fragment_metadata_by_key(self, topic_key_id: str) -> List[models.FragmentMetadata]:
@@ -249,8 +359,56 @@ class MemoryStorage:
             db_frags = session.query(FragmentDB).filter_by(topic_key_id=topic_key_id).all()
             return [
                 models.FragmentMetadata(
-                    fragment_id=f.id, topic_key_id=f.topic_key_id, session_id=f.session_id,
-                    created_at=f.created_at, temporal_index=f.temporal_index, payload_reference=f.payload_id
+                    fragment_id=f.id, 
+                    topic_key_id=f.topic_key_id, 
+                    session_id=f.session_id,
+                    created_at=f.created_at, 
+                    temporal_index=f.temporal_index, 
+                    payload_reference=f.payload_id,
+                    content_hash=f.content_hash,
+                    sequence_index=f.sequence_index or 0,
+                    source_fragment_ids=f.source_fragment_ids or [],
+                    relationship_strength=f.relationship_strength or 0.0
+                ) for f in db_frags
+            ]
+
+    def get_fragment(self, fragment_id: str) -> Optional[models.FragmentMetadata]:
+        """[NEW] Mengambil satu Fragment berdasarkan ID."""
+        with self.SessionLocal() as session:
+            f = session.query(FragmentDB).filter_by(id=fragment_id).first()
+            if not f:
+                return None
+            return models.FragmentMetadata(
+                fragment_id=f.id, 
+                topic_key_id=f.topic_key_id, 
+                session_id=f.session_id,
+                created_at=f.created_at, 
+                temporal_index=f.temporal_index, 
+                payload_reference=f.payload_id,
+                content_hash=f.content_hash,
+                sequence_index=f.sequence_index or 0,
+                source_fragment_ids=f.source_fragment_ids or [],
+                relationship_strength=f.relationship_strength or 0.0
+            )
+
+    def get_recent_fragments(self, session_id: str, limit: int = 10) -> List[models.FragmentMetadata]:
+        """[NEW] Mengambil fragment terbaru dari suatu sesi."""
+        with self.SessionLocal() as session:
+            db_frags = session.query(FragmentDB).filter_by(
+                session_id=session_id
+            ).order_by(FragmentDB.created_at.desc()).limit(limit).all()
+            return [
+                models.FragmentMetadata(
+                    fragment_id=f.id, 
+                    topic_key_id=f.topic_key_id, 
+                    session_id=f.session_id,
+                    created_at=f.created_at, 
+                    temporal_index=f.temporal_index, 
+                    payload_reference=f.payload_id,
+                    content_hash=f.content_hash,
+                    sequence_index=f.sequence_index or 0,
+                    source_fragment_ids=f.source_fragment_ids or [],
+                    relationship_strength=f.relationship_strength or 0.0
                 ) for f in db_frags
             ]
 
@@ -261,7 +419,92 @@ class MemoryStorage:
             if not db_payload:
                 return None
             return models.CompressedPayload(
-                payload_id=db_payload.id, compressed_blob=db_payload.compressed_blob,
-                checksum=db_payload.checksum, compression_algorithm=db_payload.compression_algorithm,
-                original_size=db_payload.original_size, compressed_size=db_payload.compressed_size
+                payload_id=db_payload.id, 
+                compressed_blob=db_payload.compressed_blob,
+                checksum=db_payload.checksum, 
+                compression_algorithm=db_payload.compression_algorithm,
+                original_size=db_payload.original_size, 
+                compressed_size=db_payload.compressed_size
             )
+
+    # ==========================================
+    # GRAPH OPERATIONS (NEW)
+    # ==========================================
+
+    def get_related_fragments(self, fragment_id: str) -> List[models.FragmentMetadata]:
+        """[NEW] Mengambil fragment yang terhubung via graph edges."""
+        with self.SessionLocal() as session:
+            # Cari edges di mana fragment ini adalah source atau target
+            edges = session.query(GraphEdgeDB).filter(
+                (GraphEdgeDB.source_node_id == fragment_id) | 
+                (GraphEdgeDB.target_node_id == fragment_id)
+            ).all()
+            
+            related_ids = set()
+            for e in edges:
+                if e.source_node_id != fragment_id:
+                    related_ids.add(e.source_node_id)
+                if e.target_node_id != fragment_id:
+                    related_ids.add(e.target_node_id)
+            
+            if not related_ids:
+                return []
+            
+            db_frags = session.query(FragmentDB).filter(
+                FragmentDB.id.in_(related_ids)
+            ).all()
+            
+            return [
+                models.FragmentMetadata(
+                    fragment_id=f.id, 
+                    topic_key_id=f.topic_key_id, 
+                    session_id=f.session_id,
+                    created_at=f.created_at, 
+                    temporal_index=f.temporal_index, 
+                    payload_reference=f.payload_id,
+                    content_hash=f.content_hash,
+                    sequence_index=f.sequence_index or 0,
+                    source_fragment_ids=f.source_fragment_ids or [],
+                    relationship_strength=f.relationship_strength or 0.0
+                ) for f in db_frags
+            ]
+
+    def get_related_topics(self, topic_key_id: str) -> List[models.TopicKey]:
+        """[NEW] Mengambil Topic Key yang terhubung via graph edges."""
+        with self.SessionLocal() as session:
+            edges = session.query(GraphEdgeDB).filter(
+                (GraphEdgeDB.source_node_id == topic_key_id) | 
+                (GraphEdgeDB.target_node_id == topic_key_id)
+            ).all()
+            
+            related_ids = set()
+            for e in edges:
+                if e.source_node_id != topic_key_id:
+                    related_ids.add(e.source_node_id)
+                if e.target_node_id != topic_key_id:
+                    related_ids.add(e.target_node_id)
+            
+            if not related_ids:
+                return []
+            
+            db_keys = session.query(TopicKeyDB).filter(
+                TopicKeyDB.id.in_(related_ids),
+                TopicKeyDB.status == "ACTIVE"
+            ).all()
+            
+            return [
+                models.TopicKey(
+                    key_id=k.id, 
+                    title=k.title, 
+                    helper_description=k.helper_description,
+                    representative_tokens=k.representative_tokens or [],
+                    unique_tokens=k.unique_tokens or [],
+                    token_profile=k.token_profile or {}, 
+                    co_occurrence_profile=k.co_occurrence_profile or {},
+                    created_at=k.created_at, 
+                    updated_at=k.updated_at,
+                    activation_count=k.activation_count or 0,
+                    related_fragment_ids=k.related_fragment_ids or [],
+                    status=k.status
+                ) for k in db_keys
+            ]

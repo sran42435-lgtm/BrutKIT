@@ -16,6 +16,9 @@ from storage import MemoryStorage
 from retrieval import RetrievalEngine
 from compression import PayloadCompressor, IntegrityError
 from memory_engine import MemoryEngine
+# [NEW] Import untuk End-to-End Pipeline Testing (Spec 26)
+from context_builder import ContextBuilder
+from llm_client import FakeLLMClient
 
 # ==========================================
 # FIXTURES (Setup & Teardown)
@@ -35,7 +38,10 @@ def engine(test_db_path):
     storage = MemoryStorage(db_url=test_db_path)
     retrieval = RetrievalEngine()
     compressor = PayloadCompressor()
-    return MemoryEngine(storage, retrieval, compressor)
+    # [NEW] Injeksi Context Builder & Fake LLM Client untuk uji End-to-End Pipeline
+    context_builder = ContextBuilder()
+    llm_client = FakeLLMClient()
+    return MemoryEngine(storage, retrieval, compressor, context_builder, llm_client)
 
 @pytest.fixture(scope="function")
 def tz():
