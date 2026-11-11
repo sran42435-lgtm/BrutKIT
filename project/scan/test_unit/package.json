@@ -1,0 +1,26 @@
+{
+  "name": "test_unit",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "acorn": "^8.18.0",
+    "chrome-launcher": "^1.2.1",
+    "https-proxy-agent": "^9.1.0",
+    "puppeteer": "^25.11.0",
+    "typescript": "^7.0.2",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/puppeteer": "^5.4.7",
+    "@types/ws": "^8.18.1"
+  }
+}

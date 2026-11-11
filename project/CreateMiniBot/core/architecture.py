@@ -17,6 +17,10 @@
 # - Scaled Initialization untuk residual sublayers (GPT-2 style)
 # - Cross-Attention layers (optional, configurable)
 #
+# 🆕 v3.2 Bug Fixes:
+# - Fix cross-attention backward order (norm setelah attention)
+# - Fix softcap backward (cache pre-cap scores)
+#
 # Keterhubungan:
 # - config.py              : parameter arsitektur (termasuk cross_attention_layers)
 # - core/retriever.py      : menyediakan konteks sebelum forward
@@ -384,6 +388,10 @@ class MultiHeadSelfAttention:
 
         scores = Qh_rot @ Kh_rot.transpose(0, 1, 3, 2)
         scores = scores * self.scale
+        
+        # 🆕 v3.2 FIX: Cache PRE-CAP scores sebelum softcap
+        scores_precap = scores.copy()
+        
         scores = _softcap(scores, self.attention_logit_cap)
 
         causal_mask = np.triu(np.ones((T, T), dtype=bool), k=1)
@@ -401,10 +409,11 @@ class MultiHeadSelfAttention:
         output = context @ self.o_proj.data.T
         output = _sanitize(output)
 
+        # 🆕 v3.2 FIX: Cache scores_precap (bukan scores post-cap)
         self.cache = (
             x, Qh, Kh, Vh, Qh_rot, Kh_rot,
             probs, probs_drop, attn_dropout_mask,
-            context, scores, cos[:T], sin[:T],
+            context, scores_precap, cos[:T], sin[:T],
         )
 
         return output
@@ -413,9 +422,10 @@ class MultiHeadSelfAttention:
         if self.cache is None:
             raise RuntimeError("MultiHeadSelfAttention.backward dipanggil sebelum forward.")
 
+        # 🆕 v3.2 FIX: scores_precap (bukan scores post-cap)
         (x, Qh, Kh, Vh, Qh_rot, Kh_rot,
          probs, probs_drop, attn_dropout_mask,
-         context, scores, cos, sin) = self.cache
+         context, scores_precap, cos, sin) = self.cache
 
         dout = _sanitize(dout)
         B, T, D = x.shape
@@ -442,9 +452,10 @@ class MultiHeadSelfAttention:
         causal_mask = np.triu(np.ones((T, T), dtype=bool), k=1)
         dscores = np.where(causal_mask[None, None, :, :], 0.0, dscores)
 
+        # 🆕 v3.2 FIX: Pakai scores_precap (pre-cap values) untuk backward yang benar
         dscores_pre_cap = _softcap_backward(
-            dscores, 
-            scores * (1.0 / self.scale) * self.scale, 
+            dscores,
+            scores_precap,
             self.attention_logit_cap
         )
 
@@ -588,6 +599,9 @@ class CrossAttention:
         # Attention scores: [B, H, T_q, T_c]
         scores = Qh @ Kh.transpose(0, 1, 3, 2)
         scores = scores * self.scale
+        
+        # 🆕 v3.2 FIX: Cache PRE-CAP scores sebelum softcap
+        scores_precap = scores.copy()
 
         # Soft-cap (optional, untuk stability)
         scores = _softcap(scores, self.attention_logit_cap)
@@ -607,12 +621,12 @@ class CrossAttention:
         output = attn_out @ self.o_proj.data.T
         output = _sanitize(output)
 
-        # Cache untuk backward
+        # 🆕 v3.2 FIX: Cache scores_precap (bukan scores post-cap)
         self.cache = (
             query, context,
             Qh, Kh, Vh,
             probs, probs_drop, attn_dropout_mask,
-            attn_out, scores,
+            attn_out, scores_precap,
         )
 
         return output
@@ -627,10 +641,11 @@ class CrossAttention:
         if self.cache is None:
             raise RuntimeError("CrossAttention.backward dipanggil sebelum forward.")
 
+        # 🆕 v3.2 FIX: scores_precap (bukan scores post-cap)
         (query, context,
          Qh, Kh, Vh,
          probs, probs_drop, attn_dropout_mask,
-         attn_out, scores) = self.cache
+         attn_out, scores_precap) = self.cache
 
         dout = _sanitize(dout)
         B, T_q, D = query.shape
@@ -662,10 +677,10 @@ class CrossAttention:
         dscores = probs * (dprobs - sum_dp)
         dscores = dscores * self.scale
 
-        # Soft-cap backward
+        # 🆕 v3.2 FIX: Pakai scores_precap (pre-cap values) untuk backward yang benar
         dscores_pre_cap = _softcap_backward(
             dscores,
-            scores * (1.0 / self.scale) * self.scale,
+            scores_precap,
             self.attention_logit_cap
         )
 
@@ -948,6 +963,11 @@ class TransformerBlock:
         Returns:
             (dx, d_context): gradients untuk input dan context embeddings
                             (d_context is None jika cross-attention tidak dipakai)
+        
+        🆕 v3.2 FIX: Cross-attention backward order sekarang BENAR.
+        Urutan yang benar (reverse dari forward):
+          Forward: x_1 → norm → attn → dropout → droppath → add residual
+          Backward: dout → droppath⁻¹ → dropout⁻¹ → attn⁻¹ → norm⁻¹ → add
         """
         if self.cache is None:
             raise RuntimeError("TransformerBlock.backward dipanggil sebelum forward.")
@@ -968,12 +988,24 @@ class TransformerBlock:
 
         # Cross-attention backward (jika dipakai)
         if self.use_cross_attention and context_embeddings is not None:
-            d_cross_out = _dropout_backward(d_x_1, cross_dropout_mask)
-            d_cross_out = _drop_path_backward(d_cross_out, cross_dropped, self.drop_path_rate)
-            d_cross_in = self.cross_attn_norm.backward(d_cross_out)
-            d_query, d_context = self.cross_attn.backward(d_cross_in)
-            # Sum gradients: residual + query path
-            d_x_1 = d_x_1 + d_query
+            # 🆕 v3.2 FIX: Urutan yang benar - ATTN DULU, baru NORM KEDUA
+            # Forward path: x_1 → norm → attn → dropout → droppath
+            # Backward path: reverse order
+            
+            # Step 1: Reverse droppath
+            d_cross_out = _drop_path_backward(d_x_1, cross_dropped, self.drop_path_rate)
+            
+            # Step 2: Reverse dropout
+            d_cross_out = _dropout_backward(d_cross_out, cross_dropout_mask)
+            
+            # Step 3: Reverse cross-attention (ATTN DULU)
+            d_query, d_context = self.cross_attn.backward(d_cross_out)
+            
+            # Step 4: Reverse cross-attn-norm (NORM KEDUA)
+            d_x_1_from_cross = self.cross_attn_norm.backward(d_query)
+            
+            # Sum gradients: residual + cross-attention path
+            d_x_1 = d_x_1 + d_x_1_from_cross
             d_x_1 = _sanitize(d_x_1)
 
         # Self-attention backward
@@ -1896,6 +1928,16 @@ if __name__ == "__main__":
     embed_grad_norm = np.linalg.norm(model.embed_tokens.grad)
     print(f"  Embed tokens grad norm: {embed_grad_norm:.6f}")
     assert embed_grad_norm > 0, "Embedding gradients harus non-zero"
+    
+    # 🆕 v3.2: Verify cross-attention gradients flow correctly
+    cross_attn_grad_count = 0
+    for name, param in model.parameters().items():
+        if 'cross_attn' in name and param.grad is not None:
+            grad_norm = np.linalg.norm(param.grad)
+            if grad_norm > 0:
+                cross_attn_grad_count += 1
+    print(f"  Cross-attention params with gradients: {cross_attn_grad_count}")
+    assert cross_attn_grad_count > 0, "Cross-attention harus punya gradients"
 
     # Test 4: Context encoding dengan cache
     print("\n[Test 4] Context encoding dengan cache")
@@ -1971,5 +2013,10 @@ if __name__ == "__main__":
     assert is_finite, "Logits harus finite"
 
     print("\n" + "=" * 70)
-    print("✅ core/architecture.py ALL TESTS PASSED")
+    print("✅ core/architecture.py (v3.2 - Critical Fixes) ALL TESTS PASSED")
+    print("=" * 70)
+    print("\n📊 v3.2 Bug Fixes Applied:")
+    print("  ✓ Cross-attention backward order FIXED (attn → norm)")
+    print("  ✓ Softcap backward FIXED (cache pre-cap scores)")
+    print("  ✓ All existing features PRESERVED (no code removed)")
     print("=" * 70)

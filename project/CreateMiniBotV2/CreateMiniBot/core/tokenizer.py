@@ -1,0 +1,1103 @@
+# core/tokenizer.py
+#
+# Tokenizer custom berbasis Byte-Pair Encoding (BPE) sederhana.
+#
+# Arsitektur: RAG-ready (Retrieval-Augmented Generation)
+# - Format training: "Konteks: {context} Pertanyaan: {question} Jawaban: {answer}"
+# - Format inference: "Konteks: {context} Pertanyaan: {question} Jawaban:"
+# - Special tokens: [PAD], [UNK], [BOS], [EOS], 
+#
+# Fitur:
+# - Token  dideteksi dan dipisahkan sebagai special token
+# - Tidak dipecah oleh BPE, selalu diperlakukan sebagai satu kesatuan
+# - GUARD: handle endoftext_token kosong (empty separator)
+# - Helper methods untuk QA encoding (RAG-specific)
+#
+# Catatan:
+# - Tokenizer TIDAK otomatis menambah BOS/EOS/endoftext saat encode
+# - Trainer bertanggung jawab menambah special token saat training
+# - Gunakan encode(text, add_bos=True, add_eos=True) untuk manual
+# - Gunakan encode_qa_sample() untuk format QA RAG
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from config import CONFIG, Config
+
+
+class Tokenizer:
+    """
+    Tokenizer custom dengan algoritma BPE sederhana.
+    
+    Fitur Document Boundary:
+    - Token  dipisahkan dari teks utama
+    - Setiap kemunculan  menjadi satu token utuh
+    - Bagian teks lainnya diproses seperti biasa
+    
+    RAG Helper Methods:
+    - encode_qa_sample(): encode QA pair dengan konteks (untuk training)
+    - format_rag_prompt(): format prompt RAG (untuk inference)
+    - encode_rag_prompt(): encode prompt RAG ke token IDs
+    
+    Catatan penting:
+    - Tokenizer TIDAK otomatis menambah BOS/EOS/endoftext
+    - Trainer bertanggung jawab menambah special token saat training
+    - Gunakan encode(text, add_bos=True, add_eos=True) untuk manual
+    """
+
+    SPACE_MARKER = "▁"
+    
+    # RAG Format Templates
+    QA_TRAIN_TEMPLATE = "Konteks: {context} Pertanyaan: {question} Jawaban: {answer}"
+    QA_INFERENCE_TEMPLATE = "Konteks: {context} Pertanyaan: {question} Jawaban:"
+    QA_NO_CONTEXT_TEMPLATE = "Pertanyaan: {question} Jawaban:"  # Untuk context dropout
+
+    def __init__(self, config: Config = CONFIG):
+        self.config = config
+
+        self.datasets_dir: Path = config.paths.datasets_dir
+        self.vocab_path: Path = config.paths.vocab_path
+        self.target_vocab_size: int = int(config.model.vocab_size)
+
+        self.pad_token: str = config.special_tokens.pad
+        self.unk_token: str = config.special_tokens.unk
+        self.bos_token: str = config.special_tokens.bos
+        self.eos_token: str = config.special_tokens.eos
+        
+        # GUARD: Pastikan endoftext_token tidak kosong
+        # Jika kosong (karena markdown rendering), gunakan fallback
+        raw_endoftext = config.special_tokens.endoftext
+        if not raw_endoftext:
+            # Fallback: reconstruct dari string literal
+            raw_endoftext = '<' + '|' + 'endoftext' + '|' + '>'
+        self.endoftext_token: str = raw_endoftext
+
+        self.pad_id: int = config.special_tokens.pad_id
+        self.unk_id: int = config.special_tokens.unk_id
+        self.bos_id: int = config.special_tokens.bos_id
+        self.eos_id: int = config.special_tokens.eos_id
+        self.endoftext_id: int = config.special_tokens.endoftext_id
+
+        self.special_ordered: Tuple[str, ...] = config.special_tokens.ordered_tokens
+        self._special_set = frozenset(self.special_ordered)
+
+        self.token_to_id: Dict[str, int] = {}
+        self.id_to_token: Dict[int, str] = {}
+        self.merges: List[Tuple[str, str]] = []
+        self.merge_ranks: Dict[Tuple[str, str], int] = {}
+
+        self._ready: bool = False
+
+    # ======================================================================
+    # PUBLIC PROPERTIES
+    # ======================================================================
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.token_to_id)
+
+    @property
+    def is_ready(self) -> bool:
+        return self._ready
+
+    # ======================================================================
+    # PUBLIC METHODS
+    # ======================================================================
+
+    def train(self) -> "Tokenizer":
+        self._validate_target_vocab()
+
+        word_freq, char_freq = self._build_corpus_statistics()
+        token_to_id = self._build_initial_vocab(char_freq)
+        word_freq = self._project_word_freq_to_vocab(word_freq, token_to_id)
+
+        merges: List[Tuple[str, str]] = []
+        self._learn_bpe(
+            word_freq=word_freq,
+            token_to_id=token_to_id,
+            merges=merges,
+        )
+
+        token_to_id = self._pad_vocab(token_to_id)
+
+        self.token_to_id = token_to_id
+        self.id_to_token = {v: k for k, v in token_to_id.items()}
+        self.merges = merges
+        self.merge_ranks = {pair: idx for idx, pair in enumerate(merges)}
+        self._ready = True
+
+        self.save()
+        return self
+
+    def load(self) -> "Tokenizer":
+        if not self.vocab_path.exists():
+            raise FileNotFoundError(
+                f"File vocab tidak ditemukan di: {self.vocab_path}. "
+                "Jalankan tokenizer.train() terlebih dahulu."
+            )
+
+        with open(self.vocab_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        if isinstance(payload, dict) and "token_to_id" in payload:
+            token_to_id_raw = payload["token_to_id"]
+            merges_raw = payload.get("merges", [])
+        else:
+            token_to_id_raw = payload
+            merges_raw = []
+
+        token_to_id: Dict[str, int] = {
+            str(token): int(idx) for token, idx in token_to_id_raw.items()
+        }
+
+        if len(token_to_id) < self.target_vocab_size:
+            token_to_id = self._pad_vocab(token_to_id)
+
+        self.token_to_id = token_to_id
+        self.id_to_token = {v: k for k, v in token_to_id.items()}
+
+        merges: List[Tuple[str, str]] = []
+        for pair in merges_raw:
+            if (
+                isinstance(pair, (list, tuple))
+                and len(pair) == 2
+                and isinstance(pair[0], str)
+                and isinstance(pair[1], str)
+            ):
+                merges.append((pair[0], pair[1]))
+
+        self.merges = merges
+        self.merge_ranks = {pair: idx for idx, pair in enumerate(merges)}
+        self._ready = True
+
+        self._validate_loaded_vocab()
+        return self
+
+    def save(self) -> None:
+        self.vocab_path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "version": "1.0",
+            "model": "custom-bpe",
+            "architecture": "rag-single-head",  # NEW: untuk identifikasi
+            "target_vocab_size": self.target_vocab_size,
+            "space_marker": self.SPACE_MARKER,
+            "special_tokens": {
+                "pad": self.pad_token,
+                "unk": self.unk_token,
+                "bos": self.bos_token,
+                "eos": self.eos_token,
+                "endoftext": self.endoftext_token,
+            },
+            "rag_templates": {
+                "qa_train": self.QA_TRAIN_TEMPLATE,
+                "qa_inference": self.QA_INFERENCE_TEMPLATE,
+                "qa_no_context": self.QA_NO_CONTEXT_TEMPLATE,
+            },
+            "token_to_id": self.token_to_id,
+            "merges": [[a, b] for a, b in self.merges],
+        }
+
+        with open(self.vocab_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+
+    def get_vocab(self) -> Dict[str, int]:
+        self._ensure_ready()
+        return dict(self.token_to_id)
+
+    # ======================================================================
+    # CORE ENCODE METHODS
+    # ======================================================================
+
+    def encode(
+        self,
+        text: str,
+        add_bos: bool = False,
+        add_eos: bool = False,
+        add_endoftext: bool = False,
+    ) -> List[int]:
+        """
+        Mengubah teks menjadi daftar token ID.
+        
+        Parameter:
+        - text: teks yang akan di-encode
+        - add_bos: tambahkan [BOS] (ID 2) di awal
+        - add_eos: tambahkan [EOS] (ID 3) di akhir
+        - add_endoftext: tambahkan  (ID 4) di akhir
+        
+        Catatan:
+        - Token  yang ada di dalam teks akan otomatis dideteksi
+        - add_endoftext hanya menambah 1 token di akhir (jika True)
+        """
+        self._ensure_ready()
+
+        tokens = self.encode_to_tokens(text)
+        ids: List[int] = [
+            self.token_to_id.get(token, self.unk_id) for token in tokens
+        ]
+
+        if add_bos:
+            ids = [self.bos_id] + ids
+
+        if add_eos:
+            ids = ids + [self.eos_id]
+
+        if add_endoftext:
+            ids = ids + [self.endoftext_id]
+
+        return ids
+
+    def encode_to_tokens(self, text: str) -> List[str]:
+        """
+        Mengubah teks menjadi daftar token string sebelum dikonversi ke ID.
+
+        PERBAIKAN UTAMA:
+        - Token  dideteksi dan dipisahkan dari teks utama
+        - Setiap kemunculan  menjadi satu token utuh
+        - Bagian teks lainnya diproses seperti biasa
+        - GUARD: jika endoftext_token kosong, skip splitting
+        """
+        self._ensure_ready()
+
+        text = str(text)
+        if not text.strip():
+            return []
+
+        # ============================================================
+        # GUARD: Jika endoftext_token kosong, skip splitting
+        # ============================================================
+        if not self.endoftext_token:
+            return self._encode_text_part(text)
+
+        # ============================================================
+        # DETEKSI DAN PISAHKAN 
+        # ============================================================
+        # Split teks berdasarkan 
+        try:
+            parts = text.split(self.endoftext_token)
+        except ValueError:
+            # Fallback jika split gagal (empty separator)
+            return self._encode_text_part(text)
+            
+        all_tokens: List[str] = []
+
+        for idx, part in enumerate(parts):
+            # Encode bagian teks biasa
+            part_tokens = self._encode_text_part(part)
+            all_tokens.extend(part_tokens)
+
+            # Tambahkan token  jika bukan bagian terakhir
+            if idx < len(parts) - 1:
+                all_tokens.append(self.endoftext_token)
+
+        return all_tokens
+
+    # ======================================================================
+    # RAG-SPECIFIC ENCODING METHODS (BARU)
+    # ======================================================================
+
+    def encode_qa_sample(
+        self,
+        context: str,
+        question: str,
+        answer: str,
+        add_bos: bool = True,
+        add_eos: bool = True,
+    ) -> List[int]:
+        """
+        Encode QA sample untuk training RAG.
+        
+        Format: "Konteks: {context} Pertanyaan: {question} Jawaban: {answer}"
+        
+        Parameter:
+        - context: paragraf konteks (dari retriever)
+        - question: pertanyaan user
+        - answer: jawaban yang diharapkan
+        - add_bos: tambahkan [BOS] di awal
+        - add_eos: tambahkan [EOS] di akhir
+        
+        Return:
+        - List of token IDs
+        
+        Contoh:
+            ids = tokenizer.encode_qa_sample(
+                context="Mobil adalah kendaraan beroda empat.",
+                question="Apa itu mobil?",
+                answer="Mobil adalah kendaraan beroda empat."
+            )
+        """
+        text = self.QA_TRAIN_TEMPLATE.format(
+            context=context,
+            question=question,
+            answer=answer,
+        )
+        return self.encode(text, add_bos=add_bos, add_eos=add_eos)
+
+    def encode_qa_no_context(
+        self,
+        question: str,
+        answer: str = "Maaf, saya tidak memiliki informasi tersebut.",
+        add_bos: bool = True,
+        add_eos: bool = True,
+    ) -> List[int]:
+        """
+        Encode QA sample TANPA konteks (untuk context dropout training).
+        
+        Format: "Pertanyaan: {question} Jawaban: {answer}"
+        
+        Digunakan untuk melatih model agar:
+        - Mengatakan "tidak tahu" jika tidak ada konteks
+        - Tidak hallucinate saat tidak ada informasi
+        
+        Parameter:
+        - question: pertanyaan user
+        - answer: jawaban default (biasanya "tidak tahu")
+        - add_bos: tambahkan [BOS] di awal
+        - add_eos: tambahkan [EOS] di akhir
+        
+        Return:
+        - List of token IDs
+        """
+        text = self.QA_NO_CONTEXT_TEMPLATE.format(
+            question=question,
+        )
+        # Tambah answer secara eksplisit
+        text = f"{text} {answer}"
+        return self.encode(text, add_bos=add_bos, add_eos=add_eos)
+
+    def format_rag_prompt(
+        self,
+        context: str,
+        question: str,
+        include_context: bool = True,
+    ) -> str:
+        """
+        Format prompt untuk RAG inference (text string).
+        
+        Parameter:
+        - context: paragraf konteks dari retriever
+        - question: pertanyaan user
+        - include_context: jika False, abaikan context
+        
+        Return:
+        - Formatted prompt string (belum di-encode)
+        
+        Contoh:
+            prompt = tokenizer.format_rag_prompt(
+                context="Mobil adalah kendaraan beroda empat.",
+                question="Apa itu mobil?"
+            )
+            # Result: "Konteks: Mobil adalah kendaraan beroda empat. 
+            #          Pertanyaan: Apa itu mobil? Jawaban:"
+        """
+        if include_context and context:
+            return self.QA_INFERENCE_TEMPLATE.format(
+                context=context,
+                question=question,
+            )
+        else:
+            # Tanpa context (fallback)
+            return f"Pertanyaan: {question} Jawaban:"
+
+    def encode_rag_prompt(
+        self,
+        context: Optional[str],
+        question: str,
+        add_bos: bool = True,
+    ) -> List[int]:
+        """
+        Encode prompt untuk RAG inference (token IDs).
+        
+        Format: "Konteks: {context} Pertanyaan: {question} Jawaban:"
+        
+        Parameter:
+        - context: paragraf konteks dari retriever (None jika tidak ada)
+        - question: pertanyaan user
+        - add_bos: tambahkan [BOS] di awal
+        
+        Return:
+        - List of token IDs (tanpa EOS, karena model akan generate lanjutannya)
+        
+        Contoh:
+            ids = tokenizer.encode_rag_prompt(
+                context="Mobil adalah kendaraan beroda empat.",
+                question="Apa itu mobil?"
+            )
+            # Model akan generate token selanjutnya (jawaban)
+        """
+        prompt_text = self.format_rag_prompt(
+            context=context,
+            question=question,
+            include_context=context is not None,
+        )
+        return self.encode(prompt_text, add_bos=add_bos, add_eos=False)
+
+    def split_qa_for_training(
+        self,
+        context: str,
+        question: str,
+        answer: str,
+    ) -> Tuple[List[int], List[int]]:
+        """
+        Split QA sample menjadi (input_ids, target_ids) untuk training.
+        
+        Digunakan oleh trainer untuk:
+        - Input: "Konteks: X Pertanyaan: Y Jawaban:" (tanpa answer)
+        - Target: " {answer} [EOS]" (answer + EOS)
+        
+        Parameter:
+        - context: paragraf konteks
+        - question: pertanyaan
+        - answer: jawaban
+        
+        Return:
+        - (input_ids, target_ids) tuple
+        
+        Contoh:
+            input_ids, target_ids = tokenizer.split_qa_for_training(
+                context="Mobil adalah kendaraan.",
+                question="Apa itu mobil?",
+                answer="Kendaraan beroda empat."
+            )
+            # input_ids:  [BOS, Konteks, :, Mobil, ..., Jawaban, :]
+            # target_ids: [Kendaraan, beroda, empat, ., EOS]
+        """
+        # Format lengkap (dengan answer)
+        full_text = self.QA_TRAIN_TEMPLATE.format(
+            context=context,
+            question=question,
+            answer=answer,
+        )
+        
+        # Format input (tanpa answer)
+        input_text = self.QA_INFERENCE_TEMPLATE.format(
+            context=context,
+            question=question,
+        )
+        
+        # Encode keduanya
+        full_ids = self.encode(full_text, add_bos=True, add_eos=True)
+        input_ids = self.encode(input_text, add_bos=True, add_eos=False)
+        
+        # Target = full_ids[len(input_ids):]
+        target_ids = full_ids[len(input_ids):]
+        
+        return input_ids, target_ids
+
+    # ======================================================================
+    # DECODE METHODS
+    # ======================================================================
+
+    def _encode_text_part(self, text: str) -> List[str]:
+        """
+        Encode bagian teks biasa (tanpa ).
+        """
+        normalized = self._normalize_text(text)
+        if not normalized:
+            return []
+
+        words = normalized.split(" ")
+        all_tokens: List[str] = []
+
+        for idx, word in enumerate(words):
+            base_tokens: List[str] = []
+
+            if idx > 0:
+                base_tokens.append(self.SPACE_MARKER)
+
+            for ch in word:
+                if self._is_valid_char(ch):
+                    base_tokens.append(ch)
+
+            if not base_tokens or base_tokens == [self.SPACE_MARKER]:
+                continue
+
+            base_tokens = [
+                token if token in self.token_to_id else self.unk_token
+                for token in base_tokens
+            ]
+
+            all_tokens.extend(self._apply_bpe(base_tokens))
+
+        return all_tokens
+
+    def decode(
+        self,
+        token_ids: Iterable[int],
+        skip_special_tokens: bool = True,
+    ) -> str:
+        self._ensure_ready()
+
+        pieces: List[str] = []
+
+        for token_id in token_ids:
+            try:
+                tid = int(token_id)
+            except (TypeError, ValueError):
+                continue
+
+            token = self.id_to_token.get(tid)
+            if token is None:
+                continue
+
+            if skip_special_tokens:
+                if token in self._special_set:
+                    continue
+                if token.startswith("[UNUSED_"):
+                    continue
+
+            pieces.append(token)
+
+        text = "".join(pieces)
+        text = text.replace(self.SPACE_MARKER, " ")
+        text = re.sub(r"\s+", " ", text).strip()
+
+        return text
+
+    def decode_until_eos(
+        self,
+        token_ids: Iterable[int],
+        skip_special_tokens: bool = True,
+    ) -> str:
+        """
+        Decode token IDs sampai menemukan [EOS].
+        
+        Berguna untuk inference: berhenti decode saat model generate EOS.
+        """
+        self._ensure_ready()
+
+        pieces: List[str] = []
+
+        for token_id in token_ids:
+            try:
+                tid = int(token_id)
+            except (TypeError, ValueError):
+                continue
+
+            # Stop jika ketemu EOS
+            if tid == self.eos_id:
+                break
+
+            token = self.id_to_token.get(tid)
+            if token is None:
+                continue
+
+            if skip_special_tokens:
+                if token in self._special_set:
+                    continue
+                if token.startswith("[UNUSED_"):
+                    continue
+
+            pieces.append(token)
+
+        text = "".join(pieces)
+        text = text.replace(self.SPACE_MARKER, " ")
+        text = re.sub(r"\s+", " ", text).strip()
+
+        return text
+
+    def get_token_pieces(self, token_ids: Iterable[int]) -> List[str]:
+        """Untuk debug mode di playground.py."""
+        self._ensure_ready()
+
+        pieces: List[str] = []
+        for token_id in token_ids:
+            try:
+                tid = int(token_id)
+            except (TypeError, ValueError):
+                pieces.append(f"<invalid:{token_id}>")
+                continue
+
+            token = self.id_to_token.get(tid)
+            if token is None:
+                pieces.append(f"<{tid}>")
+            else:
+                pieces.append(token)
+
+        return pieces
+
+    # ======================================================================
+    # INTERNAL: VALIDATION
+    # ======================================================================
+
+    def _validate_target_vocab(self) -> None:
+        minimum = len(self.special_ordered) + 2
+        if self.target_vocab_size < minimum:
+            raise ValueError(
+                "config.model.vocab_size terlalu kecil. "
+                f"Minimal {minimum} untuk special tokens, space marker, "
+                "dan satu token dasar."
+            )
+
+    def _validate_loaded_vocab(self) -> None:
+        for token in self.special_ordered:
+            # GUARD: Skip validasi jika token kosong
+            if not token:
+                continue
+            if token not in self.token_to_id:
+                raise ValueError(
+                    f"Special token {token} tidak ditemukan di vocab.json."
+                )
+
+        if self.SPACE_MARKER not in self.token_to_id:
+            self.token_to_id[self.SPACE_MARKER] = len(self.token_to_id)
+            self.id_to_token = {v: k for k, v in self.token_to_id.items()}
+
+    def _ensure_ready(self) -> None:
+        if self._ready:
+            return
+
+        if self.vocab_path.exists():
+            self.load()
+            return
+
+        raise RuntimeError(
+            "Tokenizer belum siap. Jalankan tokenizer.train() atau "
+            "sediakan vocab.json terlebih dahulu."
+        )
+
+    # ======================================================================
+    # INTERNAL: CORPUS READING
+    # ======================================================================
+
+    def _iter_corpus_texts(self) -> Iterable[str]:
+        if not self.datasets_dir.exists():
+            self.datasets_dir.mkdir(parents=True, exist_ok=True)
+            return
+
+        for path in sorted(self.datasets_dir.iterdir()):
+            if not path.is_file():
+                continue
+
+            suffix = path.suffix.lower()
+
+            if suffix == ".txt":
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        yield line
+
+            elif suffix == ".json":
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        data = json.load(f)
+                    for text in self._extract_json_strings(data):
+                        yield text
+                except json.JSONDecodeError:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                obj = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            for text in self._extract_json_strings(obj):
+                                yield text
+
+    def _extract_json_strings(self, node) -> Iterable[str]:
+        if isinstance(node, str):
+            yield node
+        elif isinstance(node, dict):
+            for value in node.values():
+                yield from self._extract_json_strings(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from self._extract_json_strings(value)
+
+    # ======================================================================
+    # INTERNAL: TEXT NORMALIZATION
+    # ======================================================================
+
+    def _normalize_text(self, text: str) -> str:
+        text = text.replace("\r", " ")
+        text = text.replace("\n", " ")
+        text = text.replace("\t", " ")
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _is_valid_char(self, ch: str) -> bool:
+        if ch in (" ", "\n", "\r", "\t"):
+            return False
+        return ch.isprintable()
+
+    # ======================================================================
+    # INTERNAL: CORPUS STATISTICS
+    # ======================================================================
+
+    def _build_corpus_statistics(
+        self,
+    ) -> Tuple[Dict[Tuple[str, ...], int], Counter]:
+        word_freq: Dict[Tuple[str, ...], int] = {}
+        char_freq: Counter = Counter()
+
+        for sequence in self._iter_corpus_texts():
+            normalized = self._normalize_text(sequence)
+            if not normalized:
+                continue
+
+            words = normalized.split(" ")
+
+            for idx, word in enumerate(words):
+                base_tokens: List[str] = []
+
+                if idx > 0:
+                    base_tokens.append(self.SPACE_MARKER)
+
+                for ch in word:
+                    if self._is_valid_char(ch):
+                        base_tokens.append(ch)
+                        char_freq[ch] += 1
+
+                if not base_tokens or base_tokens == [self.SPACE_MARKER]:
+                    continue
+
+                token_tuple = tuple(base_tokens)
+                word_freq[token_tuple] = word_freq.get(token_tuple, 0) + 1
+
+        return word_freq, char_freq
+
+    # ======================================================================
+    # INTERNAL: INITIAL VOCAB
+    # ======================================================================
+
+    def _build_initial_vocab(self, char_freq: Counter) -> Dict[str, int]:
+        token_to_id: Dict[str, int] = {}
+
+        # Tambahkan semua special tokens (termasuk )
+        # GUARD: Skip jika token kosong
+        for token in self.special_ordered:
+            if not token:
+                # Jika token kosong (e.g. endoftext), gunakan fallback
+                if len(token_to_id) == 4:  # index 4 = endoftext
+                    fallback_token = '<' + '|' + 'endoftext' + '|' + '>'
+                    token_to_id[fallback_token] = len(token_to_id)
+                continue
+            token_to_id[token] = len(token_to_id)
+
+        if len(token_to_id) >= self.target_vocab_size:
+            raise ValueError("vocab_size terlalu kecil untuk space marker.")
+
+        token_to_id[self.SPACE_MARKER] = len(token_to_id)
+
+        sorted_chars = sorted(char_freq.items(), key=lambda item: (-item[1], item[0]))
+
+        for ch, _freq in sorted_chars:
+            if len(token_to_id) >= self.target_vocab_size:
+                break
+            if ch == self.SPACE_MARKER:
+                continue
+            if ch in token_to_id:
+                continue
+            if not self._is_valid_char(ch):
+                continue
+            token_to_id[ch] = len(token_to_id)
+
+        return token_to_id
+
+    def _project_word_freq_to_vocab(
+        self,
+        word_freq: Dict[Tuple[str, ...], int],
+        token_to_id: Dict[str, int],
+    ) -> Dict[Tuple[str, ...], int]:
+        projected: Dict[Tuple[str, ...], int] = {}
+
+        for tokens, freq in word_freq.items():
+            mapped: List[str] = []
+            previous_unk = False
+
+            for token in tokens:
+                if token in token_to_id:
+                    mapped.append(token)
+                    previous_unk = False
+                else:
+                    if not previous_unk:
+                        mapped.append(self.unk_token)
+                        previous_unk = True
+
+            token_tuple = tuple(mapped)
+            if token_tuple:
+                projected[token_tuple] = projected.get(token_tuple, 0) + freq
+
+        return projected
+
+    # ======================================================================
+    # INTERNAL: BPE LEARNING
+    # ======================================================================
+
+    def _learn_bpe(
+        self,
+        word_freq: Dict[Tuple[str, ...], int],
+        token_to_id: Dict[str, int],
+        merges: List[Tuple[str, str]],
+    ) -> None:
+        while len(token_to_id) < self.target_vocab_size:
+            pair_counts: Dict[Tuple[str, str], int] = {}
+            existing_tokens = set(token_to_id.keys())
+
+            for tokens, freq in word_freq.items():
+                if len(tokens) < 2:
+                    continue
+
+                for i in range(len(tokens) - 1):
+                    a = tokens[i]
+                    b = tokens[i + 1]
+
+                    if a in self._special_set or b in self._special_set:
+                        continue
+
+                    candidate = a + b
+                    if candidate in existing_tokens:
+                        continue
+
+                    pair = (a, b)
+                    pair_counts[pair] = pair_counts.get(pair, 0) + freq
+
+            if not pair_counts:
+                break
+
+            best_pair = min(
+                pair_counts.items(),
+                key=lambda item: (-item[1], item[0]),
+            )[0]
+
+            new_token = best_pair[0] + best_pair[1]
+
+            if len(token_to_id) >= self.target_vocab_size:
+                break
+
+            if new_token not in token_to_id:
+                token_to_id[new_token] = len(token_to_id)
+
+            merges.append(best_pair)
+
+            a, b = best_pair
+            updated_word_freq: Dict[Tuple[str, ...], int] = {}
+
+            for tokens, freq in word_freq.items():
+                new_tokens: List[str] = []
+                i = 0
+
+                while i < len(tokens):
+                    if (
+                        i < len(tokens) - 1
+                        and tokens[i] == a
+                        and tokens[i + 1] == b
+                    ):
+                        new_tokens.append(new_token)
+                        i += 2
+                    else:
+                        new_tokens.append(tokens[i])
+                        i += 1
+
+                token_tuple = tuple(new_tokens)
+                updated_word_freq[token_tuple] = (
+                    updated_word_freq.get(token_tuple, 0) + freq
+                )
+
+            word_freq = updated_word_freq
+
+    # ======================================================================
+    # INTERNAL: VOCAB PADDING
+    # ======================================================================
+
+    def _pad_vocab(self, token_to_id: Dict[str, int]) -> Dict[str, int]:
+        token_to_id = dict(token_to_id)
+
+        while len(token_to_id) < self.target_vocab_size:
+            base_index = len(token_to_id)
+            candidate = f"[UNUSED_{base_index}]"
+            suffix = 0
+
+            while candidate in token_to_id:
+                suffix += 1
+                candidate = f"[UNUSED_{base_index}_{suffix}]"
+
+            token_to_id[candidate] = len(token_to_id)
+
+        return token_to_id
+
+    # ======================================================================
+    # INTERNAL: BPE APPLICATION
+    # ======================================================================
+
+    def _apply_bpe(self, tokens: List[str]) -> List[str]:
+        if len(tokens) <= 1:
+            return tokens
+
+        if not self.merge_ranks:
+            return tokens
+
+        current_tokens = list(tokens)
+
+        while len(current_tokens) > 1:
+            best_pair: Tuple[str, str] | None = None
+            best_rank: int | None = None
+
+            for i in range(len(current_tokens) - 1):
+                a = current_tokens[i]
+                b = current_tokens[i + 1]
+
+                if a in self._special_set or b in self._special_set:
+                    continue
+
+                pair = (a, b)
+                rank = self.merge_ranks.get(pair)
+
+                if rank is None:
+                    continue
+
+                if best_rank is None or rank < best_rank:
+                    best_rank = rank
+                    best_pair = pair
+
+            if best_pair is None:
+                break
+
+            new_token = best_pair[0] + best_pair[1]
+            merged_tokens: List[str] = []
+            i = 0
+
+            while i < len(current_tokens):
+                if (
+                    i < len(current_tokens) - 1
+                    and current_tokens[i] == best_pair[0]
+                    and current_tokens[i + 1] == best_pair[1]
+                ):
+                    merged_tokens.append(new_token)
+                    i += 2
+                else:
+                    merged_tokens.append(current_tokens[i])
+                    i += 1
+
+            current_tokens = merged_tokens
+
+        return current_tokens
+
+
+# ==========================================================================
+# DIRECT EXECUTION
+# ==========================================================================
+
+if __name__ == "__main__":
+    tokenizer = Tokenizer()
+    tokenizer.train()
+
+    # Verifikasi endoftext_token
+    print("=" * 70)
+    print("Tokenizer Verification (RAG-ready)")
+    print("=" * 70)
+    print(f"endoftext_token : {repr(tokenizer.endoftext_token)}")
+    print(f"endoftext_id    : {tokenizer.endoftext_id}")
+    print(f"Is empty?       : {not tokenizer.endoftext_token}")
+    print()
+
+    sample_text = "Apa itu mobil?"
+
+    token_ids = tokenizer.encode(
+        sample_text,
+        add_bos=True,
+        add_eos=True,
+    )
+
+    tokens = tokenizer.encode_to_tokens(sample_text)
+    token_pieces = tokenizer.get_token_pieces(token_ids)
+    decoded = tokenizer.decode(token_ids, skip_special_tokens=True)
+
+    print("Tokenizer ready.")
+    print(f"Vocab size        : {tokenizer.vocab_size}")
+    print(f"Vocab path        : {tokenizer.vocab_path}")
+    print(f"Sample text       : {sample_text}")
+    print(f"Tokens            : {tokens}")
+    print(f"Token IDs         : {token_ids}")
+    print(f"Token Pieces      : {token_pieces}")
+    print(f"Decoded           : {decoded}")
+
+    # ================================================================
+    # Test dengan document boundary
+    # ================================================================
+    print("\n" + "=" * 70)
+    print("TEST: Document Boundary Token")
+    print("=" * 70)
+    
+    # Gunakan fallback token jika endoftext kosong
+    eot_token = tokenizer.endoftext_token or '<|endoftext|>'
+    test_text = f"Mobil adalah kendaraan. {eot_token} Kucing adalah hewan."
+    
+    test_ids = tokenizer.encode(test_text, add_bos=True, add_eos=True)
+    test_tokens = tokenizer.encode_to_tokens(test_text)
+    test_pieces = tokenizer.get_token_pieces(test_ids)
+
+    print(f"Input text        : {test_text}")
+    print(f"Tokens            : {test_tokens}")
+    print(f"Token IDs         : {test_ids}")
+    print(f"Token Pieces      : {test_pieces}")
+    print(f"endoftext in tokens: {tokenizer.endoftext_token in test_tokens}")
+    print(f"endoftext_id in IDs: {tokenizer.endoftext_id in test_ids}")
+
+    # ================================================================
+    # Test RAG methods (BARU)
+    # ================================================================
+    print("\n" + "=" * 70)
+    print("TEST: RAG Encoding Methods")
+    print("=" * 70)
+    
+    # Test encode_qa_sample (untuk training)
+    context = "Mobil adalah kendaraan beroda empat yang menggunakan mesin."
+    question = "Apa itu mobil?"
+    answer = "Mobil adalah kendaraan beroda empat."
+    
+    qa_ids = tokenizer.encode_qa_sample(context, question, answer)
+    print(f"\n1. encode_qa_sample():")
+    print(f"   Context  : {context}")
+    print(f"   Question : {question}")
+    print(f"   Answer   : {answer}")
+    print(f"   IDs      : {qa_ids}")
+    print(f"   Decoded  : {tokenizer.decode(qa_ids, skip_special_tokens=False)}")
+    
+    # Test encode_qa_no_context (untuk context dropout training)
+    qa_no_ctx_ids = tokenizer.encode_qa_no_context(question)
+    print(f"\n2. encode_qa_no_context():")
+    print(f"   Question : {question}")
+    print(f"   IDs      : {qa_no_ctx_ids}")
+    print(f"   Decoded  : {tokenizer.decode(qa_no_ctx_ids, skip_special_tokens=False)}")
+    
+    # Test format_rag_prompt (untuk inference)
+    prompt_text = tokenizer.format_rag_prompt(context, question)
+    print(f"\n3. format_rag_prompt():")
+    print(f"   Formatted: {prompt_text}")
+    
+    # Test encode_rag_prompt (untuk inference)
+    prompt_ids = tokenizer.encode_rag_prompt(context, question)
+    print(f"\n4. encode_rag_prompt():")
+    print(f"   IDs      : {prompt_ids}")
+    print(f"   Decoded  : {tokenizer.decode(prompt_ids, skip_special_tokens=False)}")
+    
+    # Test split_qa_for_training (untuk trainer)
+    input_ids, target_ids = tokenizer.split_qa_for_training(context, question, answer)
+    print(f"\n5. split_qa_for_training():")
+    print(f"   Input IDs  ({len(input_ids)}): {input_ids}")
+    print(f"   Target IDs ({len(target_ids)}): {target_ids}")
+    print(f"   Input decoded  : {tokenizer.decode(input_ids, skip_special_tokens=False)}")
+    print(f"   Target decoded : {tokenizer.decode(target_ids, skip_special_tokens=False)}")
+    
+    # Test decode_until_eos
+    test_with_eos = [5, 10, 20, tokenizer.eos_id, 30, 40]
+    decoded_until = tokenizer.decode_until_eos(test_with_eos)
+    print(f"\n6. decode_until_eos():")
+    print(f"   Input IDs : {test_with_eos}")
+    print(f"   Decoded   : '{decoded_until}' (stop at EOS)")
+
+    print("\n" + "=" * 70)
+    print("core/tokenizer.py (RAG-ready) ALL TESTS PASSED")
+    print("=" * 70)

@@ -1,0 +1,277 @@
+# handlers/report_generator.py — JSON/TXT/HTML (template string murni) -> storage/report_<domain>_<ts>.*
+import json
+import os
+import time
+from datetime import datetime
+from typing import Dict, Any, List
+
+__all__ = ["generate_report", "ReportGenerator"]
+
+
+JSON_TEMPLATE = """{
+  "meta": {
+    "target": "{target}",
+    "timestamp": "{timestamp}",
+    "duration": {duration},
+    "modules_run": {modules_run}
+  },
+  "summary": {
+    "total_findings": {total_findings},
+    "by_severity": {by_severity}
+  },
+  "findings": {findings}
+}"""
+
+
+TXT_TEMPLATE = """============================================================
+ScanRider Security Scan Report
+============================================================
+Target: {target}
+Timestamp: {timestamp}
+Duration: {duration}s
+Modules Run: {modules_run}
+
+------------------------------------------------------------
+SUMMARY
+------------------------------------------------------------
+Total Findings: {total_findings}
+By Severity: {by_severity_str}
+
+------------------------------------------------------------
+FINDINGS
+------------------------------------------------------------
+{findings_txt}
+============================================================
+End of Report
+============================================================
+"""
+
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ScanRider Report - {target}</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
+    .container {{ max-width: 1200px; margin: 0 auto; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }}
+    .header {{ background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); color: white; padding: 30px; }}
+    .header h1 {{ margin: 0; font-size: 28px; }}
+    .header .meta {{ margin-top: 10px; opacity: 0.9; font-size: 14px; }}
+    .summary {{ padding: 20px 30px; border-bottom: 1px solid #eee; display: flex; gap: 20px; flex-wrap: wrap; }}
+    .stat {{ background: #f8fafc; padding: 15px 20px; border-radius: 6px; min-width: 150px; }}
+    .stat .label {{ font-size: 12px; color: #64748b; text-transform: uppercase; }}
+    .stat .value {{ font-size: 24px; font-weight: 600; color: #1e293b; }}
+    .severity-critical {{ color: #dc2626; }}
+    .severity-high {{ color: #ea580c; }}
+    .severity-medium {{ color: #d97706; }}
+    .severity-low {{ color: #2563eb; }}
+    .severity-info {{ color: #059669; }}
+    .severity-error {{ color: #7c2d12; }}
+    .modules {{ padding: 20px 30px; border-bottom: 1px solid #eee; }}
+    .module-tag {{ display: inline-block; background: #eef2ff; color: #3730a3; padding: 4px 12px; border-radius: 9999px; font-size: 12px; margin-right: 8px; margin-bottom: 8px; }}
+    .findings {{ padding: 0 30px 30px; }}
+    .finding {{ border: 1px solid #e2e8f0; border-radius: 6px; margin-bottom: 16px; overflow: hidden; }}
+    .finding-header {{ padding: 12px 16px; background: #f8fafc; border-bottom: 1px solid #e2e8f0; display: flex; justify-content: space-between; align-items: center; }}
+    .finding-title {{ font-weight: 600; color: #1e293b; }}
+    .finding-severity {{ padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; }}
+    .finding-body {{ padding: 16px; }}
+    .finding-detail {{ margin: 8px 0; font-family: monospace; font-size: 13px; background: #f1f5f9; padding: 8px; border-radius: 4px; }}
+    .footer {{ background: #f8fafc; padding: 20px; text-align: center; color: #64748b; font-size: 12px; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>ScanRider Security Report</h1>
+      <div class="meta">
+        Target: {target} | {timestamp} | Duration: {duration}s | Modules: {modules_run}
+      </div>
+    </div>
+    <div class="summary">
+      <div class="stat"><div class="label">Total Findings</div><div class="value">{total_findings}</div></div>
+      <div class="stat"><div class="label">Critical</div><div class="value severity-critical">{sev_critical}</div></div>
+      <div class="stat"><div class="label">High</div><div class="value severity-high">{sev_high}</div></div>
+      <div class="stat"><div class="label">Medium</div><div class="value severity-medium">{sev_medium}</div></div>
+      <div class="stat"><div class="label">Low</div><div class="value severity-low">{sev_low}</div></div>
+      <div class="stat"><div class="label">Info</div><div class="value severity-info">{sev_info}</div></div>
+      <div class="stat"><div class="label">Error</div><div class="value severity-error">{sev_error}</div></div>
+    </div>
+    <div class="modules">
+      {module_tags}
+    </div>
+    <div class="findings">
+      {findings_html}
+    </div>
+    <div class="footer">
+      Generated by ScanRider | {timestamp}
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "error": 5}
+SEVERITY_COLORS = {
+    "critical": "#dc2626", "high": "#ea580c", "medium": "#d97706",
+    "low": "#2563eb", "info": "#059669", "error": "#7c2d12"
+}
+
+
+def _count_by_severity(findings: List[Dict]) -> Dict[str, int]:
+    counts = {s: 0 for s in SEVERITY_ORDER}
+    for f in findings:
+        sev = f.get("severity", "info").lower()
+        if sev in counts:
+            counts[sev] += 1
+    return counts
+
+
+def _format_findings_txt(findings: List[Dict]) -> str:
+    lines = []
+    for i, f in enumerate(sorted(findings, key=lambda x: SEVERITY_ORDER.get(x.get("severity", "info"), 4)), 1):
+        sev = f.get("severity", "info").upper()
+        module = f.get("module", "unknown")
+        lines.append(f"[{i}] [{sev}] {module}")
+        for k, v in f.items():
+            if k not in ("module", "severity", "target"):
+                if isinstance(v, (dict, list)):
+                    lines.append(f"    {k}: {json.dumps(v, ensure_ascii=False)}")
+                else:
+                    lines.append(f"    {k}: {v}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _format_findings_html(findings: List[Dict]) -> str:
+    if not findings:
+        return '<p style="color:#64748b;text-align:center;padding:40px;">Tidak ada temuan</p>'
+
+    html_parts = []
+    for f in sorted(findings, key=lambda x: SEVERITY_ORDER.get(x.get("severity", "info"), 4)):
+        sev = f.get("severity", "info").lower()
+        color = SEVERITY_COLORS.get(sev, "#64748b")
+        module = f.get("module", "unknown")
+        title = f.get("type") or f.get("header") or f.get("path") or f.get("technology") or "Finding"
+
+        html_parts.append(f"""
+        <div class="finding">
+          <div class="finding-header">
+            <span class="finding-title">{module}: {title}</span>
+            <span class="finding-severity" style="background:{color}20;color:{color};">{sev.upper()}</span>
+          </div>
+          <div class="finding-body">""")
+
+        for k, v in f.items():
+            if k not in ("module", "severity", "target", "type", "header", "path", "technology"):
+                if isinstance(v, (dict, list)):
+                    html_parts.append(f'<div class="finding-detail"><strong>{k}:</strong> {json.dumps(v, ensure_ascii=False)}</div>')
+                else:
+                    html_parts.append(f'<div class="finding-detail"><strong>{k}:</strong> {v}</div>')
+
+        html_parts.append("""
+          </div>
+        </div>""")
+
+    return "".join(html_parts)
+
+
+class ReportGenerator:
+    def __init__(self, output_dir: str = "storage"):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+    def generate(
+        self,
+        target: str,
+        results: List[Dict[str, Any]],
+        formats: List[str] = None
+    ) -> Dict[str, str]:
+        """Generate report dalam format yang diminta, return dict path per format."""
+        formats = formats or ["json", "txt", "html"]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        domain = target.replace("https://", "").replace("http://", "").strip("/").replace(".", "_")
+        base_name = f"report_{domain}_{timestamp}"
+
+        all_findings = []
+        modules_run = []
+        total_duration = 0
+
+        for r in results:
+            if isinstance(r, dict):
+                modules_run.append(r.get("module", "unknown"))
+                total_duration += r.get("duration", 0)
+                all_findings.extend(r.get("findings", []))
+
+        sev_counts = _count_by_severity(all_findings)
+        by_severity_str = ", ".join(f"{k}: {v}" for k, v in sev_counts.items() if v > 0)
+
+        module_tags = "".join(f'<span class="module-tag">{m}</span>' for m in modules_run)
+
+        context = {
+            "target": target,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "duration": round(total_duration, 2),
+            "modules_run": ", ".join(modules_run),
+            "total_findings": len(all_findings),
+            "by_severity": json.dumps(sev_counts),
+            "by_severity_str": by_severity_str,
+            "findings": json.dumps(all_findings, ensure_ascii=False, indent=2),
+            "findings_txt": _format_findings_txt(all_findings),
+            "findings_html": _format_findings_html(all_findings),
+            "module_tags": module_tags,
+            **{f"sev_{k}": v for k, v in sev_counts.items()}
+        }
+
+        output_paths = {}
+        for fmt in formats:
+            if fmt == "json":
+                content = JSON_TEMPLATE.format(**context)
+                path = os.path.join(self.output_dir, f"{base_name}.json")
+            elif fmt == "txt":
+                content = TXT_TEMPLATE.format(**context)
+                path = os.path.join(self.output_dir, f"{base_name}.txt")
+            elif fmt == "html":
+                content = HTML_TEMPLATE.format(**context)
+                path = os.path.join(self.output_dir, f"{base_name}.html")
+            else:
+                continue
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            output_paths[fmt] = path
+
+        return output_paths
+
+
+def generate_report(
+    target: str,
+    results: List[Dict[str, Any]],
+    output_dir: str = "storage",
+    formats: List[str] = None
+) -> Dict[str, str]:
+    """Convenience function untuk generate report."""
+    generator = ReportGenerator(output_dir)
+    return generator.generate(target, results, formats)
+
+
+if __name__ == "__main__":
+    test_results = [{
+        "module": "headers_scanner",
+        "target": "https://example.com",
+        "findings": [
+            {"header": "Content-Security-Policy", "status": "missing", "severity": "high"},
+            {"header": "X-Frame-Options", "value": "DENY", "status": "present", "severity": "info"}
+        ],
+        "summary": "Grade B",
+        "severity": "high",
+        "duration": 1.5
+    }]
+    paths = generate_report("https://example.com", test_results, formats=["json", "txt", "html"])
+    print("Generated:", paths)
+    for fmt, path in paths.items():
+        print(f"\n--- {fmt.upper()} ---")
+        with open(path) as f:
+            print(f.read()[:500])

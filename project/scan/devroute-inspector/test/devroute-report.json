@@ -1,0 +1,948 @@
+{
+  "target": "https://juice-shop.herokuapp.com",
+  "started_at": "2026-09-20T03:37:21Z",
+  "finished_at": "2026-09-20T03:37:27Z",
+  "assets_scanned": 3,
+  "sourcemaps_parsed": 0,
+  "findings": [
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "https://fonts.googleapis.com",
+      "context": "https://fonts.googleapis.com",
+      "asset": "https://juice-shop.herokuapp.com"
+    },
+    {
+      "severity": "HIGH",
+      "type": "route",
+      "value": "/rest/admin",
+      "context": "`/rest/admin`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/Feedbacks",
+      "context": "`/api/Feedbacks`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/Challenges",
+      "context": "`/api/Challenges`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/Users",
+      "context": "`/api/Users`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/Addresss",
+      "context": "`/api/Addresss`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/Recycles",
+      "context": "`/api/Recycles`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/BasketItems",
+      "context": "`/api/BasketItems`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/Products",
+      "context": "`/api/Products`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/SecurityAnswers",
+      "context": "`/api/SecurityAnswers`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/SecurityQuestions",
+      "context": "`/api/SecurityQuestions`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/Quantitys",
+      "context": "`/api/Quantitys`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/Complaints",
+      "context": "`/api/Complaints`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/Deliverys",
+      "context": "`/api/Deliverys`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/Cards",
+      "context": "`/api/Cards`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "/api/Hints",
+      "context": "`/api/Hints`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "api",
+      "value": "https://www.googleapis.com/oauth2/v1/userinfo?alt=json\u0026access_token=",
+      "context": "https://www.googleapis.com/oauth2/v1/userinfo?alt=json\u0026access_token=",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "secret",
+      "value": "password:`password",
+      "context": "password:`password`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "secret",
+      "value": "Password=`IamUsedForTesting",
+      "context": "Password=`IamUsedForTesting`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/api/Deliverys",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/api/Recycles",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/api/Challenges",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/api/Feedbacks",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/api/Quantitys",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/api/Products",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/api/SecurityQuestions",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/api/Hints",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/rest/captcha",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/rest/continue-code",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/rest/continue-code-findIt",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/rest/continue-code-fixIt",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/rest/memories",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/rest/repeat-notification",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "HIGH",
+      "type": "exposed-data-endpoint",
+      "value": "/rest/user/whoami",
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "http_status": 200,
+      "verified": "200 OK mengembalikan payload JSON/data murni tanpa autentikasi"
+    },
+    {
+      "severity": "MEDIUM",
+      "type": "guard",
+      "value": "client-authz-check: isLoggedIn",
+      "context": "isLoggedIn",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "MEDIUM",
+      "type": "AUTHZ_MATRIX_BUILT",
+      "value": "1 aset dengan pemetaan otorisasi client-side",
+      "asset": "https://juice-shop.herokuapp.com"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/Feedbacks",
+      "context": "`/api/Feedbacks`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/web3",
+      "context": "`/rest/web3`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/Challenges",
+      "context": "`/api/Challenges`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/repeat-notification",
+      "context": "`/rest/repeat-notification`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/continue-code",
+      "context": "`/rest/continue-code`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/continue-code-findIt",
+      "context": "`/rest/continue-code-findIt`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/continue-code-fixIt",
+      "context": "`/rest/continue-code-fixIt`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/Users",
+      "context": "`/api/Users`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/user/login",
+      "context": "`/rest/user/login`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/user/reset-password",
+      "context": "`/rest/user/reset-password`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/user/whoami",
+      "context": "`/rest/user/whoami`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/saveLoginIp",
+      "context": "`/rest/saveLoginIp`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/deluxe-membership",
+      "context": "`/rest/deluxe-membership`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/Addresss",
+      "context": "`/api/Addresss`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/address/create",
+      "context": "`/address/create`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/Recycles",
+      "context": "`/api/Recycles`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/country-mapping",
+      "context": "`/rest/country-mapping`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/BasketItems",
+      "context": "`/api/BasketItems`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/address/saved",
+      "context": "`/address/saved`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/Products",
+      "context": "`/api/Products`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/address/select",
+      "context": "`/address/select`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/track-order",
+      "context": "`/rest/track-order`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/captcha",
+      "context": "`/rest/captcha`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/SecurityAnswers",
+      "context": "`/api/SecurityAnswers`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/SecurityQuestions",
+      "context": "`/api/SecurityQuestions`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/Quantitys",
+      "context": "`/api/Quantitys`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/products",
+      "context": "`/rest/products`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/2fa/enter",
+      "context": "`/2fa/enter`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/Complaints",
+      "context": "`/api/Complaints`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/user",
+      "context": "`/rest/user`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/wallet/balance",
+      "context": "`/rest/wallet/balance`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/Deliverys",
+      "context": "`/api/Deliverys`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/Cards",
+      "context": "`/api/Cards`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/order-history",
+      "context": "`/rest/order-history`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/track-result/new",
+      "context": "`/track-result/new`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/memories",
+      "context": "`/rest/memories`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/api/Hints",
+      "context": "`/api/Hints`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/chatbot/conversation",
+      "context": "`/chatbot/conversation`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "severity": "LOW",
+      "type": "route",
+      "value": "/rest/chat",
+      "context": "`/rest/chat`",
+      "asset": "https://juice-shop.herokuapp.com/main.js"
+    }
+  ],
+  "summary": {
+    "HIGH": 34,
+    "LOW": 39,
+    "MEDIUM": 2
+  },
+  "route_verification": [
+    {
+      "route": "/api/Cards",
+      "full_url": "https://juice-shop.herokuapp.com/api/Cards",
+      "http_status": 401,
+      "content_length": 83,
+      "verdict": "PROTECTED",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/BasketItems",
+      "full_url": "https://juice-shop.herokuapp.com/api/BasketItems",
+      "http_status": 401,
+      "content_length": 972,
+      "verdict": "PROTECTED",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/address/select",
+      "full_url": "https://juice-shop.herokuapp.com/address/select",
+      "http_status": 200,
+      "content_length": 9393,
+      "baseline_similarity": 1,
+      "verdict": "SPA-FALLBACK-VIRTUAL-404",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/Addresss",
+      "full_url": "https://juice-shop.herokuapp.com/api/Addresss",
+      "http_status": 401,
+      "content_length": 83,
+      "verdict": "PROTECTED",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/address/saved",
+      "full_url": "https://juice-shop.herokuapp.com/address/saved",
+      "http_status": 200,
+      "content_length": 9393,
+      "baseline_similarity": 1,
+      "verdict": "SPA-FALLBACK-VIRTUAL-404",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/Complaints",
+      "full_url": "https://juice-shop.herokuapp.com/api/Complaints",
+      "http_status": 401,
+      "content_length": 972,
+      "verdict": "PROTECTED",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/address/create",
+      "full_url": "https://juice-shop.herokuapp.com/address/create",
+      "http_status": 200,
+      "content_length": 9393,
+      "baseline_similarity": 1,
+      "verdict": "SPA-FALLBACK-VIRTUAL-404",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/Deliverys",
+      "full_url": "https://juice-shop.herokuapp.com/api/Deliverys",
+      "http_status": 200,
+      "content_length": 266,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/2fa/enter",
+      "full_url": "https://juice-shop.herokuapp.com/2fa/enter",
+      "http_status": 200,
+      "content_length": 9393,
+      "baseline_similarity": 1,
+      "verdict": "SPA-FALLBACK-VIRTUAL-404",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/SecurityAnswers",
+      "full_url": "https://juice-shop.herokuapp.com/api/SecurityAnswers",
+      "http_status": 401,
+      "content_length": 972,
+      "verdict": "PROTECTED",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/Recycles",
+      "full_url": "https://juice-shop.herokuapp.com/api/Recycles",
+      "http_status": 200,
+      "content_length": 76,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/Challenges",
+      "full_url": "https://juice-shop.herokuapp.com/api/Challenges",
+      "http_status": 200,
+      "content_length": 67642,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/Feedbacks",
+      "full_url": "https://juice-shop.herokuapp.com/api/Feedbacks",
+      "http_status": 200,
+      "content_length": 2273,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/Quantitys",
+      "full_url": "https://juice-shop.herokuapp.com/api/Quantitys",
+      "http_status": 200,
+      "content_length": 7628,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/Products",
+      "full_url": "https://juice-shop.herokuapp.com/api/Products",
+      "http_status": 200,
+      "content_length": 15952,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/SecurityQuestions",
+      "full_url": "https://juice-shop.herokuapp.com/api/SecurityQuestions",
+      "http_status": 200,
+      "content_length": 1934,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/Users",
+      "full_url": "https://juice-shop.herokuapp.com/api/Users",
+      "http_status": 401,
+      "content_length": 972,
+      "verdict": "PROTECTED",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/chatbot/conversation",
+      "full_url": "https://juice-shop.herokuapp.com/chatbot/conversation",
+      "http_status": 200,
+      "content_length": 9393,
+      "baseline_similarity": 1,
+      "verdict": "SPA-FALLBACK-VIRTUAL-404",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/admin",
+      "full_url": "https://juice-shop.herokuapp.com/rest/admin",
+      "http_status": 500,
+      "content_length": 2310,
+      "verdict": "HTTP-500",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/api/Hints",
+      "full_url": "https://juice-shop.herokuapp.com/api/Hints",
+      "http_status": 200,
+      "content_length": 97764,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/captcha",
+      "full_url": "https://juice-shop.herokuapp.com/rest/captcha",
+      "http_status": 200,
+      "content_length": 48,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/chat",
+      "full_url": "https://juice-shop.herokuapp.com/rest/chat",
+      "http_status": 500,
+      "content_length": 2308,
+      "verdict": "HTTP-500",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/continue-code",
+      "full_url": "https://juice-shop.herokuapp.com/rest/continue-code",
+      "http_status": 200,
+      "content_length": 84,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/continue-code-findIt",
+      "full_url": "https://juice-shop.herokuapp.com/rest/continue-code-findIt",
+      "http_status": 200,
+      "content_length": 2,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/continue-code-fixIt",
+      "full_url": "https://juice-shop.herokuapp.com/rest/continue-code-fixIt",
+      "http_status": 200,
+      "content_length": 2,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/deluxe-membership",
+      "full_url": "https://juice-shop.herokuapp.com/rest/deluxe-membership",
+      "http_status": 400,
+      "content_length": 72,
+      "verdict": "HTTP-400",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/country-mapping",
+      "full_url": "https://juice-shop.herokuapp.com/rest/country-mapping",
+      "http_status": 500,
+      "content_length": 0,
+      "verdict": "HTTP-500",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/memories",
+      "full_url": "https://juice-shop.herokuapp.com/rest/memories",
+      "http_status": 200,
+      "content_length": 6183,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/products",
+      "full_url": "https://juice-shop.herokuapp.com/rest/products",
+      "http_status": 500,
+      "content_length": 2316,
+      "verdict": "HTTP-500",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/repeat-notification",
+      "full_url": "https://juice-shop.herokuapp.com/rest/repeat-notification",
+      "http_status": 200,
+      "content_length": 2,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/order-history",
+      "full_url": "https://juice-shop.herokuapp.com/rest/order-history",
+      "http_status": 500,
+      "content_length": 2343,
+      "verdict": "HTTP-500",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/saveLoginIp",
+      "full_url": "https://juice-shop.herokuapp.com/rest/saveLoginIp",
+      "http_status": 401,
+      "content_length": 12,
+      "verdict": "PROTECTED",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/track-order",
+      "full_url": "https://juice-shop.herokuapp.com/rest/track-order",
+      "http_status": 500,
+      "content_length": 2322,
+      "verdict": "HTTP-500",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/user",
+      "full_url": "https://juice-shop.herokuapp.com/rest/user",
+      "http_status": 500,
+      "content_length": 2308,
+      "verdict": "HTTP-500",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/user/login",
+      "full_url": "https://juice-shop.herokuapp.com/rest/user/login",
+      "http_status": 500,
+      "content_length": 2320,
+      "verdict": "HTTP-500",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/user/reset-password",
+      "full_url": "https://juice-shop.herokuapp.com/rest/user/reset-password",
+      "http_status": 500,
+      "content_length": 2338,
+      "verdict": "HTTP-500",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/user/whoami",
+      "full_url": "https://juice-shop.herokuapp.com/rest/user/whoami",
+      "http_status": 200,
+      "content_length": 11,
+      "verdict": "ACCESSIBLE-DATA",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/wallet/balance",
+      "full_url": "https://juice-shop.herokuapp.com/rest/wallet/balance",
+      "http_status": 401,
+      "content_length": 83,
+      "verdict": "PROTECTED",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/rest/web3",
+      "full_url": "https://juice-shop.herokuapp.com/rest/web3",
+      "http_status": 500,
+      "content_length": 2308,
+      "verdict": "HTTP-500",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    },
+    {
+      "route": "/track-result/new",
+      "full_url": "https://juice-shop.herokuapp.com/track-result/new",
+      "http_status": 200,
+      "content_length": 9393,
+      "baseline_similarity": 1,
+      "verdict": "SPA-FALLBACK-VIRTUAL-404",
+      "from_asset": "https://juice-shop.herokuapp.com/main.js"
+    }
+  ],
+  "auth_matrix": [
+    {
+      "asset": "https://juice-shop.herokuapp.com/main.js",
+      "ui_routes": [
+        "/api/Feedbacks",
+        "/rest/web3",
+        "/api/Challenges",
+        "/rest/repeat-notification",
+        "/rest/continue-code",
+        "/rest/continue-code-findIt",
+        "/rest/continue-code-fixIt",
+        "/api/Users",
+        "/rest/user/login",
+        "/rest/user/reset-password",
+        "/rest/user/whoami",
+        "/rest/saveLoginIp",
+        "/rest/deluxe-membership",
+        "/api/Addresss",
+        "/address/create",
+        "/api/Recycles",
+        "/rest/admin",
+        "/rest/country-mapping",
+        "/api/BasketItems",
+        "/address/saved",
+        "/api/Products",
+        "/address/select",
+        "/rest/track-order",
+        "/rest/captcha",
+        "/api/SecurityAnswers",
+        "/api/SecurityQuestions",
+        "/api/Quantitys",
+        "/rest/products",
+        "/2fa/enter",
+        "/api/Complaints",
+        "/rest/user",
+        "/rest/wallet/balance",
+        "/api/Deliverys",
+        "/api/Cards",
+        "/rest/order-history",
+        "/track-result/new",
+        "/rest/memories",
+        "/api/Hints",
+        "/chatbot/conversation",
+        "/rest/chat"
+      ],
+      "client_guards": [
+        "client-authz-check: isLoggedIn"
+      ],
+      "backend_apis": [
+        "/api/Feedbacks",
+        "/api/Challenges",
+        "/api/Users",
+        "/api/Addresss",
+        "/api/Recycles",
+        "/api/BasketItems",
+        "/api/Products",
+        "/api/SecurityAnswers",
+        "/api/SecurityQuestions",
+        "/api/Quantitys",
+        "/api/Complaints",
+        "/api/Deliverys",
+        "/api/Cards",
+        "/api/Hints",
+        "https://www.googleapis.com/oauth2/v1/userinfo?alt=json\u0026access_token="
+      ]
+    }
+  ]
+}

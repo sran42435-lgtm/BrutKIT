@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="id"><head><meta charset="utf-8">
+<title>DevRoute-Inspector — https://juice-shop.herokuapp.com</title>
+<style>
+ body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0d1117;color:#c9d1d9;margin:0;padding:24px}
+ h1{color:#58a6ff;font-size:20px} .meta{color:#8b949e;font-size:12px;margin-bottom:16px}
+ .bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+ input,select{background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font:inherit}
+ table{border-collapse:collapse;width:100%;font-size:13px}
+ th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #21262d;vertical-align:top}
+ th{color:#8b949e;position:sticky;top:0;background:#0d1117}
+ tr:hover{background:#161b22}
+ .CRITICAL{color:#ff7b72;font-weight:700}.HIGH{color:#e3b341}.MEDIUM{color:#58a6ff}
+ .LOW{color:#8b949e}.INFO{color:#3fb950}
+ .cnt{display:inline-block;margin-right:12px;font-size:12px}
+</style></head><body>
+<h1>DevRoute-Inspector v2.0 — https://juice-shop.herokuapp.com</h1>
+<div class="meta">Dipindai: 2026-09-19T09:50:45Z | Aset: 0 JS, 0 sourcemap | Rute diverifikasi: 0</div>
+<div class="meta" id="counts"></div>
+<div class="bar">
+ <input id="q" placeholder="cari value/context/asset..." size="36">
+ <select id="sev"><option value="">Semua Severity</option></select>
+ <select id="typ"><option value="">Semua Type</option></select>
+</div>
+<table><thead><tr><th>Severity</th><th>Type</th><th>Value</th><th>Context</th><th>Asset</th><th>HTTP</th><th>Catatan</th></tr></thead>
+<tbody id="tb"></tbody></table>
+<script>
+var DATA = null;
+var tb=document.getElementById('tb'),q=document.getElementById('q'),
+    sev=document.getElementById('sev'),typ=document.getElementById('typ');
+function uniq(arr){var s={},o=[];for(var i=0;i<arr.length;i++){if(!s[arr[i]]){s[arr[i]]=1;o.push(arr[i]);}}return o;}
+var sevs=uniq(DATA.map(function(f){return f.severity;}));
+var typs=uniq(DATA.map(function(f){return f.type;}));
+for(var i=0;i<sevs.length;i++){sev.add(new Option(sevs[i],sevs[i]));}
+for(var i=0;i<typs.length;i++){typ.add(new Option(typs[i],typs[i]));}
+function esc(x){var d=document.createElement('div');d.textContent=x||'';return d.innerHTML;}
+function render(){
+ var s=q.value.toLowerCase(),sv=sev.value,ty=typ.value;
+ var rows=DATA.filter(function(f){
+   return (!sv||f.severity===sv)&&(!ty||f.type===ty)&&
+     (!s||((f.value||'')+(f.context||'')+(f.asset||'')).toLowerCase().indexOf(s)>=0);
+ });
+ tb.innerHTML=rows.map(function(f){
+   return '<tr><td class="'+f.severity+'">'+f.severity+'</td><td>'+f.type+'</td>'+
+     '<td>'+esc(f.value)+'</td><td>'+esc(f.context||'')+'</td><td>'+esc(f.asset||'')+'</td>'+
+     '<td>'+(f.http_status||'')+'</td><td>'+esc(f.verified||'')+'</td></tr>';
+ }).join('');
+ var c={};
+ for(var i=0;i<rows.length;i++){c[rows[i].severity]=(c[rows[i].severity]||0)+1;}
+ var parts=[];
+ for(var k in c){parts.push('<span class="cnt '+k+'">'+k+': '+c[k]+'</span>');}
+ document.getElementById('counts').innerHTML=parts.join('')+'<span class="cnt">total: '+rows.length+'</span>';
+}
+q.oninput=render;sev.onchange=render;typ.onchange=render;render();
+</script></body></html>
