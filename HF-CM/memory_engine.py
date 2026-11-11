@@ -273,13 +273,19 @@ class MemoryEngine:
         if retrieval.selected_key_id:
             if retrieval.selected_key_id == current_active_id:
                 # [FIX] Anti-Stickiness Protection (Blueprint XXXIV)
-                # Jika skor token dan deskripsi hampir nol, tapi input punya banyak token baru,
-                # maka ini adalah topik baru yang eksplisit (misal: C++), JANGAN dipaksa masuk topik lama.
+                # Jika skor token dan deskripsi hampir nol, kita harus membedakan antara
+                # "pertanyaan lanjutan" (misal: "Modalnya cukup?") dan "topik baru eksplisit" (misal: "Ajarkan C++.").
+                # Dalam PoC leksikal murni, kita menggunakan heuristik tanda baca dan kepadatan token.
                 top_candidate = next((c for c in retrieval.candidates if c.key_id == current_active_id), None)
                 if top_candidate and top_candidate.token_score < 0.1 and top_candidate.description_score < 0.1:
                     raw_tokens = re.findall(r'\b\w+\b', envelope.raw_text.lower())
                     new_tokens = [t for t in raw_tokens if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH]
-                    if len(new_tokens) >= 3:
+                    
+                    is_question = envelope.raw_text.strip().endswith("?")
+                    
+                    # Jika ini adalah pernyataan/perintah substansial (bukan pertanyaan) dengan banyak token baru,
+                    # maka ini adalah topik baru. Jangan biarkan continuity memaksanya masuk topik lama.
+                    if not is_question and len(new_tokens) >= 4:
                         classification = MemoryClassification.NEW_TOPIC
                     else:
                         classification = MemoryClassification.CONTINUE_TOPIC
