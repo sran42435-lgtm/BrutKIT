@@ -59,6 +59,7 @@ class SignalExtractor:
         "besok": "TOMORROW",
         "minggu lalu": "LAST_WEEK",
         "bulan lalu": "LAST_MONTH",
+        "tahun lalu": "LAST_YEAR", # [NEW] Review Kedua
         "tadi": "EARLIER_TODAY",
         "pagi": "MORNING",
         "siang": "AFTERNOON",
@@ -82,6 +83,22 @@ class SignalExtractor:
         for keyword, signal_type in self._TEMPORAL_KEYWORDS.items():
             if keyword in text_lower:
                 temporal_signals.append(signal_type)
+
+        # [NEW] 2b. Specific Hour Detection (pukul 15:00, jam 3 sore, 15.30)
+        hour_patterns = [
+            r'pukul\s+(\d{1,2})(?::(\d{2}))?',
+            r'jam\s+(\d{1,2})(?::(\d{2}))?',
+            r'(\d{1,2})\.(\d{2})'
+        ]
+        for pattern in hour_patterns:
+            matches = re.finditer(pattern, text_lower)
+            for match in matches:
+                hour = int(match.group(1))
+                minute = int(match.group(2)) if match.group(2) else 0
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    if ("sore" in text_lower or "malam" in text_lower) and hour < 12: 
+                        hour += 12
+                    temporal_signals.append(f"HOUR_{hour:02d}_{minute:02d}")
 
         # 3. Unique Terms (untuk matching)
         unique_terms = list(set(normalized_tokens))
@@ -125,19 +142,22 @@ class TemporalResolver:
         if not signals:
             return None
 
+        tz_info = ref_time.tzinfo
+        start, end = None, None
+
         # Prioritas sinyal (jika ada banyak, ambil yang paling spesifik)
-        # Urutan prioritas: TIME > DAY > WEEK > MONTH
+        # Urutan prioritas: TIME > DAY > WEEK > MONTH > YEAR
         if "YESTERDAY" in signals:
             target = ref_time - timedelta(days=1)
-            return self._get_day_range(target)
+            start, end = self._get_day_range(target, tz_info)
             
         elif "TODAY" in signals or "EARLIER_TODAY" in signals:
-            return self._get_day_range(ref_time)
+            start, end = self._get_day_range(ref_time, tz_info)
             
         elif "LAST_WEEK" in signals:
             # Minggu lalu (Senin - Minggu)
             target = ref_time - timedelta(weeks=1)
-            return self._get_week_range(target)
+            start, end = self._get_week_range(target, tz_info)
             
         elif "LAST_MONTH" in signals:
             # Bulan lalu
@@ -146,26 +166,54 @@ class TemporalResolver:
             if target_month == 0:
                 target_month = 12
                 target_year -= 1
-            return self._get_month_range(target_year, target_month)
+            start, end = self._get_month_range(target_year, target_month, tz_info)
+
+        elif "LAST_YEAR" in signals:
+            # [NEW] Tahun lalu
+            target_year = ref_time.year - 1
+            start, end = self._get_year_range(target_year, tz_info)
+
+        if start and end:
+            # [NEW] Specific Hour Narrowing
+            for sig in signals:
+                if sig.startswith("HOUR_"):
+                    parts = sig.split("_")
+                    target_hour = int(parts[1])
+                    tolerance = CONFIG.temporal.TEMPORAL_HOUR_TOLERANCE
+                    
+                    start_h = max(0, target_hour - tolerance)
+                    end_h = min(23, target_hour + tolerance)
+                    
+                    start = start.replace(hour=start_h, minute=0, second=0, microsecond=0)
+                    end = end.replace(hour=end_h, minute=59, second=59, microsecond=999999)
+                    
+            return start, end
 
         return None
 
-    def _get_day_range(self, dt: datetime) -> Tuple[datetime, datetime]:
-        start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    def _get_day_range(self, dt: datetime, tz_info) -> Tuple[datetime, datetime]:
+        start = dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=tz_info)
+        end = dt.replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=tz_info)
         return start, end
 
-    def _get_week_range(self, dt: datetime) -> Tuple[datetime, datetime]:
+    def _get_week_range(self, dt: datetime, tz_info) -> Tuple[datetime, datetime]:
         # Asumsi minggu mulai Senin (0)
         start = dt - timedelta(days=dt.weekday())
-        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = start.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=tz_info)
         end = start + timedelta(days=6, hours=23, minutes=59, seconds=59)
         return start, end
 
-    def _get_month_range(self, year: int, month: int) -> Tuple[datetime, datetime]:
-        start = datetime(year, month, 1)
+    def _get_month_range(self, year: int, month: int, tz_info) -> Tuple[datetime, datetime]:
+        # [FIX] Bug timezone-aware datetime
+        start = datetime(year, month, 1, tzinfo=tz_info)
         last_day = calendar.monthrange(year, month)[1]
-        end = datetime(year, month, last_day, 23, 59, 59)
+        end = datetime(year, month, last_day, 23, 59, 59, tzinfo=tz_info)
+        return start, end
+
+    def _get_year_range(self, year: int, tz_info) -> Tuple[datetime, datetime]:
+        # [NEW] Tahun lalu range
+        start = datetime(year, 1, 1, tzinfo=tz_info)
+        end = datetime(year, 12, 31, 23, 59, 59, tzinfo=tz_info)
         return start, end
 
 # ==========================================
@@ -180,11 +228,12 @@ class TopicKeyScorer:
         key: TopicKey, 
         is_active_topic: bool,
         continuity_score: float,
-        cross_session_score: float = 0.0 # [NEW] Bukti lintas sesi (Layer 16/Graph)
+        cross_session_score: float = 0.0, # [NEW] Bukti lintas sesi (Layer 16/Graph)
+        global_token_counts: Optional[dict] = None # [NEW] Untuk Unique Token Evidence
     ) -> CandidateScore:
         """
         Menghitung skor komposit.
-        Rumus: S = (T * W) + (D * W) + (C * W) + (Cont * W) + (U * W) + (X * W)
+        Rumus: S = (T * W) + (D * W) + (C * W) + (Cont * W) + (Temp * W) + (U * W) + (X * W)
         """
         if not signal.unique_terms:
             return CandidateScore(key_id=key.key_id, title=key.title, final_score=0.0)
@@ -192,23 +241,23 @@ class TopicKeyScorer:
         signal_tokens = set(signal.unique_terms)
 
         # A. Token Score (Query Recall)
-        # Mengubah dari Jaccard (intersection/union) menjadi Query Recall (intersection/query_len).
         key_tokens = set(key.token_profile.keys())
         intersection = signal_tokens.intersection(key_tokens)
         token_score = len(intersection) / len(signal_tokens) if signal_tokens else 0.0
 
         # B. Description Score
-        # Cek apakah ada token sinyal yang muncul di deskripsi (bantuan semantik)
-        desc_lower = key.helper_description.lower()
-        desc_matches = sum(1 for t in signal_tokens if t in desc_lower)
-        # Normalisasi: jika ada minimal 1 kata kunci utama cocok, skor tinggi
-        description_score = 1.0 if desc_matches > 0 else 0.0
+        # [FIX] Hitung rasio irisan token deskripsi agar tidak bias pada kata umum seperti "kopi"
+        desc_tokens = set(re.findall(r'\b\w+\b', key.helper_description.lower()))
+        desc_tokens = {t for t in desc_tokens if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
+        if desc_tokens:
+            desc_intersection = signal_tokens.intersection(desc_tokens)
+            description_score = len(desc_intersection) / len(desc_tokens)
+        else:
+            description_score = 0.0
 
         # C. Co-occurrence Score
-        # [NEW] Cek profil co-occurrence (pasangan kata dan kata individual)
         cooc_score = 0.0
         if key.co_occurrence_profile:
-            # Cek pasangan (pairs)
             matched_pairs = 0
             total_pairs = len(signal.co_occurrence_signals)
             for pair in signal.co_occurrence_signals:
@@ -218,31 +267,40 @@ class TopicKeyScorer:
             if total_pairs > 0:
                 cooc_score = matched_pairs / total_pairs
             else:
-                # Fallback ke token individual jika tidak ada pasangan
                 total_weight = sum(key.co_occurrence_profile.values())
                 matched_weight = sum(key.co_occurrence_profile.get(t, 0) for t in signal_tokens)
                 if total_weight > 0:
                     cooc_score = matched_weight / total_weight
 
         # D. Continuity Score
-        # Bonus jika ini adalah topik yang sedang aktif dan stabil
         cont_score = continuity_score if is_active_topic else 0.0
         
-        # [NEW] U. Unique Token Evidence (Bonus untuk token unik yang cocok)
-        unique_score = token_score 
+        # E. Temporal Score (Indikator sederhana adanya sinyal waktu)
+        temporal_score = 1.0 if signal.temporal_signals else 0.0
+        
+        # [NEW] U. Unique Token Evidence (IDF-like rarity)
+        unique_score = 0.0
+        if global_token_counts and signal_tokens:
+            rarity_sum = 0.0
+            for t in signal_tokens:
+                global_freq = global_token_counts.get(t, 0)
+                # Inverse frequency: rarer tokens get higher score
+                rarity_sum += 1.0 / (global_freq + 1.0)
+            unique_score = min(1.0, rarity_sum / len(signal_tokens))
         
         # [NEW] X. Cross-session Evidence
         x_score = cross_session_score
 
-        # E. Hitung Final Score (Weighted Sum)
+        # F. Hitung Final Score (Weighted Sum)
         w = CONFIG.activation
         final = (
             (token_score * w.TOKEN_WEIGHT) +
             (description_score * w.DESCRIPTION_WEIGHT) +
             (cooc_score * w.CO_OCCURRENCE_WEIGHT) +
             (cont_score * w.CONTINUITY_WEIGHT) +
-            (unique_score * 0.05) + # [NEW] Bobot U
-            (x_score * 0.05)        # [NEW] Bobot X
+            (temporal_score * w.TEMPORAL_WEIGHT) +
+            (unique_score * w.UNIQUE_TOKEN_WEIGHT) +
+            (x_score * w.CROSS_SESSION_WEIGHT)
         )
 
         return CandidateScore(
@@ -252,6 +310,9 @@ class TopicKeyScorer:
             description_score=description_score,
             co_occurrence_score=cooc_score,
             continuity_score=cont_score,
+            temporal_score=temporal_score,
+            unique_token_score=unique_score,
+            cross_session_score=x_score,
             final_score=final
         )
 
@@ -275,7 +336,9 @@ class RetrievalEngine:
         fragments: List[FragmentMetadata],
         reference_time: datetime,
         active_topic_id: Optional[str] = None,
-        continuity_score: float = 0.0
+        continuity_score: float = 0.0,
+        global_token_counts: Optional[dict] = None, # [NEW] Untuk Unique Token Evidence
+        cross_session_evidence: Optional[dict] = None # [NEW] topic_id -> score
     ) -> RetrievalResult:
         """
         Alur Retrieval Lengkap:
@@ -283,7 +346,7 @@ class RetrievalEngine:
         2. Score Keys
         3. Check Ambiguity
         4. Temporal Disambiguation (jika perlu)
-        5. Select Fragments
+        5. Select Fragments (Fragment-Level Ranking)
         """
         
         # 1. Extract Signal
@@ -298,11 +361,15 @@ class RetrievalEngine:
         candidates = []
         key_map = {k.key_id: k for k in keys} # [NEW] Untuk deskripsi klarifikasi
         
+        if cross_session_evidence is None:
+            cross_session_evidence = {}
+
         for key in keys:
             is_active = (key.key_id == active_topic_id)
-            # [NEW] Cross session score placeholder (bisa diisi dari graph evidence nanti)
-            x_score = 0.0 
-            score = self.scorer.score(signal, key, is_active, continuity_score, x_score)
+            x_score = cross_session_evidence.get(key.key_id, 0.0)
+            score = self.scorer.score(
+                signal, key, is_active, continuity_score, x_score, global_token_counts
+            )
             if score.final_score >= CONFIG.decision.MINIMUM_RETRIEVAL_SCORE:
                 candidates.append(score)
 
@@ -322,7 +389,13 @@ class RetrievalEngine:
         notes = f"Top: {top_candidate.title} ({top_candidate.final_score:.2f})"
         clarification_message = ""
 
-        if second_candidate:
+        # [FIX] Penegakan MIN_TOPIC_ACTIVATION_SCORE (Mencegah AMBIGUOUS pada skor yang terlalu lemah)
+        if top_candidate.final_score < CONFIG.decision.MIN_TOPIC_ACTIVATION_SCORE:
+            decision_type = DecisionType.NO_MATCH
+            selected_key_id = None
+            notes = "Skor kandidat tertinggi terlalu lemah (di bawah MIN_TOPIC_ACTIVATION_SCORE)."
+            clarification_message = ""
+        elif second_candidate:
             margin = top_candidate.final_score - second_candidate.final_score
             if margin < CONFIG.decision.AMBIGUITY_MARGIN:
                 decision_type = DecisionType.AMBIGUOUS
@@ -338,11 +411,9 @@ class RetrievalEngine:
                 clarification_message = "\n".join(msg_parts)
 
         # 4. Temporal Disambiguation (Layer 6)
-        # Jika AMBIGU tapi ada sinyal waktu, coba gunakan waktu untuk memecah kebuntuan
         temporal_range = self.temporal_resolver.resolve(signal.temporal_signals, reference_time)
         
         if decision_type == DecisionType.AMBIGUOUS and temporal_range:
-            # Cek kandidat mana yang memiliki fragment di rentang waktu tersebut
             resolved_key_id = self._try_temporal_resolution(
                 candidates, fragments, temporal_range
             )
@@ -356,7 +427,7 @@ class RetrievalEngine:
         selected_fragments = []
         if decision_type == DecisionType.CLEAR and selected_key_id:
             selected_fragments = self._select_fragments(
-                selected_key_id, fragments, temporal_range
+                selected_key_id, fragments, temporal_range, signal, reference_time
             )
 
         return RetrievalResult(
@@ -380,6 +451,7 @@ class RetrievalEngine:
         yang cocok dengan constraint waktu.
         """
         start_t, end_t = time_range
+        ref_tz = start_t.tzinfo # [FIX] Ambil timezone dari range
         matches_per_key = {}
 
         for cand in candidates:
@@ -387,8 +459,13 @@ class RetrievalEngine:
             key_frags = [f for f in fragments if f.topic_key_id == cand.key_id]
             match_count = 0
             for f in key_frags:
-                if f.temporal_index and (start_t <= f.temporal_index <= end_t):
-                    match_count += 1
+                if f.temporal_index:
+                    t_idx = f.temporal_index
+                    # [FIX] Normalisasi timezone (SQLite mengembalikan naive datetime)
+                    if t_idx.tzinfo is None:
+                        t_idx = t_idx.replace(tzinfo=ref_tz)
+                    if start_t <= t_idx <= end_t:
+                        match_count += 1
             matches_per_key[cand.key_id] = match_count
 
         # Cari key dengan match terbanyak
@@ -412,28 +489,68 @@ class RetrievalEngine:
         self, 
         key_id: str, 
         fragments: List[FragmentMetadata],
-        time_range: Optional[Tuple[datetime, datetime]]
+        time_range: Optional[Tuple[datetime, datetime]],
+        signal: SignalProfile, # [NEW] Untuk fragment relevance scoring
+        reference_time: datetime # [NEW] Untuk recency scoring
     ) -> List[str]:
-        """Memilih ID fragment terbaik untuk key yang terpilih."""
+        """
+        [OVERHAUL] Fragment-Level Ranking (Review Kedua).
+        Memilih ID fragment terbaik berdasarkan relevansi, bukan hanya waktu terbaru.
+        """
         key_frags = [f for f in fragments if f.topic_key_id == key_id]
         
-        # Filter Temporal jika ada
+        # Filter Temporal ketat jika ada constraint waktu
         if time_range:
             start_t, end_t = time_range
-            key_frags = [
-                f for f in key_frags 
-                if f.temporal_index and (start_t <= f.temporal_index <= end_t)
-            ]
+            ref_tz = start_t.tzinfo
+            filtered_frags = []
+            for f in key_frags:
+                if f.temporal_index:
+                    t_idx = f.temporal_index
+                    # [FIX] Normalisasi timezone
+                    if t_idx.tzinfo is None:
+                        t_idx = t_idx.replace(tzinfo=ref_tz)
+                    if start_t <= t_idx <= end_t:
+                        filtered_frags.append(f)
+            key_frags = filtered_frags
         
-        # Jika filter waktu terlalu ketat dan hasil kosong, fallback ke fragment terbaru?
-        # Aturan Fail-Closed: Jika user minta "kemarin" dan tidak ada data "kemarin",
-        # jangan berikan data "hari ini" secara diam-diam. Return kosong.
+        # Aturan Fail-Closed: Jika user minta "kemarin" dan tidak ada data "kemarin", return kosong.
         if time_range and not key_frags:
             return []
 
-        # Sort by time (terbaru dulu) atau relevansi
-        key_frags.sort(key=lambda x: x.created_at, reverse=True)
+        # Fragment-Level Ranking Calculation
+        ranked_frags = []
+        w_frag = CONFIG.fragment_ranking
+        
+        for f in key_frags:
+            # 1. Token/Co-occurrence Relevance (Proxy via relationship_strength dari Graph)
+            frag_semantic_score = f.relationship_strength 
+            
+            # 2. Temporal Match (Sudah difilter di atas, tapi bisa diberi bobot tambahan jika exact match)
+            frag_temporal_score = 1.0 if time_range else 0.5
+            
+            # 3. Recency (Decay berdasarkan umur fragment)
+            frag_recency_score = 0.0
+            if reference_time and f.created_at:
+                created_at = f.created_at
+                # [FIX] Normalisasi timezone
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=reference_time.tzinfo)
+                # Normalisasi age: newer = higher score (decay 30 hari)
+                age_hours = max(0, (reference_time - created_at).total_seconds() / 3600.0)
+                frag_recency_score = max(0.0, 1.0 - (age_hours / 720.0)) 
+                
+            relevance = (
+                (frag_semantic_score * w_frag.FRAGMENT_TOKEN_WEIGHT) +
+                (frag_semantic_score * w_frag.FRAGMENT_COOC_WEIGHT) +
+                (frag_temporal_score * w_frag.FRAGMENT_TEMPORAL_WEIGHT) +
+                (frag_recency_score * w_frag.FRAGMENT_RECENCY_WEIGHT)
+            )
+            ranked_frags.append((f.fragment_id, relevance))
+            
+        # Sort by relevance descending
+        ranked_frags.sort(key=lambda x: x[1], reverse=True)
         
         # Ambil maksimal N fragment
         limit = CONFIG.retrieval.MAX_RETRIEVED_FRAGMENTS
-        return [f.fragment_id for f in key_frags[:limit]]
+        return [fid for fid, score in ranked_frags[:limit]]

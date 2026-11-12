@@ -30,6 +30,8 @@ class DecisionType(str, Enum):
 class MemoryClassification(str, Enum):
     CONTINUE_TOPIC = "CONTINUE_TOPIC"   # Melanjutkan Topic Key aktif
     NEW_TOPIC = "NEW_TOPIC"             # Membentuk cluster topik baru
+    # [NEW] Ditambahkan untuk mendukung skenario reaktivasi (Coffee -> C++ -> Coffee)
+    REACTIVATE_TOPIC = "REACTIVATE_TOPIC" 
     CLARIFICATION_ONLY = "CLARIFICATION_ONLY" # Hanya kontrol state, tidak masuk memori besar
     DISCARD = "DISCARD"                 # Tidak layak disimpan (noise)
 
@@ -38,6 +40,13 @@ class RelationshipType(str, Enum):
     RELATED_TO = "RELATED_TO"
     REFERENCES = "REFERENCES"
     CROSS_SESSION_LINK = "CROSS_SESSION_LINK"
+
+# [NEW] Enum untuk observabilitas rekonstruksi memori (Review Kedua)
+class ReconstructionStatus(str, Enum):
+    FULL_SUCCESS = "FULL_SUCCESS"       # Semua fragment berhasil didekompresi
+    PARTIAL_SUCCESS = "PARTIAL_SUCCESS" # Sebagian fragment gagal (korup/hilang), sebagian berhasil
+    FAILED = "FAILED"                   # Tidak ada memori yang berhasil direkonstruksi
+    NO_MEMORY_REQUESTED = "NO_MEMORY_REQUESTED" # Tidak ada permintaan memori
 
 # ==========================================
 # LAYER 1: INPUT GATE
@@ -99,6 +108,9 @@ class CandidateScore(BaseModel):
     co_occurrence_score: float = 0.0
     continuity_score: float = 0.0
     temporal_score: float = 0.0
+    # [NEW] Skor tambahan untuk Unique Token dan Cross-Session Evidence
+    unique_token_score: float = 0.0
+    cross_session_score: float = 0.0
     final_score: float = 0.0
 
 # ==========================================
@@ -120,6 +132,8 @@ class FragmentMetadata(BaseModel):
     sequence_index: int = 0
     source_fragment_ids: list[str] = Field(default_factory=list)
     relationship_strength: float = 0.0
+    # [NEW] Skor relevansi fragment terhadap query saat ini (untuk Fragment-Level Ranking)
+    relevance_score: float = 0.0
 
 class CompressedPayload(BaseModel):
     """Memori besar yang dikompresi lossless."""
@@ -206,3 +220,5 @@ class EngineResult(BaseModel):
     retrieved_memory_ids: list[str] = Field(default_factory=list)
     active_topic_key_id: Optional[str] = None
     persistence_status: str = "SUCCESS" # SUCCESS, FAILED, SKIPPED
+    # [NEW] Status observabilitas rekonstruksi memori persis (Review Kedua)
+    reconstruction_status: ReconstructionStatus = ReconstructionStatus.NO_MEMORY_REQUESTED

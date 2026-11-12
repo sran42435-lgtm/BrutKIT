@@ -15,6 +15,7 @@ PRINSIP:
 """
 
 import logging
+import re
 import time
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -65,6 +66,10 @@ class FakeLLMClient(BaseLLMClient):
     Klien simulasi untuk Integration Testing.
     Tidak memanggil API eksternal. Ia membaca ModelRequest dan merakit respons 
     deterministik untuk MEMBUKTIKAN bahwa injeksi memori persis berhasil dilakukan.
+    
+    [FIX ARSITEKTURAL] FakeLLM kini mengekstrak topic_title dari XML tag di past_memory
+    dan menyebatkannya ke dalam respons. Ini mensimulasikan LLM asli yang context-aware,
+    sehingga Turn Analysis (Layer 11) dapat mendeteksi overlap dari respons AI.
     """
     
     def generate(self, request: ModelRequest) -> ModelResponse:
@@ -74,10 +79,14 @@ class FakeLLMClient(BaseLLMClient):
         prompt_tokens = len(request.system_context) // 4 + len(request.past_memory) // 4 + len(request.current_user_message) // 4
         
         # Logika Echo untuk membuktikan Context Injection berhasil
-        if request.past_memory and "<past_memories>" in request.past_memory:
-            # AI "pura-pura" membaca memori dan merangkumnya
+        if request.past_memory and "<past_memories" in request.past_memory:
+            # Ekstrak topic_title dari XML tag (misal: <past_memories topic="Bisnis Kopi">)
+            topic_match = re.search(r'topic="([^"]+)"', request.past_memory)
+            topic_context = topic_match.group(1) if topic_match else "masa lalu"
+            
+            # AI "pura-pura" membaca memori dan merangkumnya dengan menyebut topik
             response_text = (
-                f"[FAKE AI RESPONSE] Berdasarkan catatan masa lalu yang Anda berikan, "
+                f"[FAKE AI RESPONSE] Berdasarkan catatan {topic_context} yang Anda berikan, "
                 f"saya melihat ada memori persis yang diinjeksikan. "
                 f"Menjawab pertanyaan terbaru Anda: '{request.current_user_message}'"
             )

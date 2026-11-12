@@ -30,11 +30,16 @@ class SignalConstants:
 @dataclass(frozen=True)
 class ActivationWeights:
     """Bobot untuk scoring Topic Key (Layer 4)."""
-    TOKEN_WEIGHT: Final[float] = 0.25
-    DESCRIPTION_WEIGHT: Final[float] = 0.20
+    # [UPDATED] Bobot disesuaikan agar total = 1.0 dengan penambahan Unique & Cross-Session
+    TOKEN_WEIGHT: Final[float] = 0.20
+    DESCRIPTION_WEIGHT: Final[float] = 0.15
     CO_OCCURRENCE_WEIGHT: Final[float] = 0.15
-    CONTINUITY_WEIGHT: Final[float] = 0.40
-    TEMPORAL_WEIGHT: Final[float] = 0.00
+    CONTINUITY_WEIGHT: Final[float] = 0.20
+    TEMPORAL_WEIGHT: Final[float] = 0.10
+    # [NEW] Bobot untuk kelangkaan token global (IDF-like)
+    UNIQUE_TOKEN_WEIGHT: Final[float] = 0.10
+    # [NEW] Bobot untuk bukti lintas sesi dari Graph
+    CROSS_SESSION_WEIGHT: Final[float] = 0.10
 
 @dataclass(frozen=True)
 class DecisionThresholds:
@@ -108,11 +113,23 @@ class TopicSwitchConstants:
     MIN_ACTIVE_TOPIC_OVERLAP: Final[float] = 0.15
     TOPIC_SWITCH_THRESHOLD: Final[float] = 0.60
 
+# [NEW] Class baru untuk Fragment-Level Ranking (Review Kedua)
+@dataclass(frozen=True)
+class FragmentRankingConstants:
+    """Bobot dan batas untuk menentukan fragment mana yang paling relevan di dalam satu Topic Key."""
+    FRAGMENT_TOKEN_WEIGHT: Final[float] = 0.40
+    FRAGMENT_COOC_WEIGHT: Final[float] = 0.20
+    FRAGMENT_TEMPORAL_WEIGHT: Final[float] = 0.20
+    FRAGMENT_RECENCY_WEIGHT: Final[float] = 0.20
+    MIN_FRAGMENT_RELEVANCE_SCORE: Final[float] = 0.10
+
 @dataclass(frozen=True)
 class GraphConstants:
     EDGE_CREATION_THRESHOLD: Final[float] = 0.80
     MAX_EDGES_PER_NODE: Final[int] = 20
     MIN_RELATIONSHIP_CONFIDENCE: Final[float] = 0.75
+    # [NEW] Batas minimum skor graph untuk cross-session reactivation
+    MIN_CROSS_SESSION_SCORE: Final[float] = 0.30
 
 @dataclass(frozen=True)
 class StorageConstants:
@@ -136,6 +153,7 @@ class HF_CMConfig:
     llm: Final[LLMConstants] = LLMConstants()
     continuity: Final[ContinuityConstants] = ContinuityConstants()
     topic_switch: Final[TopicSwitchConstants] = TopicSwitchConstants() # [NEW]
+    fragment_ranking: Final[FragmentRankingConstants] = FragmentRankingConstants() # [NEW]
     graph: Final[GraphConstants] = GraphConstants()
     storage: Final[StorageConstants] = StorageConstants()
 

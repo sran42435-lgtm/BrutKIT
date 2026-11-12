@@ -186,6 +186,22 @@ class MemoryStorage:
     # OPERASI PENYIMPANAN (WRITE)
     # ==========================================
     
+    def ensure_session_exists(self, session_id: str, created_at: datetime):
+        """[NEW] Menjamin entitas Session ada sebelum Fragment disimpan (Lifecycle)."""
+        with self.SessionLocal() as session:
+            existing = session.query(SessionDB).filter_by(id=session_id).first()
+            if not existing:
+                new_session = SessionDB(
+                    id=session_id,
+                    created_at=created_at,
+                    last_active_at=created_at
+                )
+                session.add(new_session)
+                session.commit()
+            else:
+                existing.last_active_at = created_at
+                session.commit()
+
     def save_topic_key(self, session: Session, key: models.TopicKey):
         db_obj = TopicKeyDB(
             id=key.key_id, 
@@ -508,3 +524,37 @@ class MemoryStorage:
                     status=k.status
                 ) for k in db_keys
             ]
+
+    # ==========================================
+    # GLOBAL OPERATIONS (Review Kedua)
+    # ==========================================
+
+    def get_global_active_pendings(self) -> List[models.PendingState]:
+        """[NEW] Mengambil semua Pending State ACTIVE lintas sesi untuk Cross-Session Resolution."""
+        with self.SessionLocal() as session:
+            db_pendings = session.query(PendingStateDB).filter(
+                PendingStateDB.status == models.PendingStatus.ACTIVE.value
+            ).order_by(PendingStateDB.created_at.desc()).all()
+            
+            return [
+                models.PendingState(
+                    pending_id=p.id, session_id=p.session_id,
+                    original_input=p.original_input, candidate_keys=p.candidate_keys,
+                    candidate_scores=p.candidate_scores, assistant_question=p.assistant_question,
+                    clarification_round=p.clarification_round, created_at=p.created_at,
+                    last_updated_at=p.last_updated_at,
+                    status=models.PendingStatus(p.status), temporal_reference=p.temporal_reference,
+                    origin_session_id=p.origin_session_id
+                ) for p in db_pendings
+            ]
+
+    def get_global_token_counts(self) -> dict:
+        """[NEW] Menghitung frekuensi global token di seluruh Topic Key aktif (untuk Unique Token Evidence)."""
+        with self.SessionLocal() as session:
+            db_keys = session.query(TopicKeyDB).filter_by(status="ACTIVE").all()
+            global_counts = {}
+            for k in db_keys:
+                if k.token_profile:
+                    for token, count in k.token_profile.items():
+                        global_counts[token] = global_counts.get(token, 0) + count
+            return global_counts

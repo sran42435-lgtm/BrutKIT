@@ -47,36 +47,22 @@ class ContextBuilder:
     ) -> ModelRequest:
         """
         Merakit konteks final untuk Model API.
-        
-        Args:
-            current_user_input: Teks mentah dari user saat ini.
-            exact_memories: List of dict berisi {'text': str, 'timestamp': str, 'fragment_id': str}
-            active_topic_title: Judul topik yang sedang aktif (untuk konteks tambahan).
-            system_instructions: Instruksi dasar untuk AI.
-            
-        Returns:
-            ModelRequest: Objek Pydantic yang siap dikirim ke llm_client.
         """
         
         # 1. Siapkan System Context
         sys_prompt = system_instructions or self._get_default_system_prompt()
         
-        # 2. Rakit dan Batasi Memori (Memory Budgeting)
-        past_memory_text = self._assemble_and_budget_memories(exact_memories, active_topic_title)
+        # [OVERHAUL] Hitung token yang sudah terpakai oleh System dan User Input (Review Kedua)
+        sys_tokens = self._estimate_tokens(sys_prompt)
+        user_tokens = self._estimate_tokens(current_user_input)
+        available_memory_tokens = max(0, self.max_context_tokens - sys_tokens - user_tokens)
         
-        # 3. Validasi Total Budget
-        total_tokens = self._estimate_tokens(sys_prompt) + \
-                       self._estimate_tokens(past_memory_text) + \
-                       self._estimate_tokens(current_user_input)
-                       
-        if total_tokens > self.max_context_tokens:
-            logger.warning(
-                f"Context Budget Terlampaui! Estimasi: {total_tokens} token. "
-                f"Batas: {self.max_context_tokens}. Memori akan dibuang (Fail-Safe)."
-            )
-            # Fallback darurat: Buang memori, prioritaskan prompt user saat ini
-            past_memory_text = "" 
-
+        # Batasi juga dengan MAX_MEMORY_TOKENS absolut
+        effective_memory_budget = min(self.max_memory_tokens, available_memory_tokens)
+        
+        # 2. Rakit dan Batasi Memori (Memory Budgeting)
+        past_memory_text = self._assemble_and_budget_memories(exact_memories, active_topic_title, effective_memory_budget)
+        
         # 4. Bungkus dalam ModelRequest
         return ModelRequest(
             system_context=sys_prompt,
@@ -87,7 +73,8 @@ class ContextBuilder:
     def _assemble_and_budget_memories(
         self, 
         memories: List[Dict], 
-        topic_title: Optional[str]
+        topic_title: Optional[str],
+        memory_budget: int
     ) -> str:
         """
         Menggabungkan fragmen memori dengan batas token dan jumlah fragmen.
@@ -96,12 +83,10 @@ class ContextBuilder:
         if not memories:
             return ""
 
-        # [NEW] Prioritas Fragment:
-        # 1. Exact temporal match (diasumsikan sudah di-filter engine)
-        # 2. Highest retrieval score (jika ada di dict)
-        # 3. Recency (timestamp)
+        # [OVERHAUL] Prioritas Fragment: Relevance Score -> Recency (Review Kedua)
         def sort_key(mem):
-            return mem.get('timestamp', '')
+            # Tuple sorting: relevance_score (desc), then timestamp (desc)
+            return (mem.get('relevance_score', 0.0), mem.get('timestamp', ''))
             
         memories = sorted(memories, key=sort_key, reverse=True)
 
@@ -111,7 +96,7 @@ class ContextBuilder:
         assembled_parts = []
         current_memory_tokens = 0
         
-        # Iterasi dari memori yang paling relevan/terbaru
+        # Iterasi dari memori yang paling relevan
         for mem in memories:
             text = mem.get('text', '')
             timestamp = mem.get('timestamp', 'Unknown')
@@ -119,10 +104,13 @@ class ContextBuilder:
             formatted_mem = f"[Waktu: {timestamp}]\n{text}"
             mem_tokens = self._estimate_tokens(formatted_mem)
             
-            # Jika menambahkan fragmen ini melebihi batas memori, hentikan.
-            # Aturan: Exact memory tidak boleh dipotong sembarangan (string slicing).
-            # Kita membuang seluruh fragmen (break) jika budget tidak cukup.
-            if current_memory_tokens + mem_tokens > self.max_memory_tokens:
+            # [OVERHAUL] Degradasi Budget: Hentikan jika budget habis, jangan buang semua
+            if current_memory_tokens + mem_tokens > memory_budget:
+                # Jika fragment pertama saja sudah melebihi budget, kita tidak bisa memasukkannya
+                # (Exact memory tidak boleh dipotong sembarangan / string slicing)
+                if not assembled_parts:
+                    logger.warning("Fragment tunggal melebihi sisa budget memori. Dilewati.")
+                    break
                 logger.info("Memory Token Budget tercapai. Fragmen sisa diabaikan.")
                 break
                 
