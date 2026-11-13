@@ -86,9 +86,11 @@ class MemoryEngine:
                 logger.info("PENDING STATE: Tidak relevan. Di-pause.")
                 active_pending = None 
         else:
-            # [CRITICAL FIX] Cross-Session Pending Resolution dengan RANKING
-            # Tidak lagi mengambil pending pertama yang cocok (first-match), 
-            # melainkan menghitung skor relevansi dan mengambil yang terbaik.
+            # [CRITICAL FIX] Cross-Session Pending Resolution dengan RANKING.
+            # Menggunakan SUMBER BUKTI YANG SAMA dengan jalur lokal (token_profile + helper_description),
+            # lalu di-gate oleh _check_pending_relevance dan di-ranking oleh _score_pending_relevance.
+            # Sebelumnya jalur ini memakai rumus terpisah yang lebih ketat sehingga pending
+            # lintas sesi tidak pernah ter-attach (Blueprint XXVII & XXVIII).
             global_pendings = self.storage.get_global_active_pendings()
             all_keys = self.storage.get_all_topic_keys()
             
@@ -96,24 +98,19 @@ class MemoryEngine:
             best_score = -1.0
             
             for gp in global_pendings:
-                if gp.session_id != session_id:
-                    raw_tokens = re.findall(r'\b\w+\b', envelope.raw_text.lower())
-                    new_tokens = {t for t in raw_tokens if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
+                if gp.session_id == session_id:
+                    continue
                     
-                    score = 0.0
-                    if not new_tokens:
-                        score = 0.5 # Short answer, assume somewhat relevant
-                    else:
-                        pending_tokens = set()
-                        for k in all_keys:
-                            if k.key_id in gp.candidate_keys:
-                                pending_tokens.update(k.token_profile.keys())
-                        overlap = len(new_tokens.intersection(pending_tokens))
-                        score = overlap / len(new_tokens) if new_tokens else 0.0
-                        
-                    if score >= CONFIG.fast_memory.PENDING_SWITCH_THRESHOLD and score > best_score:
-                        best_score = score
-                        best_pending = gp
+                # Gate: pakai aturan relevansi yang sama persis dengan pending lokal
+                if not self._check_pending_relevance(envelope, gp, all_keys=all_keys):
+                    continue
+                    
+                # Ranking: skor komposit dari bukti yang sama
+                score = self._score_pending_relevance(envelope, gp, all_keys=all_keys)
+                
+                if score > best_score:
+                    best_score = score
+                    best_pending = gp
                         
             if best_pending:
                 active_pending = best_pending
@@ -157,6 +154,7 @@ class MemoryEngine:
             active_pending.last_updated_at = ref_time
             with self.storage.transaction() as tx:
                 self.storage.save_pending_state(tx, active_pending)
+            logger.info(f"PENDING STATE: RESOLVED (pending_id={active_pending.pending_id[:8]}..., cross_session={is_cross_session_pending}).")
         
         # Handle Ambiguity (Layer 15)
         if decision.decision_type == DecisionType.AMBIGUOUS:
@@ -222,26 +220,88 @@ class MemoryEngine:
     # INTERNAL LOGIC & HELPERS
     # ==========================================
 
-    def _check_pending_relevance(self, envelope: InputEnvelope, pending: PendingState) -> bool:
+    def _extract_input_tokens(self, envelope: InputEnvelope) -> set:
         """
-        [OVERHAUL] Memeriksa relevansi pending.
-        Input pendek otomatis dianggap relevan. Input panjang dicek irisannya.
+        [NEW] Single source of truth untuk tokenisasi input user.
+        Dipakai oleh seluruh pemeriksaan relevansi pending agar tidak ada perbedaan bukti.
         """
         raw_tokens = re.findall(r'\b\w+\b', envelope.raw_text.lower())
-        new_tokens = {t for t in raw_tokens if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
+        return {t for t in raw_tokens if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
+
+    def _collect_pending_evidence_tokens(
+        self, 
+        pending: PendingState, 
+        all_keys: Optional[List[TopicKey]] = None
+    ) -> set:
+        """
+        [CRITICAL FIX] Single source of truth untuk bukti milik Pending State.
+        Menggabungkan TOKEN PROFILE + HELPER DESCRIPTION dari seluruh candidate keys.
         
-        # [FIX] Input pendek (< 3 token) seperti "Terserah", "Yang bisnis", otomatis relevan
-        if not new_tokens or len(new_tokens) < 3:
-            return True 
+        Sebelumnya jalur cross-session hanya memakai token_profile, sehingga bukti
+        lebih lemah daripada jalur lokal dan pending lintas sesi gagal di-resolve.
+        Sesuai Blueprint: pending harus dicocokkan dengan
+        candidate keys + helper descriptions + metadata.
+        """
+        if all_keys is None:
+            all_keys = self.storage.get_all_topic_keys()
             
-        all_keys = self.storage.get_all_topic_keys()
         pending_tokens = set()
         for k in all_keys:
             if k.key_id in pending.candidate_keys:
                 pending_tokens.update(k.token_profile.keys())
                 desc_words = re.findall(r'\b\w+\b', k.helper_description.lower())
                 pending_tokens.update(w for w in desc_words if len(w) >= CONFIG.signal.MIN_TOKEN_LENGTH)
-                
+        return pending_tokens
+
+    def _score_pending_relevance(
+        self, 
+        envelope: InputEnvelope, 
+        pending: PendingState,
+        all_keys: Optional[List[TopicKey]] = None
+    ) -> float:
+        """
+        [NEW] Skor komposit relevansi pending untuk keperluan RANKING antar pending.
+        Bukan untuk gating (gating dilakukan oleh _check_pending_relevance).
+        
+        Komponen:
+        - overlap_ratio : proporsi token input yang terjelaskan oleh bukti pending
+        - overlap_bonus : penguat absolut agar pending dengan bukti lebih kaya menang
+        """
+        new_tokens = self._extract_input_tokens(envelope)
+        
+        # Jawaban sangat pendek ("Yang bisnis", "Terserah") tetap dianggap mungkin relevan,
+        # tetapi diberi skor sedang agar tidak mengalahkan pending dengan bukti eksplisit kuat.
+        if not new_tokens or len(new_tokens) < 3:
+            return 0.5
+            
+        pending_tokens = self._collect_pending_evidence_tokens(pending, all_keys=all_keys)
+        overlap = new_tokens.intersection(pending_tokens)
+        
+        overlap_ratio = len(overlap) / len(new_tokens)
+        overlap_bonus = min(len(overlap), 5) * 0.01
+        
+        return overlap_ratio + overlap_bonus
+
+    def _check_pending_relevance(
+        self, 
+        envelope: InputEnvelope, 
+        pending: PendingState,
+        all_keys: Optional[List[TopicKey]] = None
+    ) -> bool:
+        """
+        [OVERHAUL] Memeriksa relevansi pending.
+        Input pendek otomatis dianggap relevan. Input panjang dicek irisannya.
+        
+        Kini memakai helper bersama sehingga jalur LOKAL dan CROSS-SESSION
+        menggunakan bukti yang identik (token_profile + helper_description).
+        """
+        new_tokens = self._extract_input_tokens(envelope)
+        
+        # [FIX] Input pendek (< 3 token) seperti "Terserah", "Yang bisnis", otomatis relevan
+        if not new_tokens or len(new_tokens) < 3:
+            return True 
+            
+        pending_tokens = self._collect_pending_evidence_tokens(pending, all_keys=all_keys)
         overlap = new_tokens.intersection(pending_tokens)
         
         # [FIX] Jika ada minimal 2 token yang beririsan, anggap relevan (menangani long clarification)
