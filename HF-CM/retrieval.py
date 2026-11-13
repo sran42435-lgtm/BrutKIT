@@ -447,12 +447,14 @@ class RetrievalEngine:
         time_range: Tuple[datetime, datetime]
     ) -> Optional[str]:
         """
-        Mencoba menyelesaikan ambiguitas dengan memeriksa fragment mana 
-        yang cocok dengan constraint waktu.
+        [CRITICAL FIX] Temporal Quality Scoring.
+        Tidak lagi hanya menghitung jumlah fragment (count-based).
+        Menggunakan base score kandidat + temporal match sebagai quality score.
         """
         start_t, end_t = time_range
         ref_tz = start_t.tzinfo # [FIX] Ambil timezone dari range
-        matches_per_key = {}
+        
+        key_scores = {}
 
         for cand in candidates:
             # Cari fragment milik key ini
@@ -466,22 +468,27 @@ class RetrievalEngine:
                         t_idx = t_idx.replace(tzinfo=ref_tz)
                     if start_t <= t_idx <= end_t:
                         match_count += 1
-            matches_per_key[cand.key_id] = match_count
+            
+            # Quality Score: Base final score + bonus jika ada fragment yang cocok secara waktu
+            # Ini memastikan key dengan base score tinggi tidak kalah hanya karena key lain punya lebih banyak fragment acak di waktu tersebut.
+            quality_score = cand.final_score + (match_count * 0.5)
+            key_scores[cand.key_id] = (quality_score, match_count)
 
-        # Cari key dengan match terbanyak
-        if not matches_per_key:
+        if not key_scores:
             return None
 
-        best_key = max(matches_per_key, key=matches_per_key.get)
-        best_count = matches_per_key[best_key]
-
+        # Urutkan berdasarkan quality score tertinggi
+        sorted_keys = sorted(key_scores.items(), key=lambda x: x[1][0], reverse=True)
+        best_key, (best_q_score, best_count) = sorted_keys[0]
+        
         # Hanya anggap resolved jika ada minimal 1 fragment yang cocok secara waktu
-        # DAN key lain tidak memiliki jumlah match yang sama (unik)
         if best_count > 0:
-            # Cek apakah ada pesaing dengan jumlah match yang sama
-            competitors = [k for k, v in matches_per_key.items() if v == best_count and k != best_key]
-            if not competitors:
-                return best_key
+            if len(sorted_keys) > 1:
+                second_best_key, (second_q_score, second_count) = sorted_keys[1]
+                # Jika quality score terlalu dekat, tetap anggap ambigu (Temporal Tie)
+                if abs(best_q_score - second_q_score) < CONFIG.decision.AMBIGUITY_MARGIN and second_count > 0:
+                    return None
+            return best_key
         
         return None
 
@@ -494,8 +501,9 @@ class RetrievalEngine:
         reference_time: datetime # [NEW] Untuk recency scoring
     ) -> List[str]:
         """
-        [OVERHAUL] Fragment-Level Ranking (Review Kedua).
-        Memilih ID fragment terbaik berdasarkan relevansi, bukan hanya waktu terbaru.
+        [CRITICAL FIX] True Fragment-Level Ranking (Review Kedua).
+        Memilih ID fragment terbaik berdasarkan relevansi query-to-fragment yang sesungguhnya,
+        membandingkan signal tokens dengan fragment's own token_profile.
         """
         key_frags = [f for f in fragments if f.topic_key_id == key_id]
         
@@ -521,15 +529,23 @@ class RetrievalEngine:
         # Fragment-Level Ranking Calculation
         ranked_frags = []
         w_frag = CONFIG.fragment_ranking
+        signal_tokens = set(signal.unique_terms)
         
         for f in key_frags:
-            # 1. Token/Co-occurrence Relevance (Proxy via relationship_strength dari Graph)
-            frag_semantic_score = f.relationship_strength 
+            # 1. TRUE Token Relevance (Query vs Fragment Token Profile)
+            frag_tokens = set(f.token_profile.keys()) if f.token_profile else set()
+            frag_token_score = len(signal_tokens.intersection(frag_tokens)) / len(signal_tokens) if signal_tokens else 0.0
             
-            # 2. Temporal Match (Sudah difilter di atas, tapi bisa diberi bobot tambahan jika exact match)
+            # 2. TRUE Co-occurrence Relevance (Query vs Fragment Co-occurrence Profile)
+            frag_cooc_score = 0.0
+            if f.co_occurrence_profile and signal.co_occurrence_signals:
+                matched_pairs = sum(1 for p in signal.co_occurrence_signals if p in f.co_occurrence_profile)
+                frag_cooc_score = matched_pairs / len(signal.co_occurrence_signals)
+            
+            # 3. Temporal Match (Sudah difilter di atas, tapi bisa diberi bobot tambahan jika exact match)
             frag_temporal_score = 1.0 if time_range else 0.5
             
-            # 3. Recency (Decay berdasarkan umur fragment)
+            # 4. Recency (Decay berdasarkan umur fragment)
             frag_recency_score = 0.0
             if reference_time and f.created_at:
                 created_at = f.created_at
@@ -541,8 +557,8 @@ class RetrievalEngine:
                 frag_recency_score = max(0.0, 1.0 - (age_hours / 720.0)) 
                 
             relevance = (
-                (frag_semantic_score * w_frag.FRAGMENT_TOKEN_WEIGHT) +
-                (frag_semantic_score * w_frag.FRAGMENT_COOC_WEIGHT) +
+                (frag_token_score * w_frag.FRAGMENT_TOKEN_WEIGHT) +
+                (frag_cooc_score * w_frag.FRAGMENT_COOC_WEIGHT) +
                 (frag_temporal_score * w_frag.FRAGMENT_TEMPORAL_WEIGHT) +
                 (frag_recency_score * w_frag.FRAGMENT_RECENCY_WEIGHT)
             )

@@ -82,6 +82,9 @@ class FragmentDB(Base):
     sequence_index = Column(Integer, default=0)
     source_fragment_ids = Column(JSON, default=list)
     relationship_strength = Column(Float, default=0.0)
+    # [CRITICAL FIX] True Fragment-Level Relevance Profiles
+    token_profile = Column(JSON, default=dict)
+    co_occurrence_profile = Column(JSON, default=dict)
     
     # Indexing untuk Temporal Filtering & Fast Retrieval (Spek Tinggi)
     __table_args__ = (
@@ -242,7 +245,9 @@ class MemoryStorage:
             content_hash=fragment.content_hash,
             sequence_index=fragment.sequence_index,
             source_fragment_ids=fragment.source_fragment_ids,
-            relationship_strength=fragment.relationship_strength
+            relationship_strength=fragment.relationship_strength,
+            token_profile=fragment.token_profile,
+            co_occurrence_profile=fragment.co_occurrence_profile
         )
         session.add(db_obj)
 
@@ -260,21 +265,32 @@ class MemoryStorage:
         session.add(db_obj)
 
     def save_pending_state(self, session: Session, pending: models.PendingState):
-        db_obj = PendingStateDB(
-            id=pending.pending_id, 
-            session_id=pending.session_id,
-            original_input=pending.original_input, 
-            candidate_keys=pending.candidate_keys,
-            candidate_scores=pending.candidate_scores, 
-            assistant_question=pending.assistant_question,
-            clarification_round=pending.clarification_round, 
-            created_at=pending.created_at,
-            last_updated_at=pending.last_updated_at,
-            status=pending.status.value, 
-            temporal_reference=pending.temporal_reference,
-            origin_session_id=pending.origin_session_id
-        )
-        session.merge(db_obj)
+        # [CRITICAL FIX] Menggunakan explicit query update untuk menghindari quirk session.merge() 
+        # pada objek detached lintas sesi (Cross-Session Pending Resolution).
+        existing = session.query(PendingStateDB).filter_by(id=pending.pending_id).first()
+        if existing:
+            existing.status = pending.status.value
+            existing.last_updated_at = pending.last_updated_at
+            existing.original_input = pending.original_input
+            existing.clarification_round = pending.clarification_round
+            existing.candidate_keys = pending.candidate_keys
+            existing.candidate_scores = pending.candidate_scores
+        else:
+            db_obj = PendingStateDB(
+                id=pending.pending_id, 
+                session_id=pending.session_id,
+                original_input=pending.original_input, 
+                candidate_keys=pending.candidate_keys,
+                candidate_scores=pending.candidate_scores, 
+                assistant_question=pending.assistant_question,
+                clarification_round=pending.clarification_round, 
+                created_at=pending.created_at,
+                last_updated_at=pending.last_updated_at,
+                status=pending.status.value, 
+                temporal_reference=pending.temporal_reference,
+                origin_session_id=pending.origin_session_id
+            )
+            session.add(db_obj)
 
     # ==========================================
     # OPERASI PEMBACAAN (READ)
@@ -384,7 +400,9 @@ class MemoryStorage:
                     content_hash=f.content_hash,
                     sequence_index=f.sequence_index or 0,
                     source_fragment_ids=f.source_fragment_ids or [],
-                    relationship_strength=f.relationship_strength or 0.0
+                    relationship_strength=f.relationship_strength or 0.0,
+                    token_profile=f.token_profile or {},
+                    co_occurrence_profile=f.co_occurrence_profile or {}
                 ) for f in db_frags
             ]
 
@@ -404,7 +422,9 @@ class MemoryStorage:
                 content_hash=f.content_hash,
                 sequence_index=f.sequence_index or 0,
                 source_fragment_ids=f.source_fragment_ids or [],
-                relationship_strength=f.relationship_strength or 0.0
+                relationship_strength=f.relationship_strength or 0.0,
+                token_profile=f.token_profile or {},
+                co_occurrence_profile=f.co_occurrence_profile or {}
             )
 
     def get_recent_fragments(self, session_id: str, limit: int = 10) -> List[models.FragmentMetadata]:
@@ -424,7 +444,9 @@ class MemoryStorage:
                     content_hash=f.content_hash,
                     sequence_index=f.sequence_index or 0,
                     source_fragment_ids=f.source_fragment_ids or [],
-                    relationship_strength=f.relationship_strength or 0.0
+                    relationship_strength=f.relationship_strength or 0.0,
+                    token_profile=f.token_profile or {},
+                    co_occurrence_profile=f.co_occurrence_profile or {}
                 ) for f in db_frags
             ]
 
@@ -481,7 +503,9 @@ class MemoryStorage:
                     content_hash=f.content_hash,
                     sequence_index=f.sequence_index or 0,
                     source_fragment_ids=f.source_fragment_ids or [],
-                    relationship_strength=f.relationship_strength or 0.0
+                    relationship_strength=f.relationship_strength or 0.0,
+                    token_profile=f.token_profile or {},
+                    co_occurrence_profile=f.co_occurrence_profile or {}
                 ) for f in db_frags
             ]
 
@@ -549,12 +573,17 @@ class MemoryStorage:
             ]
 
     def get_global_token_counts(self) -> dict:
-        """[NEW] Menghitung frekuensi global token di seluruh Topic Key aktif (untuk Unique Token Evidence)."""
+        """
+        [CRITICAL FIX] Menghitung Document Frequency (DF) global token.
+        Menghitung di berapa banyak Topic Key berbeda sebuah token muncul, 
+        BUKAN menjumlahkan total frekuensi kemunculannya. Ini adalah IDF yang benar.
+        """
         with self.SessionLocal() as session:
             db_keys = session.query(TopicKeyDB).filter_by(status="ACTIVE").all()
             global_counts = {}
             for k in db_keys:
                 if k.token_profile:
-                    for token, count in k.token_profile.items():
-                        global_counts[token] = global_counts.get(token, 0) + count
+                    # Gunakan .keys() untuk mendapatkan token unik di setiap Topic Key
+                    for token in k.token_profile.keys():
+                        global_counts[token] = global_counts.get(token, 0) + 1
             return global_counts

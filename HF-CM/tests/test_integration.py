@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from config import CONFIG
 from models import (
     InputEnvelope, DecisionType, PendingStatus, MemoryClassification,
-    TopicKey, FragmentMetadata, CompressedPayload
+    TopicKey, FragmentMetadata, CompressedPayload, EngineResult
 )
 from storage import MemoryStorage
 from retrieval import RetrievalEngine
@@ -19,6 +19,57 @@ from memory_engine import MemoryEngine
 # [NEW] Import untuk End-to-End Pipeline Testing (Spec 26)
 from context_builder import ContextBuilder
 from llm_client import FakeLLMClient
+
+# ==========================================
+# DIAGNOSTIC HELPER (Deep Architectural Transparency)
+# ==========================================
+def print_engine_trace(engine: MemoryEngine, env: InputEnvelope, res: EngineResult, step_name: str = ""):
+    """
+    Mencetak jejak diagnostik mesin secara real-time dengan kedalaman penuh.
+    Memperlihatkan input, keputusan, fragment terpilih, status Big Memory, dan Fast Memory.
+    """
+    print(f"\n{'='*20} 🔍 TRACE: {step_name} {'='*20}")
+    print(f"👤 [USER INPUT]   : {env.raw_text}")
+    print(f"🧠 [DECISION]     : {res.decision.decision_type.value}")
+    print(f"🔑 [ACTIVE KEY]   : {res.active_topic_key_id[:8] + '...' if res.active_topic_key_id else '(NEW_TOPIC / NO_MATCH)'}")
+    print(f"📂 [RETRIEVAL]    : {len(res.retrieved_memory_ids)} fragments selected")
+    
+    # Detail Fragment yang Terpilih
+    for fid in res.retrieved_memory_ids:
+        frag = engine.storage.get_fragment(fid)
+        if frag:
+            key_short = frag.topic_key_id[:8] + "..."
+            time_str = frag.temporal_index.strftime("%Y-%m-%d %H:%M") if frag.temporal_index else "N/A"
+            print(f"   └─ Frag: {fid[:8]}... | Key: {key_short} | Time: {time_str}")
+            
+    print(f"🔄 [RECONSTRUCT]  : {res.reconstruction_status.value}")
+    
+    # Potong respons agar tidak membanjiri terminal
+    ai_resp = res.assistant_response.replace('\n', ' ')
+    print(f"🤖 [AI RESPONSE]  : {ai_resp[:120]}{'...' if len(ai_resp) > 120 else ''}")
+    
+    if res.decision.decision_type == DecisionType.AMBIGUOUS:
+        msg = res.decision.message.replace('\n', ' ')
+        print(f"⚠️ [PENDING MSG]  : {msg[:150]}{'...' if len(msg) > 150 else ''}")
+        
+    # Big Memory Status (Daftar Topic Keys di Database)
+    print(f"\n🗄️  [BIG MEMORY STATUS]")
+    keys = engine.storage.get_all_topic_keys()
+    print(f"   Total Topic Keys Tersimpan: {len(keys)}")
+    for k in keys:
+        tokens_preview = list(k.token_profile.keys())[:5]
+        title_short = (k.title[:25] + "...") if len(k.title) > 25 else k.title
+        print(f"   🔑 {title_short:<28} | Tokens: {tokens_preview}")
+        
+    # Fast Memory Status (Pending State)
+    pending = engine.storage.get_active_pending_state(env.session_id)
+    if pending:
+        print(f"\n⏳ [FAST MEMORY: PENDING ACTIVE]")
+        print(f"   Round: {pending.clarification_round} | Candidates: {len(pending.candidate_keys)} | Origin: {pending.origin_session_id}")
+    else:
+        print(f"\n⏳ [FAST MEMORY: NO ACTIVE PENDING]")
+
+    print(f"{'='*65}\n")
 
 # ==========================================
 # FIXTURES (Setup & Teardown)
@@ -69,15 +120,18 @@ def test_scenario_1_topic_continuity(engine: MemoryEngine, tz: ZoneInfo):
     
     env1 = create_envelope(session_id, "Saya mau buka bisnis kopi.", tz)
     res1 = engine.process_input(env1)
+    print_engine_trace(engine, env1, res1, "Scenario 1 - Turn 1 (Init)")
     assert res1.decision.decision_type in [DecisionType.CLEAR, DecisionType.NO_MATCH]
     key_id_1 = res1.active_topic_key_id
     assert key_id_1 is not None, "Topik Key pertama harus terbuat."
 
     env2 = create_envelope(session_id, "Modalnya sekitar 50 juta cukup?", tz, time_offset_hours=1)
     res2 = engine.process_input(env2)
+    print_engine_trace(engine, env2, res2, "Scenario 1 - Turn 2 (Continuity)")
     
     env3 = create_envelope(session_id, "Terus lokasinya di mana yang strategis?", tz, time_offset_hours=2)
     res3 = engine.process_input(env3)
+    print_engine_trace(engine, env3, res3, "Scenario 1 - Turn 3 (Continuity)")
 
     keys = engine.storage.get_all_topic_keys()
     assert len(keys) == 1, "Harus hanya ada 1 Topic Key (Bisnis Kopi). Tidak boleh membuat topik baru untuk Modal/Lokasi."
@@ -102,6 +156,7 @@ def test_scenario_2_topic_switch_protection(engine: MemoryEngine, tz: ZoneInfo):
 
     env_cpp = create_envelope(session_id, "Ajarkan saya pointer dan reference di C++.", tz, time_offset_hours=10)
     res_cpp = engine.process_input(env_cpp)
+    print_engine_trace(engine, env_cpp, res_cpp, "Scenario 2 - Topic Switch (C++)")
 
     keys_after = engine.storage.get_all_topic_keys()
     assert len(keys_after) == 2, "Sistem harus membuat Topic Key baru untuk C++."
@@ -121,6 +176,7 @@ def test_scenario_4_ambiguity_gate(engine: MemoryEngine, tz: ZoneInfo):
 
     env = create_envelope(session_id, "Bahas kopi dong.", tz)
     res = engine.process_input(env)
+    print_engine_trace(engine, env, res, "Scenario 4 - Ambiguity Gate")
 
     assert res.decision.decision_type == DecisionType.AMBIGUOUS, "Sistem tidak boleh menebak jika selisih skor tipis."
     
@@ -151,6 +207,7 @@ def test_scenario_6_ambiguity_resolution(engine: MemoryEngine, tz: ZoneInfo):
     # [FIX] Tambahkan kata unik dari deskripsi ("strategi", "modal") agar margin skor melebar dan decision menjadi CLEAR
     env_resolve = create_envelope(session_id, "Yang bisnis saja, kita bahas strategi dan modal.", tz, time_offset_hours=1)
     res_resolve = engine.process_input(env_resolve)
+    print_engine_trace(engine, env_resolve, res_resolve, "Scenario 6 - Resolution")
 
     pending_after = engine.storage.get_active_pending_state(session_id)
     
@@ -175,6 +232,7 @@ def test_scenario_7_pause_pending_on_switch(engine: MemoryEngine, tz: ZoneInfo):
     
     env_switch = create_envelope(session_id, "Tidak, saya sekarang mau belajar C++.", tz, time_offset_hours=1)
     res_switch = engine.process_input(env_switch)
+    print_engine_trace(engine, env_switch, res_switch, "Scenario 7 - Pause Pending")
 
     pending = engine.storage.get_active_pending_state(session_id)
     assert pending is None, "Pending state harus di-pause (tidak lagi ACTIVE) saat user pindah topik."
@@ -229,6 +287,7 @@ def test_scenario_a_exact_end_to_end_injection(engine: MemoryEngine, tz: ZoneInf
     # Turn 2: Ask about it
     env2 = create_envelope(session_id, "Berapa modal yang saya sebut tadi?", tz, time_offset_hours=1)
     res2 = engine.process_input(env2)
+    print_engine_trace(engine, env2, res2, "Scenario A - Exact E2E Injection")
     
     # The FakeLLMClient should echo the past memory if it was injected
     assert "[FAKE AI RESPONSE]" in res2.assistant_response
@@ -246,6 +305,7 @@ def test_scenario_c_question_as_topic_switch(engine: MemoryEngine, tz: ZoneInfo)
     # Turn 2: A question about a completely different topic
     env2 = create_envelope(session_id, "Bagaimana cara kerja pointer di C++?", tz, time_offset_hours=1)
     res2 = engine.process_input(env2)
+    print_engine_trace(engine, env2, res2, "Scenario C - Question as Topic Switch")
     
     keys = engine.storage.get_all_topic_keys()
     assert len(keys) == 2, "Sistem harus membuat topik baru untuk C++ meskipun diakhiri tanda tanya."
@@ -269,6 +329,7 @@ def test_scenario_d_long_clarification(engine: MemoryEngine, tz: ZoneInfo):
     long_answer = "Yang saya maksud sebenarnya bisnis kopi yang kemarin. Kita sebelumnya membahas modal sekitar 50 juta, lokasi usaha, dan bagaimana strategi untuk memulainya."
     env_resolve = create_envelope(session_id, long_answer, tz, time_offset_hours=1)
     res_resolve = engine.process_input(env_resolve)
+    print_engine_trace(engine, env_resolve, res_resolve, "Scenario D - Long Clarification")
     
     pending_after = engine.storage.get_active_pending_state(session_id)
     assert pending_after is None or pending_after.status != PendingStatus.ACTIVE, "Pending harus ter-resolve meskipun jawaban > 100 karakter."
@@ -292,15 +353,18 @@ def test_scenario_e_max_clarification_rounds(engine: MemoryEngine, tz: ZoneInfo)
     
     # Round 2 (still ambiguous)
     env2 = create_envelope(session_id, "Terserah.", tz, time_offset_hours=1)
-    engine.process_input(env2)
+    res2 = engine.process_input(env2)
+    print_engine_trace(engine, env2, res2, "Scenario E - Round 2 (Update)")
     
     # Round 3 (still ambiguous)
     env3 = create_envelope(session_id, "Pilih saja.", tz, time_offset_hours=2)
     res3 = engine.process_input(env3)
+    print_engine_trace(engine, env3, res3, "Scenario E - Round 3 (Update)")
     
     # Round 4 (Should trigger fallback / expiration)
     env4 = create_envelope(session_id, "Mana?", tz, time_offset_hours=3)
     res4 = engine.process_input(env4)
+    print_engine_trace(engine, env4, res4, "Scenario E - Round 4 (Max Fallback)")
     
     pending = engine.storage.get_active_pending_state(session_id)
     # Should be expired or None
@@ -327,7 +391,8 @@ def test_scenario_f_pending_ttl(engine: MemoryEngine, tz: ZoneInfo):
     
     # Jump time beyond TTL (e.g., 25 hours later)
     env_late = create_envelope(session_id, "Jawaban untuk alpha.", tz, time_offset_hours=25)
-    engine.process_input(env_late)
+    res_late = engine.process_input(env_late)
+    print_engine_trace(engine, env_late, res_late, "Scenario F - TTL Expiration")
     
     pending_after = engine.storage.get_active_pending_state(session_id)
     assert pending_after is None, "Pending harus expired karena melewati TTL."
@@ -356,6 +421,7 @@ def test_scenario_g_cross_session_pending(engine: MemoryEngine, tz: ZoneInfo):
     # Session 2: User answers the pending question from Session 1
     env2 = create_envelope(session_2, "Yang bisnis kopi saja, kita bahas strategi dan modal.", tz, time_offset_hours=1)
     res2 = engine.process_input(env2)
+    print_engine_trace(engine, env2, res2, "Scenario G - Cross-Session Resolve")
     
     # The pending from Session 1 should be resolved
     pending_s1_after = engine.storage.get_pending_by_reference(pending_s1.pending_id)
@@ -392,6 +458,7 @@ def test_scenario_h_i_temporal_year_and_hour(engine: MemoryEngine, tz: ZoneInfo)
     # ref_time is 2023-10-25 14:00. "kemarin" = 2023-10-24. "pukul 15:00" = 15:00.
     env_query = create_envelope(session_id, "Lanjutkan bisnis kopi kemarin pukul 15:00.", tz)
     res = engine.process_input(env_query)
+    print_engine_trace(engine, env_query, res, "Scenario H/I - Temporal Hour")
     
     assert "frag_specific" in res.retrieved_memory_ids, "Sistem harus menemukan fragment berdasarkan tahun lalu atau jam spesifik."
 
@@ -425,6 +492,7 @@ def test_scenario_j_temporal_tie(engine: MemoryEngine, tz: ZoneInfo):
     # Query: "Bahas kopi kemarin." (Both are yesterday, scores will be close, temporal doesn't break tie uniquely if tolerance covers both)
     env = create_envelope(session_id, "Bahas kopi kemarin.", tz) # ref_time = 2023-10-25 14:00
     res = engine.process_input(env)
+    print_engine_trace(engine, env, res, "Scenario J - Temporal Tie")
     
     # Since both are "kemarin", and base scores are similar, it should be AMBIGUOUS or at least not crash.
     assert res.decision.decision_type in [DecisionType.AMBIGUOUS, DecisionType.CLEAR]
@@ -459,6 +527,7 @@ def test_scenario_k_fragment_ranking(engine: MemoryEngine, tz: ZoneInfo):
     # Query specifically about "modal"
     env = create_envelope(session_id, "Berapa modal yang kita bahas?", tz)
     res = engine.process_input(env)
+    print_engine_trace(engine, env, res, "Scenario K - Fragment Ranking")
     
     # The retrieval should ideally rank f_modal higher due to token match / relationship strength
     if res.retrieved_memory_ids:
@@ -479,11 +548,13 @@ def test_scenario_l_cross_session_graph(engine: MemoryEngine, tz: ZoneInfo):
     
     # Session 2: C++
     env2 = create_envelope(s2, "Belajar pointer C++.", tz, time_offset_hours=24)
-    engine.process_input(env2)
+    res2 = engine.process_input(env2)
+    print_engine_trace(engine, env2, res2, "Scenario L - Session 2 (C++)")
     
     # Session 3: Coffee again
     env3 = create_envelope(s3, "Lanjutkan bisnis kopi.", tz, time_offset_hours=48)
     res3 = engine.process_input(env3)
+    print_engine_trace(engine, env3, res3, "Scenario L - Session 3 (Reactivation)")
     
     # Should reactivate the coffee key
     assert res3.active_topic_key_id == coffee_key_id, "Sesi 3 harus mengaktifkan kembali Topic Key Kopi dari Sesi 1."

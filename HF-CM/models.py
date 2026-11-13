@@ -134,6 +134,9 @@ class FragmentMetadata(BaseModel):
     relationship_strength: float = 0.0
     # [NEW] Skor relevansi fragment terhadap query saat ini (untuk Fragment-Level Ranking)
     relevance_score: float = 0.0
+    # [CRITICAL FIX] Profil token & co-occurrence independen milik Fragment untuk True Query-to-Fragment Relevance
+    token_profile: dict[str, int] = Field(default_factory=dict)
+    co_occurrence_profile: dict[str, int] = Field(default_factory=dict)
 
 class CompressedPayload(BaseModel):
     """Memori besar yang dikompresi lossless."""

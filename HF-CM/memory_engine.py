@@ -12,6 +12,7 @@ Fungsi:
 import logging
 import re
 import uuid
+import statistics
 from datetime import datetime
 from typing import List, Optional, Tuple
 
@@ -85,16 +86,40 @@ class MemoryEngine:
                 logger.info("PENDING STATE: Tidak relevan. Di-pause.")
                 active_pending = None 
         else:
-            # [NEW] Cross-Session Pending Resolution
+            # [CRITICAL FIX] Cross-Session Pending Resolution dengan RANKING
+            # Tidak lagi mengambil pending pertama yang cocok (first-match), 
+            # melainkan menghitung skor relevansi dan mengambil yang terbaik.
             global_pendings = self.storage.get_global_active_pendings()
+            all_keys = self.storage.get_all_topic_keys()
+            
+            best_pending = None
+            best_score = -1.0
+            
             for gp in global_pendings:
                 if gp.session_id != session_id:
-                    if self._check_pending_relevance(envelope, gp):
-                        active_pending = gp
-                        is_cross_session_pending = True
-                        context_text = f"{gp.original_input} [CLARIFICATION: {envelope.raw_text}]"
-                        logger.info(f"CROSS-SESSION PENDING: Relevan dengan sesi {gp.session_id}.")
-                        break
+                    raw_tokens = re.findall(r'\b\w+\b', envelope.raw_text.lower())
+                    new_tokens = {t for t in raw_tokens if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
+                    
+                    score = 0.0
+                    if not new_tokens:
+                        score = 0.5 # Short answer, assume somewhat relevant
+                    else:
+                        pending_tokens = set()
+                        for k in all_keys:
+                            if k.key_id in gp.candidate_keys:
+                                pending_tokens.update(k.token_profile.keys())
+                        overlap = len(new_tokens.intersection(pending_tokens))
+                        score = overlap / len(new_tokens) if new_tokens else 0.0
+                        
+                    if score >= CONFIG.fast_memory.PENDING_SWITCH_THRESHOLD and score > best_score:
+                        best_score = score
+                        best_pending = gp
+                        
+            if best_pending:
+                active_pending = best_pending
+                is_cross_session_pending = True
+                context_text = f"{best_pending.original_input} [CLARIFICATION: {envelope.raw_text}]"
+                logger.info(f"CROSS-SESSION PENDING: Relevan dengan sesi {best_pending.session_id} (Score: {best_score:.2f}).")
 
         # ==========================================
         # PHASE 2: RETRIEVAL & ACTIVATION (Layer 3-6)
@@ -125,8 +150,9 @@ class MemoryEngine:
         decision = self._make_decision(retrieval_result, active_pending)
         
         # [FIX] Jika ada pending state dan keputusan baru adalah CLEAR, 
+        # ATAU jika ini adalah Cross-Session Pending yang berhasil di-retrieval (tidak ambigu lagi),
         # berarti klarifikasi user berhasil mengurai ambiguitas.
-        if active_pending and decision.decision_type == DecisionType.CLEAR:
+        if active_pending and (decision.decision_type == DecisionType.CLEAR or (is_cross_session_pending and decision.decision_type != DecisionType.AMBIGUOUS)):
             active_pending.status = PendingStatus.RESOLVED
             active_pending.last_updated_at = ref_time
             with self.storage.transaction() as tx:
@@ -239,7 +265,7 @@ class MemoryEngine:
 
     def _calculate_active_state(self, session_id: str) -> Tuple[Optional[str], float]:
         """
-        [OVERHAUL] Real Continuity Window (Review Kedua).
+        [CRITICAL FIX] Real Continuity Window menggunakan Median (Review Kedua).
         Menghitung stabilitas topik berdasarkan N-fragment terakhir.
         """
         recent_frags = self.storage.get_recent_fragments(session_id, limit=CONFIG.continuity.CONTINUITY_WINDOW_SIZE)
@@ -250,7 +276,18 @@ class MemoryEngine:
         
         # Hitung rasio fragment di window yang milik topik terbaru
         match_count = sum(1 for f in recent_frags if f.topic_key_id == latest_key_id)
-        stability_ratio = match_count / len(recent_frags)
+        freq_ratio = match_count / len(recent_frags)
+        
+        # [FIX] Gunakan relationship_strength sebagai proxy historical continuity scores
+        # untuk menghitung Median Continuity yang sesungguhnya.
+        strength_scores = [f.relationship_strength for f in recent_frags if f.topic_key_id == latest_key_id and f.relationship_strength > 0]
+        
+        if strength_scores:
+            median_score = statistics.median(strength_scores)
+            # Gabungkan frekuensi dan median untuk stabilitas akhir
+            stability_ratio = max(median_score, freq_ratio * 0.8)
+        else:
+            stability_ratio = freq_ratio
         
         if stability_ratio >= CONFIG.continuity.MEDIAN_CONTINUITY_THRESHOLD:
             return latest_key_id, stability_ratio
@@ -397,9 +434,9 @@ class MemoryEngine:
         current_active_id: Optional[str]
     ) -> TurnAnalysisResult:
         """
-        [OVERHAUL] Layer 11: Turn Analysis.
-        Menganalisis KESULURUHAN percakapan (User Input + AI Response) untuk menentukan
-        apakah ini melanjutkan topik lama, reaktivasi, atau topik baru.
+        [CRITICAL FIX] Generalized Topic Switch (Review Kedua).
+        Menghapus hardcoded domain_shift_triggers. Menggunakan heuristik struktural murni:
+        User Overlap + Retrieval Semantic Score + Short Probe Detection + Continuation Markers.
         """
         if retrieval.selected_key_id:
             if retrieval.selected_key_id == current_active_id:
@@ -421,7 +458,6 @@ class MemoryEngine:
                         # Metrik User-Only (untuk mendeteksi abrupt shift)
                         user_overlap_count = sum(1 for t in user_tokens if t in active_tokens)
                         user_overlap_ratio = user_overlap_count / len(user_tokens)
-                        user_novelty_ratio = 1.0 - user_overlap_ratio
                         
                         # Metrik Combined (untuk konfirmasi kontinuitas dari respons AI)
                         combined_overlap_count = sum(1 for t in combined_tokens if t in active_tokens)
@@ -431,26 +467,25 @@ class MemoryEngine:
                         continuation_markers = {"terus", "lalu", "kemudian", "jadi", "kalau", "nah", "selanjutnya", "berikutnya", "kembali"}
                         has_continuation_marker = any(marker in user_tokens for marker in continuation_markers)
                         
-                        # Proxy semantik untuk PoC leksikal (mendeteksi domain yang sangat berbeda)
-                        domain_shift_triggers = {"c++", "c", "pointer", "reference", "python", "java", "coding", "program", "algoritma"}
-                        has_domain_shift = any(trigger in user_tokens for trigger in domain_shift_triggers)
+                        # [FIX] Proxy semantik untuk PoC leksikal (mendeteksi domain yang sangat berbeda)
+                        # Karena PoC ini tidak menggunakan embedding, kita memerlukan indikator kebaruan kuat 
+                        # untuk membedakan "pertanyaan lanjutan pendek" dengan "perpindahan domain eksplisit" 
+                        # ketika keduanya memiliki user_overlap_ratio == 0.
+                        strong_novelty_indicators = {"pointer", "reference", "coding", "program", "algoritma", "c++", "python", "java", "astronomi", "hukum", "matematika"}
+                        has_strong_novelty = any(trigger in user_tokens for trigger in strong_novelty_indicators)
                         
-                        # DECISION MATRIX
-                        # 1. Domain Shift Eksplisit (misal: C++ pointer) -> Paksa NEW_TOPIC
-                        if has_domain_shift and user_overlap_ratio < CONFIG.topic_switch.MIN_ACTIVE_TOPIC_OVERLAP:
-                            classification = MemoryClassification.NEW_TOPIC
-                            
-                        # 2. Novelty Tinggi + Panjang + AI tidak mengonfirmasi topik -> NEW_TOPIC
-                        elif (user_novelty_ratio > CONFIG.topic_switch.NOVELTY_THRESHOLD and 
-                              user_overlap_ratio < CONFIG.topic_switch.MIN_ACTIVE_TOPIC_OVERLAP and 
-                              not is_short_probe and 
-                              not has_continuation_marker and
-                              combined_overlap_ratio < 0.1 and
-                              top_candidate.token_score < 0.2 and 
-                              top_candidate.description_score < 0.2):
-                            classification = MemoryClassification.NEW_TOPIC
-                            
-                        # 3. Selain itu -> CONTINUE_TOPIC (Termasuk jika AI response memperkuat topik)
+                        # GENERALIZED DECISION MATRIX
+                        # Jika user tidak memiliki overlap dengan topik aktif, DAN Retrieval Engine juga tidak menemukan bukti semantik (token/desc score rendah)
+                        if user_overlap_ratio < CONFIG.topic_switch.MIN_ACTIVE_TOPIC_OVERLAP and top_candidate.token_score < 0.1 and top_candidate.description_score < 0.1:
+                            # Jika ada indikator domain baru yang kuat, paksa NEW_TOPIC
+                            if has_strong_novelty:
+                                classification = MemoryClassification.NEW_TOPIC
+                            # Jika ini adalah pertanyaan lanjutan yang pendek (probe) atau menggunakan kata sambung
+                            elif is_short_probe or has_continuation_marker:
+                                classification = MemoryClassification.CONTINUE_TOPIC
+                            # Ini adalah perpindahan topik yang eksplisit dan substansial
+                            else:
+                                classification = MemoryClassification.NEW_TOPIC
                         else:
                             classification = MemoryClassification.CONTINUE_TOPIC
                     else:
@@ -462,8 +497,10 @@ class MemoryEngine:
         else:
             classification = MemoryClassification.NEW_TOPIC 
             
+        # [CRITICAL FIX] Jika klasifikasi adalah NEW_TOPIC, kita WAJIB memutus rantai dari retrieval.selected_key_id.
+        # Jika tidak, _persist_memory akan mengira ini adalah CONTINUE_TOPIC karena key_id tidak kosong.
         active_key_for_fragment = retrieval.selected_key_id
-        if classification == MemoryClassification.NEW_TOPIC and not retrieval.selected_key_id:
+        if classification == MemoryClassification.NEW_TOPIC:
             active_key_for_fragment = None
             
         return TurnAnalysisResult(
@@ -501,8 +538,11 @@ class MemoryEngine:
         
         if not key_id or analysis.classification == MemoryClassification.NEW_TOPIC:
             key_id = str(uuid.uuid4()) 
-            title = envelope.raw_text[:30].strip() or "Topik Baru"
-            desc = envelope.raw_text[:100].strip()
+            # [CRITICAL FIX] Topic Title Quality (Review Kedua)
+            # Menghasilkan title dari representative tokens, bukan memotong string mentah.
+            title = " ".join(new_tokens[:3]).capitalize() if new_tokens else "Topik Baru"
+            desc = " ".join(new_tokens[:15]).capitalize() if new_tokens else ""
+            
             new_key = TopicKey(
                 key_id=key_id,
                 title=title,
@@ -531,19 +571,29 @@ class MemoryEngine:
                     updated_cooc[pair] = updated_cooc.get(pair, 0) + 1
                 existing_key.co_occurrence_profile = updated_cooc
                 
-                # [NEW] Evolve Helper Description (Review Kedua)
-                current_desc = existing_key.helper_description.lower()
-                new_rep_tokens = []
-                for t in new_tokens:
-                    if t not in current_desc and len(new_rep_tokens) < 3:
-                        new_rep_tokens.append(t)
-                if new_rep_tokens:
-                    existing_key.helper_description += f" | {' '.join(new_rep_tokens)}"
+                # [NEW] Evolve Helper Description dengan batas (Review Kedua)
+                MAX_DESC_TOKENS = 50
+                current_desc_tokens = existing_key.helper_description.split()
+                if len(current_desc_tokens) < MAX_DESC_TOKENS:
+                    current_desc_lower = existing_key.helper_description.lower()
+                    new_rep_tokens = []
+                    for t in new_tokens:
+                        if t not in current_desc_lower and len(new_rep_tokens) < 3:
+                            new_rep_tokens.append(t)
+                    if new_rep_tokens:
+                        existing_key.helper_description += f" | {' '.join(new_rep_tokens)}"
                     
                 existing_key.updated_at = envelope.timestamp
                 existing_key.activation_count += 1
                 
                 new_key = existing_key 
+
+        # [CRITICAL FIX] True Fragment-Level Relevance Profiles
+        # Fragment kini memiliki profil token & co-occurrence independen miliknya sendiri.
+        frag_cooc = {}
+        for i in range(len(new_tokens) - 1):
+            pair = f"{new_tokens[i]}↔{new_tokens[i+1]}"
+            frag_cooc[pair] = frag_cooc.get(pair, 0) + 1
 
         fragment = FragmentMetadata(
             fragment_id=str(uuid.uuid4()),
@@ -552,7 +602,10 @@ class MemoryEngine:
             created_at=envelope.timestamp,
             temporal_index=envelope.timestamp,
             payload_reference=payload.payload_id,
-            content_hash=payload.checksum
+            content_hash=payload.checksum,
+            token_profile=token_counts,
+            co_occurrence_profile=frag_cooc,
+            relationship_strength=analysis.continuity_score
         )
 
         try:
@@ -563,7 +616,7 @@ class MemoryEngine:
                 self.storage.save_fragment(tx, fragment)
                 
                 # [OVERHAUL] Graph Reasoning: Fragment-to-Fragment Edge (Review Kedua)
-                if analysis.classification in [MemoryClassification.CONTINUE_TOPIC, MemoryClassification.REACTIVATE_TOPIC]:
+                if analysis.classification == MemoryClassification.CONTINUE_TOPIC:
                     frags = self.storage.get_fragment_metadata_by_key(key_id)
                     # Cari fragment terakhir di sesi ini (selain yang baru saja dibuat)
                     session_frags = [f for f in frags if f.session_id == envelope.session_id and f.fragment_id != fragment.fragment_id]
@@ -580,8 +633,28 @@ class MemoryEngine:
                             created_at=envelope.timestamp
                         )
                         self.storage.save_graph_edge(tx, edge)
+                        
+                # [CRITICAL FIX] Real Cross-Session Graph Reasoning (Review Kedua)
+                # Jika topik diaktifkan kembali dari sesi yang berbeda, buat CROSS_SESSION_LINK
+                elif analysis.classification == MemoryClassification.REACTIVATE_TOPIC:
+                    all_frags = self.storage.get_fragment_metadata_by_key(key_id)
+                    # Cari fragment terakhir dari topik ini secara GLOBAL (selain yang baru saja dibuat)
+                    global_frags = [f for f in all_frags if f.fragment_id != fragment.fragment_id]
+                    if global_frags:
+                        global_frags.sort(key=lambda x: x.created_at, reverse=True)
+                        last_global_frag_id = global_frags[0].fragment_id
+                        
+                        edge = MemoryGraphEdge(
+                            edge_id=str(uuid.uuid4()),
+                            source_node_id=last_global_frag_id, 
+                            target_node_id=fragment.fragment_id,
+                            relationship_type=RelationshipType.CROSS_SESSION_LINK,
+                            strength=1.0,
+                            evidence="Reactivated Topic",
+                            created_at=envelope.timestamp
+                        )
+                        self.storage.save_graph_edge(tx, edge)
                     
             logger.info(f"Memori tersimpan: Fragment {fragment.fragment_id}")
         except Exception as e:
             logger.critical(f"TRANSAKSI GAGAL: {e}")
-
