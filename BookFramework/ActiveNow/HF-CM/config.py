@@ -162,7 +162,15 @@ class GraphConstants:
     DIRECT_CROSS_SESSION_WEIGHT: Final[float] = 1.2   # cross-session lebih kuat dari continuation
     INDIRECT_GRAPH_DECAY: Final[float] = 0.5          # decay per hop pada path
     MAX_GRAPH_PATH_DEPTH: Final[int] = 3              # batas penelusuran path graph
-    FRAGMENT_GRAPH_MIN_SCORE: Final[float] = 0.05     # skor graph di bawah ini dianggap 0
+    # [FIX — Batch B] Noise floor diturunkan dari 0.05 → 0.01.
+    #
+    # Alasan: turn_continuity_score untuk continuation yang SAH tapi lemah
+    # (overlap nol + novelty tinggi) bernilai sekitar 0.05:
+    #     0.25 (history) - 0.20 (novelty penalty) = 0.04999999999999999
+    # Dengan floor 0.05, edge CONTINUES yang legit ini dibuang karena
+    # presisi floating point (0.0499... < 0.05). Floor 0.01 tetap membuang
+    # noise near-zero tanpa membuang bukti continuation lemah yang valid.
+    FRAGMENT_GRAPH_MIN_SCORE: Final[float] = 0.01
 
 @dataclass(frozen=True)
 class StorageConstants:
@@ -314,6 +322,17 @@ class TokenQualityConstants:
         "lanjutkan", "lanjut", "terus", "lalu", "kemudian", "jadi", "kalau",
         "nah", "selanjutnya", "berikutnya", "kembali", "tadi", "sebelumnya",
         "kita", "bahas", "buat", "bikin", "minta", "kasih", "beri",
+        # [FIX — Batch B] Ambiguous clarification responses.
+        # Kata-kata ini adalah RESPONS terhadap pertanyaan klarifikasi,
+        # bukan sinyal identitas topik. Tanpa ini, "terserah" (8 huruf)
+        # diklasifikasikan TOPIC_SIGNAL dan dianggap meaningful token,
+        # sehingga pending di-pause padahal user masih menjawab klarifikasi.
+        "terserah", "terserahmu", "bebas", "entah", "ragu", "bingung",
+        "pilih", "pilihkan", "silakan", "silahkan", "apapun", "apaun",
+        "manapun", "semua", "semuanya", "dua", "duanya", "salah",
+        # Affirmation / negation pendek terhadap klarifikasi.
+        "ya", "iya", "oke", "ok", "baik", "baiklah", "setuju", "benar",
+        "betul", "tidak", "bukan", "jangan", "gak", "nggak", "enggak",
     })
 
     # Token numerik / identifier: nilai identitas tertinggi.

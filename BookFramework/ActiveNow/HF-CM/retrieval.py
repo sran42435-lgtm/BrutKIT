@@ -1074,26 +1074,78 @@ class RetrievalEngine:
     # [REASONING PURITY] TEMPORAL DISTANCE QUALITY
     # ==========================================
 
+    def _resolve_requested_time(
+        self,
+        signal: SignalProfile,
+        temporal_range: Optional[Tuple[datetime, datetime]],
+    ) -> Optional[datetime]:
+        """
+        [FIX — Batch C] Resolve WAKTU YANG DIMINTA USER, bukan midpoint range.
+
+        Bug sebelumnya: midpoint dari range "kemarin pukul 15:00"
+            start = 13:00:00.000000
+            end   = 17:59:59.999999
+            midpoint = 15:29:59.999999   ← BUKAN 15:00!
+        Akibatnya fragment 14:59 dihitung berjarak 31 menit (seharusnya 1 menit).
+
+        Sekarang:
+            - Jika query menyebut jam spesifik (HOUR_15_00) → target = jam itu
+              pada tanggal awal range.
+            - Jika tidak (query "kemarin" saja) → midpoint range, karena seluruh
+              hari memang range yang diminta dan presisi tidak ditekankan.
+        """
+        if temporal_range is None:
+            return None
+
+        start_t, end_t = temporal_range
+
+        # Cari sinyal jam spesifik
+        for sig in (signal.temporal_signals or []):
+            if not sig.startswith("HOUR_"):
+                continue
+            parts = sig.split("_")
+            if len(parts) < 2:
+                continue
+            try:
+                target_hour = int(parts[1])
+                target_minute = int(parts[2]) if len(parts) > 2 else 0
+            except (ValueError, IndexError):
+                continue
+            if 0 <= target_hour <= 23 and 0 <= target_minute <= 59:
+                return start_t.replace(
+                    hour=target_hour, minute=target_minute,
+                    second=0, microsecond=0
+                )
+
+        # Tidak ada jam spesifik → midpoint range (presisi hari)
+        total_seconds = (end_t - start_t).total_seconds()
+        return start_t + timedelta(seconds=total_seconds / 2)
+
     def _compute_temporal_distance_score(
         self,
         fragment_time: datetime,
         temporal_range: Optional[Tuple[datetime, datetime]],
         has_specific_hour: bool,
+        requested_time: Optional[datetime] = None,
     ) -> Tuple[float, Optional[float]]:
         """
-        Menghitung skor kualitas temporal berdasarkan KEDekatan fragment
+        Menghitung skor kualitas temporal berdasarkan KEDEKATAN fragment
         dengan waktu yang diminta. Bukan sekadar "masuk range atau tidak".
 
         Returns:
             (temporal_distance_score, distance_minutes)
 
-        Rumus:
-            Jika fragment_time tepat di tengah range → EXACT_MATCH (1.0)
-            Semakin jauh dari tengah → decay per jam
+        [FIX — Batch C] Dua perbaikan:
+        1. Target waktu diambil dari `requested_time` (jam yang diminta user),
+           bukan midpoint range yang bergeser karena microsecond=999999.
+        2. TEMPORAL_HOUR_PRECISION_WEIGHT dipakai sebagai pengali DECAY,
+           bukan pengali SKOR. Sebelumnya boost multiplicative
+           (score × 1.5 lalu clamp ke 1.0) membuat fragment dekat dan jauh
+           sama-sama mendapat 1.0 → diskriminasi hilang total.
 
-        Dua fragment yang sama-sama masuk range "kemarin" tetap dibedakan:
-            15:01 (query: 15:00) → score tinggi
-            23:00 (query: 15:00) → score rendah
+        Sekarang presisi tinggi = decay lebih tajam = diskriminasi lebih baik:
+            query "pukul 15:00", fragment 14:59 → distance 1 min  → EXACT 1.0
+            query "pukul 15:00", fragment 16:30 → distance 90 min → 0.775
         """
         tc = CONFIG.temporal
 
@@ -1107,27 +1159,34 @@ class RetrievalEngine:
         if fragment_time.tzinfo is None and start_t.tzinfo is not None:
             fragment_time = fragment_time.replace(tzinfo=start_t.tzinfo)
 
-        # Hitung midpoint dari range
-        total_seconds = (end_t - start_t).total_seconds()
-        midpoint = start_t + timedelta(seconds=total_seconds / 2)
+        # [FIX] Target = waktu yang diminta user (jika ada), else midpoint range.
+        if requested_time is not None:
+            target_time = requested_time
+            if target_time.tzinfo is None and start_t.tzinfo is not None:
+                target_time = target_time.replace(tzinfo=start_t.tzinfo)
+        else:
+            total_seconds = (end_t - start_t).total_seconds()
+            target_time = start_t + timedelta(seconds=total_seconds / 2)
 
-        # Distance dalam jam dari midpoint
-        distance_seconds = abs((fragment_time - midpoint).total_seconds())
+        # Distance dari waktu yang diminta
+        distance_seconds = abs((fragment_time - target_time).total_seconds())
         distance_hours = distance_seconds / 3600.0
         distance_minutes = distance_seconds / 60.0
 
-        # Exact match: fragment di dalam 5 menit dari midpoint
+        # Exact match: fragment di dalam 5 menit dari waktu yang diminta
         if distance_minutes <= 5.0:
             return (tc.TEMPORAL_EXACT_MATCH_SCORE, distance_minutes)
 
-        # Distance decay: 1 - (decay_per_hour * distance_hours)
-        # Floor di 0.1 agar fragment yang masuk range tidak drop ke 0
-        decay = tc.TEMPORAL_DISTANCE_DECAY * distance_hours
-        score = max(0.1, 1.0 - decay)
+        # [FIX] Precision weight mengalikan DECAY, bukan SKOR.
+        # Query dengan jam spesifik → presisi lebih ditekankan → decay lebih tajam.
+        precision_weight = (
+            tc.TEMPORAL_HOUR_PRECISION_WEIGHT if has_specific_hour
+            else tc.TEMPORAL_DAY_PRECISION_WEIGHT
+        )
+        decay = tc.TEMPORAL_DISTANCE_DECAY * distance_hours * precision_weight
 
-        # Boost jika query menyebut jam spesifik (presisi lebih dihargai)
-        if has_specific_hour:
-            score = min(1.0, score * tc.TEMPORAL_HOUR_PRECISION_WEIGHT)
+        # Floor di 0.1 agar fragment yang masuk range tidak drop ke 0
+        score = max(0.1, 1.0 - decay)
 
         return (score, distance_minutes)
 
@@ -1191,6 +1250,10 @@ class RetrievalEngine:
             sig.startswith("HOUR_") for sig in (signal.temporal_signals or [])
         )
 
+        # [FIX — Batch C] Resolve waktu yang diminta SEKALI untuk seluruh fragment,
+        # agar semua fragment dibandingkan terhadap target yang sama dan benar.
+        requested_time = self._resolve_requested_time(signal, time_range)
+
         graph_scores_map = fragment_graph_scores or {}
         
         for f in key_frags:
@@ -1227,7 +1290,8 @@ class RetrievalEngine:
             temporal_distance_minutes: Optional[float] = None
             if f.temporal_index is not None:
                 frag_temporal_score, temporal_distance_minutes = self._compute_temporal_distance_score(
-                    f.temporal_index, time_range, has_specific_hour
+                    f.temporal_index, time_range, has_specific_hour,
+                    requested_time=requested_time,
                 )
             
             # 4. Recency (Decay berdasarkan umur fragment)

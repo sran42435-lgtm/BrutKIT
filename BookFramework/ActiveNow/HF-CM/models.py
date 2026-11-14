@@ -390,3 +390,22 @@ class EngineResult(BaseModel):
     candidates: list[CandidateScore] = Field(default_factory=list)
     # [REASONING PURITY] Ringkasan kemurnian reasoning (untuk audit/debug).
     reasoning_purity_summary: str = ""
+    # [FIX — Batch D] Continuity Purity observability.
+    #
+    # Nilai turn_continuity_score AKTUAL yang dihitung saat turn ini diproses,
+    # dan yang dipersist ke fragment.relationship_strength.
+    #
+    # Kenapa perlu di-expose:
+    #   Menghitung ulang nilai ini SETELAH persist tidak menghasilkan angka yang
+    #   sama, karena 3 inputnya sudah berubah state:
+    #     1. token_profile TopicKey sudah diperbarui dengan token turn ini
+    #     2. history_ratio berubah karena fragment baru sudah masuk window
+    #     3. active_frag_rel mengambil fragment terbaru — yaitu fragment yang
+    #        sedang diuji sendiri (self-reference)
+    #
+    #   Dengan field ini, invariant "relationship_strength == turn_continuity"
+    #   dapat diverifikasi langsung tanpa rekonstruksi ulang.
+    turn_continuity_score: float = 0.0
+    # Sumber bukti continuity untuk audit: "overlap", "history", "fragments",
+    # "-novelty(0.20)", "-contradiction(0.15)".
+    continuity_evidence_sources: list[str] = Field(default_factory=list)

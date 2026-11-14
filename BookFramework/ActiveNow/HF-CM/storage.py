@@ -666,6 +666,15 @@ class MemoryStorage:
         - Relationship-type weight (CROSS_SESSION_LINK > CONTINUES)
         - Cycle detection via visited set
 
+        [CRITICAL FIX — Batch A]
+        Sebelumnya `edges_cache` di-pre-populate dengan SEMUA node IDs:
+            edges_cache = {nid: [] for nid in all_nodes}
+        sehingga `nodes_to_load = [n for n in frontier if n not in edges_cache]`
+        SELALU kosong → query DB tidak pernah dijalankan → semua skor 0.
+
+        Sekarang tracking node yang sudah di-load dipisah ke `loaded_nodes`,
+        sehingga query DB benar-benar dijalankan pada frontier pertama.
+
         Args:
             session: SQLAlchemy session aktif (caller harus manage lifecycle)
             start_ids: set fragment IDs untuk dihitung graph score-nya
@@ -674,63 +683,55 @@ class MemoryStorage:
 
         Returns:
             (scores, path_info)
-            scores: Dict[fragment_id, float] — skor graph tertinggi per fragment
+            scores: Dict[fragment_id, float] — skor graph tertinggi per fragment (0..1)
             path_info: Dict[fragment_id, {best_depth, path_types, edge_count}] — untuk observability
         """
         gc = CONFIG.graph
 
-        # Cache edges: fragment_id -> list[(other_id, strength, relationship_type)]
-        # Dibangun sekali, dipakai untuk traversal.
-        all_nodes: Set[str] = set(start_ids)
-        if target_ids:
-            all_nodes |= target_ids
+        # [FIX] Cache dibangun LAZY dari DB, bukan pre-populated.
+        edges_cache: Dict[str, List[Tuple[str, float, str]]] = {}
+        loaded_nodes: Set[str] = set()
 
-        edges_cache: Dict[str, List[Tuple[str, float, str]]] = {nid: [] for nid in all_nodes}
-
-        # Iteratif load edges up to max_depth (lazy BFS expansion)
-        # Kita load semua edge yang melibatkan start_ids di iterasi pertama,
-        # lalu load edge dari node yang ditemukan di iterasi berikutnya.
+        # Iteratif load edges per level BFS (lazy expansion).
         frontier: Set[str] = set(start_ids)
-        visited_global: Set[str] = set()
 
         for depth in range(max_depth + 1):
             if not frontier:
                 break
 
-            nodes_to_load = [n for n in frontier if n not in edges_cache]
+            # [FIX] Gunakan loaded_nodes, bukan edges_cache, untuk menentukan
+            # node mana yang belum di-query dari DB.
+            nodes_to_load = [n for n in frontier if n not in loaded_nodes]
+
             if nodes_to_load:
                 db_edges = session.query(GraphEdgeDB).filter(
                     (GraphEdgeDB.source_node_id.in_(nodes_to_load)) |
                     (GraphEdgeDB.target_node_id.in_(nodes_to_load))
                 ).all()
 
-                for e in db_edges:
-                    # Pastikan kedua ujung di-cache
-                    if e.source_node_id not in edges_cache:
-                        edges_cache[e.source_node_id] = []
-                    if e.target_node_id not in edges_cache:
-                        edges_cache[e.target_node_id] = []
+                # Tandai semua node yang di-query sebagai loaded,
+                # termasuk yang tidak punya edge sama sekali.
+                for n in nodes_to_load:
+                    edges_cache.setdefault(n, [])
+                    loaded_nodes.add(n)
 
+                for e in db_edges:
                     strength = max(0.0, min(1.0, e.strength if e.strength is not None else e.weight))
                     rel_type = e.relationship_type
                     weighted_strength = strength * self._apply_relationship_weight(rel_type)
 
-                    edges_cache[e.source_node_id].append((e.target_node_id, weighted_strength, rel_type))
-                    edges_cache[e.target_node_id].append((e.source_node_id, weighted_strength, rel_type))
+                    edges_cache.setdefault(e.source_node_id, []).append(
+                        (e.target_node_id, weighted_strength, rel_type)
+                    )
+                    edges_cache.setdefault(e.target_node_id, []).append(
+                        (e.source_node_id, weighted_strength, rel_type)
+                    )
 
-                    # Expand frontier untuk depth berikutnya
-                    if depth < max_depth:
-                        if e.target_node_id not in visited_global:
-                            frontier.add(e.target_node_id)
-                        if e.source_node_id not in visited_global:
-                            frontier.add(e.source_node_id)
-
-            visited_global |= frontier
-            # Frontier berikutnya: neighbor yang belum dikunjungi
+            # Frontier berikutnya: neighbor yang belum di-load dari DB.
             next_frontier: Set[str] = set()
             for node in frontier:
                 for (other, _, _) in edges_cache.get(node, []):
-                    if other not in visited_global:
+                    if other not in loaded_nodes:
                         next_frontier.add(other)
             frontier = next_frontier
 
@@ -761,8 +762,11 @@ class MemoryStorage:
                     new_depth = depth + 1
 
                     # Decay: score = weighted_strength * (INDIRECT_GRAPH_DECAY ** depth)
-                    decay_factor = gc.INDIRECT_GRAPH_DECAY ** depth  # depth = 0 untuk edge pertama
-                    candidate_score = weighted_strength * decay_factor
+                    # depth = 0 untuk edge pertama (direct) → decay 1.0
+                    decay_factor = gc.INDIRECT_GRAPH_DECAY ** depth
+                    # [FIX] Clamp ke [0, 1] agar CROSS_SESSION weight 1.2 tidak
+                    # menghasilkan skor > 1.0 (kontrak: graph_score dalam 0..1).
+                    candidate_score = max(0.0, min(1.0, weighted_strength * decay_factor))
 
                     # Apakah neighbor ada di target?
                     is_target_hit = (

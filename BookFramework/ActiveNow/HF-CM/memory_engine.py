@@ -19,6 +19,18 @@ Memori tidak boleh diperbarui sebelum keputusan asosiasinya cukup tervalidasi.
 - relationship_strength fragment diisi dari turn_continuity_score murni.
 - Short pending input divalidasi, bukan otomatis dianggap relevan.
 - graph_score fragment dihitung dari edge nyata (CONTINUES / CROSS_SESSION_LINK).
+
+[MINOR FALLBACK LOCK]
+SHORT INPUT ≠ AUTOMATICALLY RELEVANT
+Short input harus menunjukkan salah satu dari:
+  (a) explicit candidate selection ("nomor 1", "yang pertama")
+  (b) token overlap dengan candidate evidence (title + desc + token_profile)
+  (c) semua token low-information (fallback "terserah")
+Jika tidak ada bukti → TIDAK RELEVAN (lanjut ke topic switch analysis).
+
+[SYMBOL IDENTITY LOCK]
+Input yang tidak menghasilkan token word-character (mis. "C++", "C#")
+BUKAN input kosong. Identity-nya diekstrak dari raw_text sebelum dievaluasi.
 """
 
 import logging
@@ -59,6 +71,19 @@ class MemoryEngine:
         "continuity": EvidenceFamily.CONTEXTUAL,
         "graph": EvidenceFamily.RELATIONAL,
     }
+
+    # [FIX — Batch E] Single source of truth untuk indikator domain baru yang kuat.
+    # Sebelumnya set ini diduplikasi di _check_pending_relevance dan _analyze_turn,
+    # sehingga berisiko divergen. Sekarang satu definisi untuk kedua jalur.
+    _STRONG_NOVELTY_INDICATORS: frozenset = frozenset({
+        "pointer", "reference", "coding", "program", "algoritma",
+        "c++", "c#", "python", "java", "astronomi", "hukum", "matematika",
+    })
+
+    # [FIX — Batch E] Pola identifier simbolik yang tidak ditangkap \b\w+\b.
+    # "C++" → \w+ hanya menangkap "c" (1 char, terfilter MIN_TOKEN_LENGTH).
+    # Pola ini menangkap "c++", "c#", "f#" secara utuh.
+    _SYMBOL_IDENTITY_PATTERN = re.compile(r"[a-z0-9_]+(?:\+\+|\+|#)+", re.IGNORECASE)
 
     def __init__(self, storage: MemoryStorage, retrieval: RetrievalEngine, compressor: PayloadCompressor, context_builder=None, llm_client=None):
         self.storage = storage
@@ -285,6 +310,11 @@ class MemoryEngine:
             # [EVIDENCE LOCKING] Sertakan kandidat yang DITOLAK agar bisa diaudit.
             candidates=retrieval_result.candidates,
             reasoning_purity_summary=reasoning_summary,
+            # [FIX — Batch E] Expose turn_continuity_score AKTUAL yang dipersist
+            # ke fragment.relationship_strength, agar invariant Continuity Purity
+            # dapat diverifikasi tanpa re-computation yang rentan state-drift.
+            turn_continuity_score=analysis.turn_continuity_score,
+            continuity_evidence_sources=analysis.continuity_evidence_sources,
         )
 
     # ==========================================
@@ -299,6 +329,23 @@ class MemoryEngine:
         raw_tokens = re.findall(r'\b\w+\b', envelope.raw_text.lower())
         return {t for t in raw_tokens if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
 
+    def _extract_symbol_identity_tokens(self, raw_text: str) -> set:
+        """
+        [FIX — Batch E] Ekstrak identity token INCLUDING identifier simbolik.
+
+        Masalah: "C++" melalui `re.findall(r'\b\w+\b', ...)` hanya menghasilkan
+        ["c"] (1 karakter), lalu terfilter MIN_TOKEN_LENGTH=3 → himpunan kosong.
+        Sistem lalu salah menyimpulkan "input kosong" dan menganggapnya relevan
+        terhadap pending apa pun.
+
+        Fungsi ini menangkap identifier simbolik secara utuh ("c++", "c#", "f#")
+        plus token alfanumerik pendek, sehingga evaluasi bukti tetap bisa jalan.
+        """
+        text = raw_text.lower()
+        tokens = set(self._SYMBOL_IDENTITY_PATTERN.findall(text))
+        tokens |= {t for t in re.findall(r'\b\w+\b', text) if t}
+        return tokens
+
     def _collect_pending_evidence_tokens(
         self, 
         pending: PendingState, 
@@ -306,8 +353,11 @@ class MemoryEngine:
     ) -> set:
         """
         [CRITICAL FIX] Single source of truth untuk bukti milik Pending State.
-        Menggabungkan TOKEN PROFILE + HELPER DESCRIPTION dari seluruh candidate keys.
+        Menggabungkan TITLE + TOKEN PROFILE + HELPER DESCRIPTION dari seluruh candidate keys.
         
+        [MINOR FALLBACK LOCK] Ditambahkan title agar "bisnis" yang muncul di judul
+        "Bisnis Kopi" tetap terdeteksi sebagai evidence terhadap candidate.
+
         Sebelumnya jalur cross-session hanya memakai token_profile, sehingga bukti
         lebih lemah daripada jalur lokal dan pending lintas sesi gagal di-resolve.
         Sesuai Blueprint: pending harus dicocokkan dengan
@@ -320,6 +370,11 @@ class MemoryEngine:
         for k in all_keys:
             if k.key_id in pending.candidate_keys:
                 pending_tokens.update(k.token_profile.keys())
+                # [MINOR FALLBACK LOCK] Sertakan title tokens
+                title_words = re.findall(r'\b\w+\b', k.title.lower())
+                pending_tokens.update(
+                    w for w in title_words if len(w) >= CONFIG.signal.MIN_TOKEN_LENGTH
+                )
                 desc_words = re.findall(r'\b\w+\b', k.helper_description.lower())
                 pending_tokens.update(w for w in desc_words if len(w) >= CONFIG.signal.MIN_TOKEN_LENGTH)
         return pending_tokens
@@ -353,6 +408,81 @@ class MemoryEngine:
         
         return overlap_ratio + overlap_bonus
 
+    # ==========================================
+    # [MINOR FALLBACK LOCK] EXPLICIT SELECTION DETECTION
+    # ==========================================
+
+    def _detect_explicit_selection(self, raw_text: str, pending: PendingState) -> bool:
+        """
+        [MINOR FALLBACK LOCK] Deteksi apakah input pendek adalah pilihan eksplisit
+        terhadap salah satu kandidat pending.
+
+        Contoh pola yang dikenali:
+            "nomor 1", "pilihan 2", "opsi 3", "1" (angka saja)
+            "yang pertama", "yang kedua", "yang terakhir"
+            "pertama", "kedua"
+
+        Mengembalikan True jika index yang dipilih valid (1..N kandidat).
+        Tidak mengubah state pending — hanya memberi sinyal ke caller.
+        """
+        n_candidates = len(pending.candidate_keys)
+        if n_candidates == 0:
+            return False
+
+        text_lower = raw_text.lower().strip()
+
+        # 1. Pola angka eksplisit: "nomor 1", "pilihan 2", "opsi 3", "1" saja
+        number_patterns = [
+            r'\bnomor\s+(\d+)\b',
+            r'\bpilihan\s+(\d+)\b',
+            r'\boption\s+(\d+)\b',
+            r'\boptions?\s+(\d+)\b',
+            r'\bopsi\s+(\d+)\b',
+            r'^\s*(\d+)\s*$',      # hanya angka tunggal
+        ]
+        for pattern in number_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                try:
+                    idx = int(match.group(1))
+                    if 1 <= idx <= n_candidates:
+                        return True
+                except ValueError:
+                    continue
+
+        # 2. Pola ordinal: "yang pertama", "yang kedua", "yang terakhir"
+        ordinal_map = {
+            "pertama": 1, "kesatu": 1,
+            "kedua": 2,
+            "ketiga": 3,
+            "keempat": 4,
+            "kelima": 5,
+            "keenam": 6,
+            "ketujuh": 7,
+            "terakhir": n_candidates,
+            "last": n_candidates,
+            "first": 1,
+            "second": 2,
+            "third": 3,
+        }
+        for word, idx in ordinal_map.items():
+            # Cocokkan sebagai whole word agar "kedua" tidak match di "berkedua"
+            if re.search(rf'\b{re.escape(word)}\b', text_lower):
+                if 1 <= idx <= n_candidates:
+                    return True
+
+        # 3. Angka cardinal yang berdiri sendiri di input pendek: "satu", "dua", "tiga"
+        cardinal_map = {
+            "satu": 1, "dua": 2, "tiga": 3, "empat": 4, "lima": 5,
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        }
+        for word, idx in cardinal_map.items():
+            if re.search(rf'\b{re.escape(word)}\b', text_lower):
+                if 1 <= idx <= n_candidates:
+                    return True
+
+        return False
+
     def _check_pending_relevance(
         self, 
         envelope: InputEnvelope, 
@@ -362,64 +492,106 @@ class MemoryEngine:
         """
         [OVERHAUL] Memeriksa relevansi pending.
 
-        [REASONING PURITY — Prioritas #3: Short Pending Safety]
-        Input pendek TIDAK otomatis dianggap relevan. Harus divalidasi terhadap
-        kandidat pending untuk mencegah "C++" dianggap jawaban terhadap pending
-        "Bisnis Kopi / Kedai Kopi?".
+        [MINOR FALLBACK LOCK]
+        SHORT INPUT ≠ AUTOMATICALLY RELEVANT
 
-        Pipeline:
-        - Jika input pendek (< SHORT_PENDING_INPUT_THRESHOLD tokens):
-            - Jika semua token low-information → RELEVANT (anggap "terserah", "yang bisnis")
-            - Jika ada meaningful tokens → cek overlap dengan candidate keys
-              - overlap >= SHORT_PENDING_MIN_MATCH → RELEVANT
-              - tidak ada overlap DAN ada strong novelty → NOT RELEVANT
-              - tidak ada overlap TANPA strong novelty → RELEVANT (weak)
-        - Jika input panjang:
-            - overlap >= 2 tokens → RELEVANT (long clarification)
-            - overlap == 0 dan >= 3 tokens baru → NOT RELEVANT (topic switch)
-            - Fallback: overlap_ratio >= PENDING_SWITCH_THRESHOLD
+        Urutan evaluasi input pendek:
+            0. Tokenisasi kosong → cek identity simbolik (lihat sub-branch di bawah)
+            1. Input benar-benar kosong                    → RELEVANT (edge case)
+            2. Semua token low-information                 → RELEVANT ("terserah", "mana?")
+            3. Explicit candidate selection                → RELEVANT ("nomor 1", "yang pertama")
+            4. Token overlap dengan candidate evidence     → RELEVANT ("yang bisnis", "kopi")
+            5. Strong novelty indicator                    → NOT RELEVANT ("C++", "pointer")
+            6. Tidak ada bukti apapun                      → NOT RELEVANT (jangan paksa)
+
+        Urutan evaluasi input panjang:
+            - overlap >= 2 tokens                          → RELEVANT
+            - overlap == 0 dan >= 3 tokens baru            → NOT RELEVANT (topic switch)
+            - fallback: overlap_ratio >= SWITCH_THRESHOLD
+
+        [FIX — Batch E] Sub-branch untuk tokenisasi kosong:
+            "C++" tidak menghasilkan token word-character yang lolos filter panjang,
+            tetapi itu BUKAN input kosong. Identity-nya ("c++") diekstrak dari
+            raw_text, lalu dievaluasi dengan aturan bukti yang sama.
         """
         new_tokens = self._extract_input_tokens(envelope)
         short_threshold = CONFIG.fast_memory.SHORT_PENDING_INPUT_THRESHOLD
         min_match = CONFIG.fast_memory.SHORT_PENDING_MIN_MATCH
 
-        # [REASONING PURITY] Short input validation
+        # ==========================================
+        # JALUR INPUT PENDEK
+        # ==========================================
         if not new_tokens or len(new_tokens) < short_threshold:
+            # [FIX — Batch E] 0. Tokenisasi kosong: bedakan "benar-benar kosong"
+            # dari "berisi identifier simbolik yang tidak lolos tokenisasi".
             if not new_tokens:
-                return True  # input kosong — tetap relevan (edge case)
+                raw_stripped = envelope.raw_text.strip()
 
-            # Cek apakah semua token low-information
+                # 1. Benar-benar kosong (whitespace saja) → edge case, tetap relevan.
+                if not raw_stripped:
+                    return True
+
+                # 3. Explicit selection tetap diprioritaskan (mis. "1", "2").
+                if self._detect_explicit_selection(raw_stripped, pending):
+                    return True
+
+                # Ekstrak identity simbolik + token pendek dari raw_text.
+                identity_tokens = self._extract_symbol_identity_tokens(raw_stripped)
+
+                from retrieval import SignalExtractor
+                extractor = SignalExtractor()
+                meaningful_identity = [
+                    t for t in identity_tokens
+                    if extractor._classify_token(t) != TokenQuality.LOW_INFORMATION
+                ]
+
+                # 2. Semua identity low-information (mis. "ya", "ok") → relevan.
+                if not meaningful_identity:
+                    return True
+
+                # 5. Strong novelty (mis. "c++", "c#") → BUKAN jawaban pending.
+                if any(t in self._STRONG_NOVELTY_INDICATORS for t in meaningful_identity):
+                    return False
+
+                # 4. Overlap dengan bukti candidate → relevan.
+                pending_tokens = self._collect_pending_evidence_tokens(pending, all_keys=all_keys)
+                if set(meaningful_identity).intersection(pending_tokens):
+                    return True
+
+                # 6. Tidak ada bukti apapun → jangan paksa relevan.
+                return False
+
+            # 2. Semua token low-information → RELEVANT (weak fallback)
             quality_map = self._get_input_token_quality(envelope)
             meaningful = [
                 t for t in new_tokens
                 if quality_map.get(t, TokenQuality.NORMAL) != TokenQuality.LOW_INFORMATION
             ]
-
-            # Jika semua low-information → auto relevan ("terserah", "mana?", "pilih saja")
             if not meaningful:
                 return True
 
-            # Ada meaningful tokens — validasi terhadap candidate keys
+            # 3. Explicit candidate selection → RELEVANT
+            if self._detect_explicit_selection(envelope.raw_text, pending):
+                return True
+
+            # 4. Token overlap dengan candidate evidence → RELEVANT
             pending_tokens = self._collect_pending_evidence_tokens(pending, all_keys=all_keys)
             overlap = set(meaningful).intersection(pending_tokens)
-
             if len(overlap) >= min_match:
                 return True
 
-            # Cek strong novelty indicators (domain shift eksplisit)
-            strong_novelty = {
-                "pointer", "reference", "coding", "program", "algoritma",
-                "c++", "python", "java", "astronomi", "hukum", "matematika"
-            }
-            has_strong_novelty = any(t in strong_novelty for t in meaningful)
+            # 5. Strong novelty indicator → NOT RELEVANT
+            has_strong_novelty = any(t in self._STRONG_NOVELTY_INDICATORS for t in meaningful)
             if has_strong_novelty:
                 return False
 
-            # Tidak ada overlap, tidak ada strong novelty → RELEVANT (weak)
-            # Asumsikan ini masih mencoba menjawab pending (e.g. "yang kedua")
-            return True
+            # 6. [MINOR FALLBACK LOCK] Tidak ada bukti apapun → NOT RELEVANT
+            # JANGAN paksa relevan. Biarkan mekanisme topic switch yang menangani.
+            return False
 
-        # Input panjang: logika asli (dengan sumber bukti yang konsisten)
+        # ==========================================
+        # JALUR INPUT PANJANG (logika lama dipertahankan)
+        # ==========================================
         pending_tokens = self._collect_pending_evidence_tokens(pending, all_keys=all_keys)
         overlap = new_tokens.intersection(pending_tokens)
         
@@ -1219,8 +1391,10 @@ class MemoryEngine:
                         # Karena PoC ini tidak menggunakan embedding, kita memerlukan indikator kebaruan kuat 
                         # untuk membedakan "pertanyaan lanjutan pendek" dengan "perpindahan domain eksplisit" 
                         # ketika keduanya memiliki user_overlap_ratio == 0.
-                        strong_novelty_indicators = {"pointer", "reference", "coding", "program", "algoritma", "c++", "python", "java", "astronomi", "hukum", "matematika"}
-                        has_strong_novelty = any(trigger in user_tokens for trigger in strong_novelty_indicators)
+                        # [Batch E] Memakai class attribute agar sinkron dengan _check_pending_relevance.
+                        has_strong_novelty = any(
+                            trigger in user_tokens for trigger in self._STRONG_NOVELTY_INDICATORS
+                        )
                         
                         # GENERALIZED DECISION MATRIX
                         # Jika user tidak memiliki overlap dengan topik aktif, DAN Retrieval Engine juga tidak menemukan bukti semantik (token/desc score rendah)
