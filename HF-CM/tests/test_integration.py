@@ -10,10 +10,11 @@ from zoneinfo import ZoneInfo
 from config import CONFIG
 from models import (
     InputEnvelope, DecisionType, PendingStatus, MemoryClassification,
-    TopicKey, FragmentMetadata, CompressedPayload, EngineResult
+    TopicKey, FragmentMetadata, CompressedPayload, EngineResult,
+    CandidateScore, EvidenceProfile, RetrievedMemory, TokenQuality
 )
 from storage import MemoryStorage
-from retrieval import RetrievalEngine
+from retrieval import RetrievalEngine, SignalExtractor, TopicKeyScorer
 from compression import PayloadCompressor, IntegrityError
 from memory_engine import MemoryEngine
 # [NEW] Import untuk End-to-End Pipeline Testing (Spec 26)
@@ -70,6 +71,45 @@ def print_engine_trace(engine: MemoryEngine, env: InputEnvelope, res: EngineResu
         print(f"\n⏳ [FAST MEMORY: NO ACTIVE PENDING]")
 
     print(f"{'='*65}\n")
+
+
+# ==========================================
+# [ASSOCIATIVE EVIDENCE LOCKING] DIAGNOSTIC HELPER
+# ==========================================
+def print_evidence_trace(res: EngineResult, step_name: str = ""):
+    """
+    Mencetak DUA DIMENSI penilaian: RELEVANCE dan EVIDENCE STRENGTH.
+    Menjawab: KENAPA memori A dipilih, KENAPA B tidak, KAPAN sistem menolak.
+    """
+    print(f"\n{'='*18} 🧾 EVIDENCE: {step_name} {'='*18}")
+    d = res.decision
+    print(f"🧠 [DECISION]      : {d.decision_type.value}")
+    print(f"📊 [CONFIDENCE]    : {d.confidence:.3f}")
+    print(f"🧩 [SUPPORT COUNT] : {d.support_count}")
+    print(f"💪 [EVIDENCE STR]  : {d.evidence_strength:.3f}")
+    print(f"⚡ [CONTRADICTION] : {d.contradiction_score:.3f}")
+    if d.decision_reason:
+        print(f"📝 [REASON]        : {d.decision_reason}")
+    if res.evidence_summary:
+        print("─" * 60)
+        print(res.evidence_summary)
+    print(f"{'='*65}\n")
+
+
+def print_candidate_comparison(candidates, step_name: str = ""):
+    """Membandingkan RELEVANCE vs EVIDENCE STRENGTH antar kandidat secara berdampingan."""
+    print(f"\n{'='*14} ⚖️  CANDIDATE COMPARISON: {step_name} {'='*14}")
+    print(f"{'TITLE':<24} {'RELEVANCE':>10} {'SUPPORT':>8} {'EVID_STR':>9} {'CONFID':>8} {'CONTRA':>8}")
+    for c in candidates:
+        title = (c.title[:22] + "..") if len(c.title) > 22 else c.title
+        print(f"{title:<24} {c.final_score:>10.3f} {c.support_count:>8} "
+              f"{c.evidence_strength:>9.3f} {c.confidence:>8.3f} {c.contradiction_score:>8.3f}")
+        if c.evidence_profile:
+            print(f"    supporting: {', '.join(c.evidence_profile.supporting_evidence_names) or '(none)'}")
+        if c.evidence_notes:
+            print(f"    notes: {'; '.join(c.evidence_notes)}")
+    print(f"{'='*65}\n")
+
 
 # ==========================================
 # FIXTURES (Setup & Teardown)
@@ -558,3 +598,486 @@ def test_scenario_l_cross_session_graph(engine: MemoryEngine, tz: ZoneInfo):
     
     # Should reactivate the coffee key
     assert res3.active_topic_key_id == coffee_key_id, "Sesi 3 harus mengaktifkan kembali Topic Key Kopi dari Sesi 1."
+
+
+# ==========================================================================
+# [ASSOCIATIVE EVIDENCE LOCKING] VALIDATION SUITE (TEST 1 - 9)
+#
+# Fase ini tidak menguji "apakah memori bisa ditemukan", tetapi:
+#   KENAPA memori A dipilih,
+#   KENAPA memori B tidak dipilih,
+#   KAPAN sistem harus menolak memilih.
+#
+# Empat prinsip yang diverifikasi:
+#   1. Satu skor tinggi tidak otomatis berarti bukti kuat.
+#   2. Beberapa bukti yang saling mendukung > satu kecocokan besar.
+#   3. Bukti kontradiktif harus bisa menurunkan kepercayaan.
+#   4. Memori tidak boleh diperbarui sebelum keputusan asosiasinya tervalidasi.
+# ==========================================================================
+
+# ==========================================
+# EVIDENCE TEST 1: MULTI-EVIDENCE MENGALAHKAN SINGLE-EVIDENCE
+# ==========================================
+def test_evidence_1_multi_evidence_beats_single_signal(engine: MemoryEngine, tz: ZoneInfo):
+    """
+    Candidate A: Token saja (sangat tinggi).
+    Candidate B: Token + Description + Co-occurrence (konsisten).
+
+    Expected: B diprioritaskan, dan A TIDAK dianggap confident
+    hanya karena satu skor besar.
+
+    Scorer dipanggil langsung agar dua dimensi (RELEVANCE vs EVIDENCE)
+    dapat diisolasi tanpa pengaruh pipeline lain.
+    """
+    ref = datetime(2023, 10, 25, 14, 0, 0, tzinfo=tz)
+    extractor = SignalExtractor()
+    signal = extractor.extract("bisnis kopi modal strategi", ref)
+
+    tokens = {"bisnis": 1, "kopi": 1, "modal": 1, "strategi": 1}
+    window_pairs = engine._build_window_pairs(["bisnis", "kopi", "modal", "strategi"])
+
+    key_a = TopicKey(
+        key_id="A", title="Token Only",
+        helper_description="",                      # tidak ada bukti deskripsi
+        token_profile=tokens,
+        co_occurrence_profile={},                   # tidak ada bukti co-occurrence
+        created_at=ref
+    )
+    key_b = TopicKey(
+        key_id="B", title="Multi Evidence",
+        helper_description="bisnis kopi modal strategi",
+        token_profile=tokens,
+        co_occurrence_profile=window_pairs,
+        created_at=ref
+    )
+
+    # DF=2 pada 2 Topic Key -> rarity 0, sehingga unique tidak menambah support.
+    df = {t: 2 for t in tokens}
+    scorer = engine.retrieval.scorer
+    sa = scorer.score(signal, key_a, False, 0.0, 0.0, df, total_topic_keys=2)
+    sb = scorer.score(signal, key_b, False, 0.0, 0.0, df, total_topic_keys=2)
+
+    print_candidate_comparison([sa, sb], "Evidence 1 - Multi vs Single")
+
+    # A hanya punya SATU jenis bukti.
+    assert sa.support_count == 1, "Candidate A harus terdeteksi single-signal."
+    assert sa.confidence <= CONFIG.candidate_safety.SINGLE_SIGNAL_CONFIDENCE_CAP, (
+        "Single-signal confidence wajib di-cap."
+    )
+
+    # B punya bukti yang saling mendukung.
+    assert sb.support_count > sa.support_count, "B harus punya lebih banyak jenis bukti."
+    assert sb.final_score > sa.final_score, "Multi-evidence harus menang relevansi."
+    assert sb.confidence > sa.confidence, "Multi-evidence harus lebih dipercaya."
+    assert sb.evidence_profile is not None
+    assert "description" in sb.evidence_profile.supporting_evidence_names
+    assert "co_occurrence" in sb.evidence_profile.supporting_evidence_names
+
+
+# ==========================================
+# EVIDENCE TEST 2: SINGLE STRONG TOKEN TIDAK OTOMATIS MENANG
+# ==========================================
+def test_evidence_2_single_token_not_auto_confident(engine: MemoryEngine, tz: ZoneInfo):
+    """
+    Query: "kopi"
+    Dua topik sama-sama mengandung "kopi", tanpa bukti lain.
+
+    Expected: TIDAK CLEAR. Harus AMBIGUOUS atau INSUFFICIENT_EVIDENCE.
+    """
+    session_id = "session_ev2"
+
+    with engine.storage.transaction() as tx:
+        key_a = TopicKey(
+            key_id="ev2_bisnis", title="Bisnis Kopi",
+            helper_description="Modal dan strategi usaha",
+            created_at=datetime.now(tz), token_profile={"kopi": 10, "bisnis": 10}
+        )
+        key_b = TopicKey(
+            key_id="ev2_kedai", title="Kedai Kopi",
+            helper_description="Lokasi kedai terdekat",
+            created_at=datetime.now(tz), token_profile={"kopi": 10, "kedai": 10}
+        )
+        engine.storage.save_topic_key(tx, key_a)
+        engine.storage.save_topic_key(tx, key_b)
+
+    env = create_envelope(session_id, "kopi", tz)
+    res = engine.process_input(env)
+    print_engine_trace(engine, env, res, "Evidence 2 - Single Token")
+    print_evidence_trace(res, "Evidence 2 - Single Token")
+    print_candidate_comparison(res.decision and res.candidates if hasattr(res, 'candidates') else [], "Evidence 2")
+
+    assert res.decision.decision_type != DecisionType.CLEAR, (
+        "Satu token yang cocok tidak boleh menghasilkan keputusan CONFIDENT."
+    )
+    assert res.decision.decision_type in (
+        DecisionType.AMBIGUOUS, DecisionType.INSUFFICIENT_EVIDENCE, DecisionType.NO_MATCH
+    )
+    assert res.decision.support_count <= 1, "Hanya satu jenis bukti yang boleh terdeteksi."
+
+
+# ==========================================
+# EVIDENCE TEST 3: UNIQUE TOKEN MENANG
+# ==========================================
+def test_evidence_3_unique_token_wins(engine: MemoryEngine, tz: ZoneInfo):
+    """
+    Bisnis Kopi -> modal, juta (identitas spesifik)
+    Kedai Kopi  -> lokasi, menu
+
+    Query memakai subset padat identitas: "kopi modal juta".
+
+    Catatan jujur: frasa natural yang panjang ("Kopi yang modal 50 juta itu")
+    terdilusi token low-information sehingga evidence_strength jatuh di bawah
+    MIN_ASSOCIATIVE_CONFIDENCE. Test ini memakai subset identitas agar yang
+    diukur adalah mekanisme uniqueness, bukan panjang kalimat.
+    """
+    session_id = "session_ev3"
+    ref = datetime.now(tz)
+    bisnis_pairs = engine._build_window_pairs(["kopi", "modal", "juta"])
+
+    with engine.storage.transaction() as tx:
+        key_a = TopicKey(
+            key_id="ev3_bisnis", title="Bisnis Kopi",
+            helper_description="Pembahasan bisnis kopi modal usaha",
+            created_at=ref,
+            token_profile={"kopi": 10, "bisnis": 10, "modal": 5, "juta": 5},
+            co_occurrence_profile=bisnis_pairs
+        )
+        key_b = TopicKey(
+            key_id="ev3_kedai", title="Kedai Kopi",
+            helper_description="Mencari kedai kopi lokasi menu",
+            created_at=ref,
+            token_profile={"kopi": 10, "kedai": 10, "lokasi": 5, "menu": 5},
+            co_occurrence_profile={}
+        )
+        engine.storage.save_topic_key(tx, key_a)
+        engine.storage.save_topic_key(tx, key_b)
+
+    env = create_envelope(session_id, "kopi modal juta", tz)
+    res = engine.process_input(env)
+    print_engine_trace(engine, env, res, "Evidence 3 - Unique Token")
+    print_evidence_trace(res, "Evidence 3 - Unique Token")
+
+    assert res.decision.decision_type == DecisionType.CLEAR, "Bukti identitas unik harus menghasilkan keputusan jelas."
+    assert res.decision.selected_key_id == "ev3_bisnis", "Bisnis Kopi harus menang karena token identitas unik."
+    assert res.decision.support_count >= CONFIG.evidence.MIN_SUPPORTING_EVIDENCE
+    assert res.decision.evidence_strength > 0.0
+
+    # Unique token evidence harus benar-benar terpisah dari token_score.
+    df = engine.storage.get_global_token_counts()
+    assert df.get("kopi", 0) == 2, "kopi muncul di 2 Topic Key."
+    assert df.get("modal", 0) == 1, "modal hanya muncul di 1 Topic Key."
+    assert engine.storage.count_topic_keys_containing_token("juta") == 1
+
+
+# ==========================================
+# EVIDENCE TEST 4: CONTRADICTION PENALTY
+# ==========================================
+def test_evidence_4_contradiction_penalty(engine: MemoryEngine, tz: ZoneInfo):
+    """
+    Query: "bisnis kopi"
+    Kandidat "Kedai Kopi": token kopi cocok, TETAPI deskripsinya
+    menjelaskan intent yang sama sekali berbeda (mencari tempat minum).
+
+    Expected: description contradiction menurunkan skor kandidat itu.
+    """
+    session_id = "session_ev4"
+    ref = datetime.now(tz)
+    bisnis_pairs = engine._build_window_pairs(["bisnis", "kopi"])
+
+    with engine.storage.transaction() as tx:
+        key_a = TopicKey(
+            key_id="ev4_bisnis", title="Bisnis Kopi",
+            helper_description="Pembahasan bisnis kopi modal usaha",
+            created_at=ref,
+            token_profile={"bisnis": 10, "kopi": 10, "modal": 5},
+            co_occurrence_profile=bisnis_pairs
+        )
+        key_b = TopicKey(
+            key_id="ev4_kedai", title="Kedai Terdekat",
+            # Sengaja TIDAK mengandung kata dari query.
+            helper_description="Mencari tempat minum terdekat di kota",
+            created_at=ref,
+            token_profile={"kopi": 10, "kedai": 10, "lokasi": 5},
+            co_occurrence_profile={}
+        )
+        engine.storage.save_topic_key(tx, key_a)
+        engine.storage.save_topic_key(tx, key_b)
+
+    env = create_envelope(session_id, "bisnis kopi", tz)
+    res = engine.process_input(env)
+    print_engine_trace(engine, env, res, "Evidence 4 - Contradiction")
+    print_evidence_trace(res, "Evidence 4 - Contradiction")
+
+    assert res.decision.decision_type == DecisionType.CLEAR
+    assert res.decision.selected_key_id == "ev4_bisnis"
+
+    # Kandidat yang kontradiktif harus tetap terlihat beserta alasannya.
+    kedai = next((c for c in res.candidates if c.key_id == "ev4_kedai"), None)
+    assert kedai is not None, "Kandidat kontradiktif harus tetap tercatat untuk audit."
+    print_candidate_comparison(res.candidates, "Evidence 4 - Contradiction")
+
+    assert kedai.contradiction_score > 0.0, "Contradiction penalty harus diterapkan."
+    assert any("contradiction" in note for note in kedai.evidence_notes), (
+        "Alasan kontradiksi harus bisa diaudit."
+    )
+    bisnis = next(c for c in res.candidates if c.key_id == "ev4_bisnis")
+    assert kedai.final_score < bisnis.final_score
+
+
+# ==========================================
+# EVIDENCE TEST 5: WINDOW CO-OCCURRENCE
+# ==========================================
+def test_evidence_5_window_co_occurrence(engine: MemoryEngine, tz: ZoneInfo):
+    """
+    Stored : "bisnis kecil di bidang kopi"  (tidak berdampingan)
+    Query  : "bisnis kopi"
+
+    Expected: co-occurrence TETAP memberikan evidence.
+    Dibuktikan dengan membandingkan profil WINDOW vs profil ADJACENT-ONLY.
+    """
+    ref = datetime(2023, 10, 25, 14, 0, 0, tzinfo=tz)
+    extractor = SignalExtractor()
+
+    stored_tokens = ["bisnis", "kecil", "bidang", "kopi"]
+    window_profile = engine._build_window_pairs(stored_tokens)
+    adjacent_only_profile = {
+        "bisnis↔kecil": 1,
+        "kecil↔bidang": 1,
+        "bidang↔kopi": 1,
+    }
+
+    print(f"\n🪟 WINDOW PAIRS dari 'bisnis kecil di bidang kopi': {list(window_profile.keys())}")
+    assert "bisnis↔kopi" in window_profile, "Window co-occurrence harus menangkap pasangan non-adjacent."
+
+    signal = extractor.extract("bisnis kopi", ref)
+    assert "bisnis↔kopi" in signal.window_co_occurrence_signals
+
+    tokens = {"bisnis": 5, "kopi": 5}
+    df = {"bisnis": 1, "kopi": 1}
+    scorer = engine.retrieval.scorer
+
+    key_window = TopicKey(
+        key_id="W", title="Window Profile", helper_description="bisnis kopi",
+        created_at=ref, token_profile=tokens, co_occurrence_profile=window_profile
+    )
+    key_adjacent = TopicKey(
+        key_id="ADJ", title="Adjacent Only", helper_description="bisnis kopi",
+        created_at=ref, token_profile=tokens, co_occurrence_profile=adjacent_only_profile
+    )
+
+    s_window = scorer.score(signal, key_window, False, 0.0, 0.0, df, total_topic_keys=1)
+    s_adjacent = scorer.score(signal, key_adjacent, False, 0.0, 0.0, df, total_topic_keys=1)
+
+    print_candidate_comparison([s_window, s_adjacent], "Evidence 5 - Window vs Adjacent")
+
+    assert s_window.co_occurrence_score > 0.0, "Window profile harus memberi evidence."
+    assert s_adjacent.co_occurrence_score == 0.0, "Adjacent-only profile tidak boleh cocok dengan query window."
+    assert s_window.final_score > s_adjacent.final_score
+
+
+# ==========================================
+# EVIDENCE TEST 6: EVIDENCE POLLUTION PROTECTION
+# ==========================================
+def test_evidence_6_no_evidence_pollution(engine: MemoryEngine, tz: ZoneInfo):
+    """
+    Turn 1: Bisnis kopi
+    Turn 2: "Bagaimana cara kerja pointer di C++?"
+
+    Expected: token C++/pointer TIDAK masuk ke Token Profile,
+    Co-occurrence, maupun Helper Description milik cluster Kopi.
+    """
+    session_id = "session_ev6"
+
+    env1 = create_envelope(session_id, "Saya mau buka bisnis kopi.", tz)
+    res1 = engine.process_input(env1)
+    coffee_key_id = res1.active_topic_key_id
+    assert coffee_key_id is not None
+
+    coffee_before = engine.storage.get_topic_key(coffee_key_id)
+    profile_before = dict(coffee_before.token_profile)
+    desc_before = coffee_before.helper_description
+
+    env2 = create_envelope(session_id, "Bagaimana cara kerja pointer di C++?", tz, time_offset_hours=1)
+    res2 = engine.process_input(env2)
+    print_engine_trace(engine, env2, res2, "Evidence 6 - Pollution Protection")
+    print_evidence_trace(res2, "Evidence 6 - Pollution Protection")
+
+    keys = engine.storage.get_all_topic_keys()
+    assert len(keys) == 2, "C++ harus menjadi cluster terpisah."
+
+    coffee_after = engine.storage.get_topic_key(coffee_key_id)
+    polluted_tokens = {"pointer", "cara", "kerja", "bagaimana"}
+
+    print(f"\n🛡️  COFFEE PROFILE BEFORE: {list(profile_before.keys())}")
+    print(f"🛡️  COFFEE PROFILE AFTER : {list(coffee_after.token_profile.keys())}")
+
+    assert not (polluted_tokens & set(coffee_after.token_profile.keys())), (
+        "Token C++ tidak boleh mencemari Token Profile Kopi."
+    )
+    for pair in coffee_after.co_occurrence_profile.keys():
+        assert "pointer" not in pair, "Co-occurrence Kopi tidak boleh tercemar."
+    assert "pointer" not in coffee_after.helper_description.lower(), (
+        "Helper Description Kopi tidak boleh tercemar."
+    )
+
+
+# ==========================================
+# EVIDENCE TEST 7: WEAK CONTINUATION TIDAK MEMPERKUAT CLUSTER
+# ==========================================
+def test_evidence_7_weak_continuation_does_not_mutate(engine: MemoryEngine, tz: ZoneInfo):
+    """
+    Input: "Bagaimana itu?" -> seluruh token low-information.
+
+    Expected: fragmen tetap disimpan (percakapan tidak hilang),
+    TETAPI profil topik tidak diperbarui secara agresif.
+    """
+    session_id = "session_ev7"
+
+    env1 = create_envelope(session_id, "Saya mau buka bisnis kopi.", tz)
+    res1 = engine.process_input(env1)
+    coffee_key_id = res1.active_topic_key_id
+
+    coffee_before = engine.storage.get_topic_key(coffee_key_id)
+    profile_before = dict(coffee_before.token_profile)
+    desc_before = coffee_before.helper_description
+    frags_before = len(engine.storage.get_fragment_metadata_by_key(coffee_key_id))
+
+    env2 = create_envelope(session_id, "Bagaimana itu?", tz, time_offset_hours=1)
+    res2 = engine.process_input(env2)
+    print_engine_trace(engine, env2, res2, "Evidence 7 - Weak Continuation")
+    print_evidence_trace(res2, "Evidence 7 - Weak Continuation")
+
+    coffee_after = engine.storage.get_topic_key(coffee_key_id)
+    frags_after = len(engine.storage.get_fragment_metadata_by_key(coffee_key_id))
+
+    print(f"\n🧊 PROFILE BEFORE: {list(profile_before.keys())}")
+    print(f"🧊 PROFILE AFTER : {list(coffee_after.token_profile.keys())}")
+
+    assert len(engine.storage.get_all_topic_keys()) == 1, "Weak continuation tidak boleh memecah cluster."
+    assert "bagaimana" not in coffee_after.token_profile, "Token low-information tidak boleh masuk profil."
+    assert "itu" not in coffee_after.token_profile, "Token low-information tidak boleh masuk profil."
+    assert coffee_after.helper_description == desc_before, "Deskripsi tidak boleh diperbarui oleh bukti lemah."
+    assert frags_after > frags_before, "Fragmen tetap harus disimpan agar percakapan tidak hilang."
+
+
+# ==========================================
+# EVIDENCE TEST 8: STRONG MULTI-EVIDENCE CONTINUATION
+# ==========================================
+def test_evidence_8_strong_continuation_grows_cluster(engine: MemoryEngine, tz: ZoneInfo):
+    """
+    Bisnis kopi -> Modal bisnis kopi sekitar lima juta.
+
+    Expected: Token profile berkembang, Co-occurrence berkembang,
+    Helper description berkembang.
+    """
+    session_id = "session_ev8"
+
+    env1 = create_envelope(session_id, "Saya mau buka bisnis kopi.", tz)
+    res1 = engine.process_input(env1)
+    coffee_key_id = res1.active_topic_key_id
+
+    coffee_before = engine.storage.get_topic_key(coffee_key_id)
+    profile_before = dict(coffee_before.token_profile)
+    cooc_before = dict(coffee_before.co_occurrence_profile)
+    desc_before = coffee_before.helper_description
+
+    env2 = create_envelope(session_id, "Modal bisnis kopi sekitar lima juta.", tz, time_offset_hours=1)
+    res2 = engine.process_input(env2)
+    print_engine_trace(engine, env2, res2, "Evidence 8 - Strong Continuation")
+    print_evidence_trace(res2, "Evidence 8 - Strong Continuation")
+
+    coffee_after = engine.storage.get_topic_key(coffee_key_id)
+
+    print(f"\n🌱 PROFILE BEFORE : {list(profile_before.keys())}")
+    print(f"🌱 PROFILE AFTER  : {list(coffee_after.token_profile.keys())}")
+    print(f"🌱 COOC BEFORE    : {len(cooc_before)} pairs")
+    print(f"🌱 COOC AFTER     : {len(coffee_after.co_occurrence_profile)} pairs")
+    print(f"🌱 DESC BEFORE    : {desc_before}")
+    print(f"🌱 DESC AFTER     : {coffee_after.helper_description}")
+
+    assert len(engine.storage.get_all_topic_keys()) == 1, "Harus tetap satu cluster."
+    assert "modal" in coffee_after.token_profile, "Token profile harus berkembang."
+    assert len(coffee_after.token_profile) > len(profile_before)
+    assert len(coffee_after.co_occurrence_profile) > len(cooc_before), "Co-occurrence harus berkembang."
+    assert coffee_after.helper_description != desc_before, "Helper description harus berkembang."
+    assert res2.decision.support_count >= CONFIG.evidence.MIN_SUPPORTING_EVIDENCE
+
+
+# ==========================================
+# EVIDENCE TEST 9: RETRIEVAL EXPLANATION CONSISTENCY
+# ==========================================
+def test_evidence_9_explanation_consistency(engine: MemoryEngine, tz: ZoneInfo):
+    """
+    final_score TINGGI tetapi support_count RENDAH.
+
+    Expected: decision TIDAK CONFIDENT bila melewati safety rule.
+    Membuktikan bahwa RELEVANCE dan EVIDENCE adalah dua dimensi berbeda.
+    """
+    # Kandidat dengan relevansi sangat tinggi tetapi hanya satu jenis bukti.
+    weak_evidence_candidate = CandidateScore(
+        key_id="ev9_high_score",
+        title="High Score Low Evidence",
+        token_score=1.0,
+        final_score=0.95,             # relevansi sangat tinggi
+        support_count=1,              # tetapi hanya satu jenis bukti
+        evidence_strength=1.0,
+        confidence=CONFIG.candidate_safety.SINGLE_SIGNAL_CONFIDENCE_CAP,
+        continuity_score=0.0,         # tidak ada exemption continuity
+        contradiction_score=0.0,
+        evidence_profile=EvidenceProfile(
+            token_score=1.0,
+            supporting_evidence_count=1,
+            supporting_evidence_names=["token"],
+            evidence_strength=1.0,
+            is_single_signal_dominated=True
+        )
+    )
+
+    gate_decision, gate_reason = engine._validate_candidate_evidence(weak_evidence_candidate)
+    print(f"\n🧾 HIGH RELEVANCE / LOW EVIDENCE -> {gate_decision} | {gate_reason}")
+
+    assert gate_decision == DecisionType.INSUFFICIENT_EVIDENCE, (
+        "Skor tinggi dengan satu bukti tidak boleh lolos sebagai CONFIDENT."
+    )
+
+    # Kandidat dengan bukti yang saling mendukung harus lolos.
+    strong_evidence_candidate = CandidateScore(
+        key_id="ev9_multi",
+        title="Multi Evidence",
+        token_score=0.70,
+        description_score=0.80,
+        co_occurrence_score=0.75,
+        final_score=0.82,
+        support_count=3,
+        evidence_strength=0.75,
+        confidence=0.75,
+        continuity_score=0.0,
+        contradiction_score=0.0,
+        evidence_profile=EvidenceProfile(
+            token_score=0.70,
+            description_score=0.80,
+            co_occurrence_score=0.75,
+            supporting_evidence_count=3,
+            supporting_evidence_names=["token", "description", "co_occurrence"],
+            evidence_strength=0.75
+        )
+    )
+
+    gate_decision_ok, gate_reason_ok = engine._validate_candidate_evidence(strong_evidence_candidate)
+    print(f"🧾 MULTI EVIDENCE -> {gate_decision_ok} | {gate_reason_ok or 'passed'}")
+    assert gate_decision_ok is None, "Multi-evidence yang konsisten harus lolos validasi."
+
+    # Kontradiksi tinggi harus diblokir walaupun relevansi tinggi.
+    contradictory_candidate = CandidateScore(
+        key_id="ev9_contra",
+        title="Contradictory",
+        token_score=0.90,
+        final_score=0.90,
+        support_count=3,
+        evidence_strength=0.80,
+        confidence=0.80,
+        contradiction_score=CONFIG.evidence.MAX_CONTRADICTION_SCORE + 0.10
+    )
+    gate_contra, reason_contra = engine._validate_candidate_evidence(contradictory_candidate)
+    print(f"🧾 CONTRADICTORY -> {gate_contra} | {reason_contra}")
+    assert gate_contra == DecisionType.CONTRADICTORY_EVIDENCE

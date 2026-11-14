@@ -138,6 +138,169 @@ class StorageConstants:
     SQLITE_DB_PATH: Final[str] = "data/memory.db"
 
 
+# ==========================================
+# [ASSOCIATIVE EVIDENCE LOCKING] GRUP BARU
+# Fase ini tidak menambah fitur, tetapi mengunci KUALITAS BUKTI.
+# Prinsip: skor tinggi != bukti kuat.
+# ==========================================
+
+@dataclass(frozen=True)
+class AssociativeEvidenceConstants:
+    """
+    Pengendali kualitas bukti asosiatif (Associative Evidence Locking).
+
+    Menjawab: "Berapa jenis bukti yang benar-benar mendukung kandidat ini?"
+    bukan hanya "Seberapa besar skor akhirnya?"
+    """
+    # [ALIAS] Nama kanonik dokumentasi untuk CROSS_SESSION_WEIGHT.
+    # PENTING: ini BUKAN bobot ke-8. Total ActivationWeights tetap 1.00.
+    # Retrieval harus memakai SALAH SATU (CROSS_SESSION_WEIGHT atau GRAPH_WEIGHT),
+    # TIDAK BOLEH menjumlahkan keduanya.
+    GRAPH_WEIGHT: Final[float] = 0.10
+
+    # Sebuah evidence baru dihitung "mendukung" jika >= batas ini.
+    EVIDENCE_SUPPORT_THRESHOLD: Final[float] = 0.20
+
+    # Minimal berapa JENIS bukti yang mendukung agar boleh auto-retrieve.
+    MIN_SUPPORTING_EVIDENCE: Final[int] = 2
+
+    # Confidence minimum sebelum retrieval otomatis dianggap aman.
+    MIN_ASSOCIATIVE_CONFIDENCE: Final[float] = 0.55
+
+    # Batas toleransi kontradiksi. Di atas ini -> CONTRADICTORY_EVIDENCE.
+    MAX_CONTRADICTION_SCORE: Final[float] = 0.35
+
+    # Token match dianggap "kuat" mulai dari nilai ini.
+    STRONG_TOKEN_MATCH_THRESHOLD: Final[float] = 0.50
+
+    # KONTRADIKSI: token cocok kuat TAPI deskripsi hampir tidak cocok
+    # = indikasi intent topik sebenarnya berbeda.
+    # Contoh: query "lanjutkan bisnis kopi" vs kandidat "Kedai kopi terdekat".
+    DESCRIPTION_CONTRADICTION_THRESHOLD: Final[float] = 0.10
+    DESCRIPTION_CONTRADICTION_PENALTY: Final[float] = 0.20
+
+    # KONTRADIKSI TEMPORAL: user menyebut waktu spesifik, kandidat tidak punya
+    # fragment di rentang waktu itu sama sekali.
+    TEMPORAL_CONTRADICTION_PENALTY: Final[float] = 0.10
+
+    # Deteksi dominasi: jika satu evidence menyumbang >= rasio ini dari total
+    # positive evidence, kandidat dianggap single-signal dominated.
+    EVIDENCE_DOMINANCE_RATIO: Final[float] = 0.75
+
+    # [GUARDRAIL EKSPLISIT] Continuity adalah bukti yang SAH untuk continuation.
+    # Tanpa exemption ini, "Modalnya sekitar 50 juta cukup?" (overlap token = 0,
+    # hanya continuity) akan ditolak MIN_SUPPORTING_EVIDENCE dan memecah Scenario 1.
+    # Efek exemption: confidence DI-CAP, bukan kandidat DITOLAK.
+    CONTINUITY_EXEMPT_FROM_MIN_SUPPORT: Final[bool] = True
+
+
+@dataclass(frozen=True)
+class CandidateSafetyConstants:
+    """
+    Pengaman agar satu skor besar tidak menghasilkan kepercayaan palsu.
+    """
+    # Jika hanya 1 jenis bukti aktif, confidence tidak boleh melewati ini.
+    SINGLE_SIGNAL_CONFIDENCE_CAP: Final[float] = 0.70
+
+    # Jika hanya 2 jenis bukti aktif, confidence masih dibatasi.
+    DUAL_SIGNAL_CONFIDENCE_CAP: Final[float] = 0.85
+
+    # Margin minimum antara kandidat #1 dan #2 agar boleh dianggap tunggal.
+    MIN_TOP_CANDIDATE_MARGIN: Final[float] = 0.05
+
+
+@dataclass(frozen=True)
+class CoOccurrenceConstants:
+    """
+    Co-occurrence naik dari literal-adjacent menjadi asosiatif berbasis window.
+
+    Level 1 (Adjacent) : "bisnis kopi"        -> bisnis <-> kopi
+    Level 2 (Window)   : "bisnis kecil di bidang kopi" -> bisnis <-> kopi tetap tercatat
+    """
+    CO_OCCURRENCE_WINDOW_SIZE: Final[int] = 5
+
+    # Pasangan dengan kekuatan di bawah ini tidak dianggap evidence.
+    CO_OCCURRENCE_MIN_STRENGTH: Final[float] = 0.10
+
+    # Semakin jauh jarak token dalam window, semakin lemah hubungannya.
+    # distance=1 -> 1.0, distance=2 -> 0.75, distance=3 -> 0.5625, dst.
+    CO_OCCURRENCE_DECAY: Final[float] = 0.75
+
+    # Pasangan bersebelahan langsung tetap mendapat nilai penuh.
+    ADJACENT_PAIR_BONUS: Final[float] = 1.0
+
+
+@dataclass(frozen=True)
+class MemoryMutationConstants:
+    """
+    EVIDENCE BEFORE MUTATION.
+
+    ANALYZE -> SCORE -> VALIDATE EVIDENCE -> DECIDE -> BARU UPDATE MEMORY
+
+    Mencegah "evidence pollution": token C++/pointer masuk ke Token Profile,
+    Co-occurrence, dan Helper Description milik cluster Bisnis Kopi.
+    """
+    # Confidence minimum agar boleh memperbarui token_profile & co_occurrence.
+    # Diselaraskan dengan MIN_TOPIC_ACTIVATION_SCORE (0.15) agar kandidat yang
+    # lolos activation gate tidak otomatis diblokir saat mutasi.
+    MIN_EVIDENCE_TO_MUTATE_TOPIC: Final[float] = 0.15
+
+    # Deskripsi adalah identitas manusia-readable -> butuh bukti lebih kuat.
+    MIN_EVIDENCE_TO_UPDATE_DESCRIPTION: Final[float] = 0.30
+
+    # Minimal jenis bukti pendukung agar mutasi diizinkan.
+    MIN_SUPPORT_TO_MUTATE_TOPIC: Final[int] = 1
+
+    # [GUARDRAIL EKSPLISIT] Continuation yang hanya didukung continuity tetap
+    # boleh memperluas cluster (Scenario 1: Modal / Lokasi tanpa kata "kopi").
+    # Yang DITOLAK adalah mutasi dengan bukti lemah ATAU kontradiksi tinggi.
+    ALLOW_CONTINUITY_ONLY_MUTATION: Final[bool] = True
+
+    # Kontradiksi di atas batas ini memblokir mutasi walaupun skor akhir tinggi.
+    MUTATION_CONTRADICTION_BLOCK: Final[float] = 0.35
+
+
+@dataclass(frozen=True)
+class TokenQualityConstants:
+    """
+    Tidak semua token memiliki kekuatan identitas yang sama.
+
+    "bagaimana" != "kopi" != "Rp50 juta"
+    """
+    # Token fungsional / kata tanya / kata ganti: nilai informasi rendah.
+    LOW_INFORMATION_TOKENS: Final[frozenset] = frozenset({
+        "saya", "aku", "kamu", "anda", "dia", "mereka", "kita", "kami",
+        "yang", "dan", "atau", "untuk", "dengan", "dari", "pada", "tentang",
+        "bagaimana", " gimana", "apa", "siapa", "kapan", "dimana", "mana",
+        "mengapa", "kenapa", "berapa", "apakah", "itu", "ini", "tersebut",
+        "ingin", "mau", "bisa", "boleh", "tolong", "coba", "saja", "dong",
+        "yah", "nih", "sih", "deh", "lah", "kah", "pun", "juga", "lagi",
+        "sudah", "belum", "akan", "sedang", "telah", "masih", "pernah",
+        "bahas", "bahasan", "jelaskan", "sebut", "sebutkan", "bilang",
+        "maksud", "maksudnya", "sebenarnya", "kira", "pikir", "rasa",
+        "lanjutkan", "lanjut", "terus", "lalu", "kemudian", "jadi", "kalau",
+        "nah", "selanjutnya", "berikutnya", "kembali", "tadi", "sebelumnya",
+        "kita", "bahas", "buat", "bikin", "minta", "kasih", "beri",
+    })
+
+    # Token numerik / identifier: nilai identitas tertinggi.
+    # Contoh: "rp50", "50", "juta", "15", "2023", "v2"
+    NUMERIC_IDENTIFIER_PATTERN: Final[str] = r"^(rp)?\d+([.,]\d+)?$|^\d+[a-z]+$|^v\d+$"
+
+    # Token >= panjang ini dan bukan low-information dianggap TOPIC SIGNAL.
+    MIN_TOPIC_SIGNAL_LENGTH: Final[int] = 4
+
+    # Token yang muncul di <= rasio ini dari seluruh Topic Key = RARE SIGNAL.
+    RARE_TOKEN_DF_RATIO: Final[float] = 0.25
+
+    # Bobot kualitas token (pengali, bukan pengganti ActivationWeights).
+    LOW_INFORMATION_WEIGHT: Final[float] = 0.25
+    NORMAL_WEIGHT: Final[float] = 1.0
+    TOPIC_SIGNAL_WEIGHT: Final[float] = 1.25
+    RARE_SIGNAL_WEIGHT: Final[float] = 1.5
+    NUMERIC_IDENTIFIER_WEIGHT: Final[float] = 2.0
+
+
 @dataclass(frozen=True)
 class HF_CMConfig:
     """Global Configuration Aggregator."""
@@ -156,5 +319,11 @@ class HF_CMConfig:
     fragment_ranking: Final[FragmentRankingConstants] = FragmentRankingConstants() # [NEW]
     graph: Final[GraphConstants] = GraphConstants()
     storage: Final[StorageConstants] = StorageConstants()
+    # [ASSOCIATIVE EVIDENCE LOCKING] Grup pengendali kualitas bukti
+    evidence: Final[AssociativeEvidenceConstants] = AssociativeEvidenceConstants()
+    candidate_safety: Final[CandidateSafetyConstants] = CandidateSafetyConstants()
+    co_occurrence: Final[CoOccurrenceConstants] = CoOccurrenceConstants()
+    mutation: Final[MemoryMutationConstants] = MemoryMutationConstants()
+    token_quality: Final[TokenQualityConstants] = TokenQualityConstants()
 
 CONFIG: Final[HF_CMConfig] = HF_CMConfig()

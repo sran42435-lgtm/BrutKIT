@@ -7,6 +7,11 @@ Fungsi:
 2. Mengelola Fast State (Pending Ambiguity).
 3. Menerapkan Continuity Window Analysis (Mencegah 'Sticky Topic').
 4. Menjamin transaksi penyimpanan memori bersifat Atomik (No Half-Memory).
+
+[ASSOCIATIVE EVIDENCE LOCKING]
+EVIDENCE BEFORE MUTATION:
+    ANALYZE -> SCORE -> VALIDATE EVIDENCE -> DECIDE -> BARU UPDATE MEMORY
+Memori tidak boleh diperbarui sebelum keputusan asosiasinya cukup tervalidasi.
 """
 
 import logging
@@ -14,14 +19,15 @@ import re
 import uuid
 import statistics
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 from config import CONFIG
 from models import (
     InputEnvelope, EngineResult, EngineDecision, DecisionType, 
     MemoryClassification, PendingState, PendingStatus, TopicKey, 
     FragmentMetadata, CompressedPayload, MemoryGraphEdge, RelationshipType,
-    CandidateScore, TurnAnalysisResult, ReconstructionStatus
+    CandidateScore, TurnAnalysisResult, ReconstructionStatus,
+    RetrievedMemory, TokenQuality
 )
 from storage import MemoryStorage
 from retrieval import RetrievalEngine, RetrievalResult
@@ -130,6 +136,11 @@ class MemoryEngine:
         
         # [NEW] Fetch Global Token Counts for Unique Token Evidence
         global_token_counts = self.storage.get_global_token_counts()
+
+        # [ASSOCIATIVE EVIDENCE LOCKING] Graph sebagai EVIDENCE, bukan absolute truth.
+        # Sebelumnya cross_session_evidence tidak pernah dikirim sehingga graph_score
+        # selalu 0 dan tidak pernah memengaruhi keputusan.
+        graph_evidence = self._build_graph_evidence(all_keys, relevant_fragments, active_topic_id)
         
         retrieval_result = self.retrieval.retrieve(
             input_text=context_text,
@@ -138,7 +149,8 @@ class MemoryEngine:
             reference_time=ref_time,
             active_topic_id=active_topic_id,
             continuity_score=continuity_score,
-            global_token_counts=global_token_counts
+            global_token_counts=global_token_counts,
+            cross_session_evidence=graph_evidence
         )
 
         # ==========================================
@@ -149,7 +161,16 @@ class MemoryEngine:
         # [FIX] Jika ada pending state dan keputusan baru adalah CLEAR, 
         # ATAU jika ini adalah Cross-Session Pending yang berhasil di-retrieval (tidak ambigu lagi),
         # berarti klarifikasi user berhasil mengurai ambiguitas.
-        if active_pending and (decision.decision_type == DecisionType.CLEAR or (is_cross_session_pending and decision.decision_type != DecisionType.AMBIGUOUS)):
+        # [EVIDENCE LOCKING] Kegagalan bukti TIDAK boleh dianggap sebagai resolusi.
+        _unresolved_states = {
+            DecisionType.AMBIGUOUS,
+            DecisionType.INSUFFICIENT_EVIDENCE,
+            DecisionType.CONTRADICTORY_EVIDENCE,
+        }
+        if active_pending and (
+            decision.decision_type == DecisionType.CLEAR
+            or (is_cross_session_pending and decision.decision_type not in _unresolved_states)
+        ):
             active_pending.status = PendingStatus.RESOLVED
             active_pending.last_updated_at = ref_time
             with self.storage.transaction() as tx:
@@ -160,15 +181,31 @@ class MemoryEngine:
         if decision.decision_type == DecisionType.AMBIGUOUS:
             question = retrieval_result.clarification_message or "Maaf, saya kurang yakin. Maksud Anda topik yang mana?"
             return self._handle_ambiguity(envelope, retrieval_result, active_pending, question)
+
+        # [ASSOCIATIVE EVIDENCE LOCKING] Dua kondisi gagal-bukti yang BERBEDA dari ambiguitas.
+        # AMBIGUOUS              : beberapa kandidat kuat
+        # INSUFFICIENT_EVIDENCE  : tidak ada kandidat yang cukup terbukti
+        # CONTRADICTORY_EVIDENCE : ada kecocokan tetapi bukti saling bertentangan
+        if decision.decision_type in (DecisionType.INSUFFICIENT_EVIDENCE, DecisionType.CONTRADICTORY_EVIDENCE):
+            question = retrieval_result.clarification_message or decision.message or (
+                "Bukti yang saya miliki belum cukup untuk memilih satu topik. Bisa diperjelas?"
+            )
+            return self._handle_ambiguity(
+                envelope, retrieval_result, active_pending, question,
+                decision_type=decision.decision_type
+            )
             
         # ==========================================
         # PHASE 4: EXACT RECONSTRUCTION (Layer 7)
         # ==========================================
         exact_memories = []
+        retrieved_memories: List[RetrievedMemory] = []
         reconstruction_status = ReconstructionStatus.NO_MEMORY_REQUESTED
         
         if decision.selected_fragment_ids:
             exact_memories, reconstruction_status = self._reconstruct_memories(decision.selected_fragment_ids)
+            # [ASSOCIATIVE EVIDENCE LOCKING] Bawa metadata bukti ke Context Builder.
+            retrieved_memories = self._attach_evidence_metadata(exact_memories, retrieval_result)
             
         # ==========================================
         # PHASE 5: GENERATION (Layer 8 & 9)
@@ -181,7 +218,7 @@ class MemoryEngine:
                 
             model_request = self.context_builder.build_context(
                 current_user_input=envelope.raw_text,
-                exact_memories=exact_memories,
+                exact_memories=retrieved_memories if retrieved_memories else exact_memories,
                 active_topic_title=active_topic_title
             )
             try:
@@ -213,7 +250,11 @@ class MemoryEngine:
             retrieved_memory_ids=decision.selected_fragment_ids,
             active_topic_key_id=analysis.active_topic_key_id,
             persistence_status="SUCCESS",
-            reconstruction_status=reconstruction_status
+            reconstruction_status=reconstruction_status,
+            retrieved_memories=retrieved_memories,
+            evidence_summary=retrieval_result.evidence_summary,
+            # [EVIDENCE LOCKING] Sertakan kandidat yang DITOLAK agar bisa diaudit.
+            candidates=retrieval_result.candidates
         )
 
     # ==========================================
@@ -362,32 +403,305 @@ class MemoryEngine:
             fragments.extend(self.storage.get_fragment_metadata_by_key(k.key_id))
         return fragments
 
+    # ==========================================
+    # [ASSOCIATIVE EVIDENCE LOCKING] HELPERS
+    # ==========================================
+
+    def _build_graph_evidence(
+        self,
+        keys: List[TopicKey],
+        fragments: List[FragmentMetadata],
+        active_topic_id: Optional[str]
+    ) -> Dict[str, float]:
+        """
+        Graph = EVIDENCE, bukan absolute truth.
+
+        Menjawab: "Apakah kandidat ini pernah memiliki hubungan kuat dengan
+        fragment/topik yang sekarang aktif?"
+
+        Skor diambil dari kekuatan edge terkuat yang menghubungkan fragment
+        kandidat dengan fragment referensi (topik aktif).
+        """
+        evidence: Dict[str, float] = {}
+        if not active_topic_id:
+            return evidence
+
+        reference_ids = [
+            f.fragment_id for f in fragments if f.topic_key_id == active_topic_id
+        ]
+        if not reference_ids:
+            return evidence
+        # Batasi referensi agar tidak meledak pada dataset besar.
+        reference_ids = reference_ids[:CONFIG.graph.MAX_EDGES_PER_NODE]
+
+        for key in keys:
+            key_frag_ids = [f.fragment_id for f in fragments if f.topic_key_id == key.key_id]
+            if not key_frag_ids:
+                continue
+            scores = self.storage.get_fragment_graph_evidence(key_frag_ids, reference_ids)
+            if scores:
+                best = max(scores.values())
+                if best > 0:
+                    evidence[key.key_id] = best
+        return evidence
+
+    def _attach_evidence_metadata(
+        self,
+        exact_memories: List[dict],
+        retrieval: RetrievalResult
+    ) -> List[RetrievedMemory]:
+        """
+        Mengubah dict memori hasil rekonstruksi menjadi RetrievedMemory yang
+        membawa metadata kualitas bukti, agar Context Builder dapat mengurutkan
+        berdasarkan bukti dan bukan sekadar recency.
+        """
+        score_map = retrieval.selected_fragment_scores or {}
+        results: List[RetrievedMemory] = []
+        for mem in exact_memories:
+            fid = mem.get('fragment_id', '')
+            meta = score_map.get(fid, {})
+            results.append(RetrievedMemory(
+                fragment_id=fid,
+                text=mem.get('text', ''),
+                timestamp=mem.get('timestamp', ''),
+                topic_key_id=mem.get('topic_key_id', ''),
+                relevance_score=meta.get('relevance_score', mem.get('relevance_score', 0.0)),
+                temporal_score=meta.get('temporal_score', 0.0),
+                graph_score=meta.get('graph_score', 0.0),
+                evidence_strength=meta.get('relevance_score', 0.0),
+                exact_temporal_match=meta.get('exact_temporal_match', False)
+            ))
+        return results
+
+    def _build_window_pairs(self, tokens: List[str]) -> Dict[str, int]:
+        """
+        [ASSOCIATIVE EVIDENCE LOCKING] Co-occurrence berbasis window untuk PERSISTENCE.
+
+        Wajib selaras dengan retrieval: jika retrieval mencocokkan window pairs
+        tetapi persistence hanya menyimpan adjacent pairs, maka
+        "bisnis kecil di bidang kopi" tidak akan pernah cocok dengan query "bisnis kopi".
+        """
+        cc = CONFIG.co_occurrence
+        pairs: Dict[str, int] = {}
+        for i, token_a in enumerate(tokens):
+            window_end = min(len(tokens), i + cc.CO_OCCURRENCE_WINDOW_SIZE + 1)
+            for j in range(i + 1, window_end):
+                token_b = tokens[j]
+                if token_a == token_b:
+                    continue
+                distance = j - i
+                strength = cc.ADJACENT_PAIR_BONUS if distance == 1 else (
+                    cc.ADJACENT_PAIR_BONUS * (cc.CO_OCCURRENCE_DECAY ** (distance - 1))
+                )
+                if strength < cc.CO_OCCURRENCE_MIN_STRENGTH:
+                    continue
+                left, right = sorted([token_a, token_b])
+                pair = f"{left}↔{right}"
+                pairs[pair] = pairs.get(pair, 0) + 1
+        return pairs
+
+    def _compute_mutation_permissions(
+        self,
+        envelope: InputEnvelope,
+        retrieval: RetrievalResult,
+        candidate: Optional[CandidateScore],
+        classification: MemoryClassification
+    ) -> Tuple[bool, bool, str, float, int, float]:
+        """
+        EVIDENCE BEFORE MUTATION.
+
+        Mengembalikan:
+        (mutation_allowed, description_update_allowed, reason,
+         evidence_strength, support_count, contradiction_score)
+
+        Mencegah "evidence pollution": token C++/pointer masuk ke Token Profile,
+        Co-occurrence, dan Helper Description milik cluster Bisnis Kopi.
+        """
+        mut = CONFIG.mutation
+
+        # Topik baru selalu boleh dibuat (tidak ada cluster lama yang bisa tercemar).
+        if classification == MemoryClassification.NEW_TOPIC or candidate is None:
+            return (True, True, "new topic / no candidate", 0.0, 0, 0.0)
+
+        evidence_strength = candidate.evidence_strength
+        support_count = candidate.support_count
+        contradiction = candidate.contradiction_score
+
+        # 1. Kontradiksi tinggi memblokir mutasi walaupun skor akhir tinggi.
+        if contradiction > mut.MUTATION_CONTRADICTION_BLOCK:
+            return (False, False,
+                    f"blocked: contradiction {contradiction:.2f} > {mut.MUTATION_CONTRADICTION_BLOCK:.2f}",
+                    evidence_strength, support_count, contradiction)
+
+        # 2. Continuation harus punya bukti cukup.
+        if evidence_strength < mut.MIN_EVIDENCE_TO_MUTATE_TOPIC:
+            return (False, False,
+                    f"blocked: evidence {evidence_strength:.2f} < {mut.MIN_EVIDENCE_TO_MUTATE_TOPIC:.2f}",
+                    evidence_strength, support_count, contradiction)
+
+        if support_count < mut.MIN_SUPPORT_TO_MUTATE_TOPIC:
+            continuity_only_ok = (
+                mut.ALLOW_CONTINUITY_ONLY_MUTATION
+                and candidate.continuity_score >= CONFIG.evidence.EVIDENCE_SUPPORT_THRESHOLD
+            )
+            if not continuity_only_ok:
+                return (False, False,
+                        f"blocked: support {support_count} < {mut.MIN_SUPPORT_TO_MUTATE_TOPIC}",
+                        evidence_strength, support_count, contradiction)
+
+        # 3. [ANTI-POLLUTION] Token low-information tidak membawa identitas topik.
+        # "Bagaimana itu?" tidak boleh memperkaya profil cluster apa pun.
+        signal = retrieval.signal_profile
+        quality_map = (signal.token_quality if signal else {}) or {}
+        user_tokens = [
+            t for t in re.findall(r'\b\w+\b', envelope.raw_text.lower())
+            if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH
+        ]
+        meaningful_tokens = [
+            t for t in user_tokens
+            if quality_map.get(t, TokenQuality.NORMAL) != TokenQuality.LOW_INFORMATION
+        ]
+        if user_tokens and not meaningful_tokens:
+            return (True, False,
+                    "fragment stored, topic profile untouched: only low-information tokens",
+                    evidence_strength, support_count, contradiction)
+
+        # 4. Deskripsi adalah identitas manusia-readable -> butuh bukti lebih kuat.
+        desc_allowed = evidence_strength >= mut.MIN_EVIDENCE_TO_UPDATE_DESCRIPTION
+        reason = "allowed" if desc_allowed else "allowed: description update held (evidence below description threshold)"
+        return (True, desc_allowed, reason, evidence_strength, support_count, contradiction)
+
     def _make_decision(self, result: RetrievalResult, pending: Optional[PendingState]) -> EngineDecision:
-        """Menerjemahkan hasil retrieval menjadi keputusan mesin."""
+        """
+        Menerjemahkan hasil retrieval menjadi keputusan mesin.
+
+        [ASSOCIATIVE EVIDENCE LOCKING] Engine tidak boleh langsung percaya
+        kandidat tertinggi. Keputusan membawa alasan yang bisa diaudit.
+        """
         if result.decision_type == DecisionType.AMBIGUOUS:
             return EngineDecision(
                 decision_type=DecisionType.AMBIGUOUS,
-                message=result.clarification_message or "Ambiguitas terdeteksi. Memerlukan klarifikasi."
+                message=result.clarification_message or "Ambiguitas terdeteksi. Memerlukan klarifikasi.",
+                decision_reason=result.analysis_notes
+            )
+
+        # [EVIDENCE LOCKING] Dua state gagal-bukti dipertahankan apa adanya,
+        # TIDAK dilipat menjadi NO_MATCH.
+        if result.decision_type in (DecisionType.INSUFFICIENT_EVIDENCE, DecisionType.CONTRADICTORY_EVIDENCE):
+            top = result.candidates[0] if result.candidates else None
+            return EngineDecision(
+                decision_type=result.decision_type,
+                message=result.clarification_message or result.analysis_notes,
+                confidence=top.confidence if top else 0.0,
+                support_count=top.support_count if top else 0,
+                evidence_strength=top.evidence_strength if top else 0.0,
+                contradiction_score=top.contradiction_score if top else 0.0,
+                decision_reason=result.analysis_notes
             )
             
         if result.decision_type == DecisionType.CLEAR:
+            selected = next(
+                (c for c in result.candidates if c.key_id == result.selected_key_id),
+                result.candidates[0] if result.candidates else None
+            )
+
+            # Re-validasi di sisi Engine: jangan langsung percaya candidates[0].
+            gate_decision, gate_reason = self._validate_candidate_evidence(selected)
+            if gate_decision is not None:
+                return EngineDecision(
+                    decision_type=gate_decision,
+                    message=gate_reason,
+                    confidence=selected.confidence if selected else 0.0,
+                    support_count=selected.support_count if selected else 0,
+                    evidence_strength=selected.evidence_strength if selected else 0.0,
+                    contradiction_score=selected.contradiction_score if selected else 0.0,
+                    decision_reason=gate_reason
+                )
+
             return EngineDecision(
                 decision_type=DecisionType.CLEAR,
                 selected_key_id=result.selected_key_id,
                 selected_fragment_ids=result.selected_fragment_ids,
-                message=f"Topik terpilih: {result.selected_key_id}"
+                message=f"Topik terpilih: {result.selected_key_id}",
+                confidence=selected.confidence if selected else 0.0,
+                support_count=selected.support_count if selected else 0,
+                evidence_strength=selected.evidence_strength if selected else 0.0,
+                contradiction_score=selected.contradiction_score if selected else 0.0,
+                decision_reason=result.analysis_notes
             )
             
         return EngineDecision(
             decision_type=DecisionType.NO_MATCH,
-            message="Tidak ada memori relevan ditemukan."
+            message="Tidak ada memori relevan ditemukan.",
+            decision_reason=result.analysis_notes
         )
 
-    def _handle_ambiguity(self, envelope: InputEnvelope, result: RetrievalResult, existing: Optional[PendingState], question: str) -> EngineResult:
+    def _validate_candidate_evidence(
+        self,
+        candidate: Optional[CandidateScore]
+    ) -> Tuple[Optional[DecisionType], str]:
+        """
+        EVIDENCE VALIDATION di sisi Engine (lapis kedua setelah Retrieval).
+
+        Support cukup? Kontradiksi rendah? Confidence cukup?
+        """
+        if candidate is None:
+            return (None, "")
+
+        ev = CONFIG.evidence
+
+        if candidate.contradiction_score > ev.MAX_CONTRADICTION_SCORE:
+            return (
+                DecisionType.CONTRADICTORY_EVIDENCE,
+                f"Bukti kontradiktif pada '{candidate.title}' "
+                f"(contradiction={candidate.contradiction_score:.2f})."
+            )
+
+        if candidate.support_count < ev.MIN_SUPPORTING_EVIDENCE:
+            continuity_exemption = (
+                ev.CONTINUITY_EXEMPT_FROM_MIN_SUPPORT
+                and candidate.continuity_score >= ev.EVIDENCE_SUPPORT_THRESHOLD
+            )
+            if not continuity_exemption:
+                return (
+                    DecisionType.INSUFFICIENT_EVIDENCE,
+                    f"Bukti pendukung tidak cukup pada '{candidate.title}' "
+                    f"(support={candidate.support_count})."
+                )
+
+        if candidate.confidence < ev.MIN_ASSOCIATIVE_CONFIDENCE:
+            return (
+                DecisionType.INSUFFICIENT_EVIDENCE,
+                f"Confidence asosiatif tidak cukup pada '{candidate.title}' "
+                f"(confidence={candidate.confidence:.2f})."
+            )
+
+        return (None, "")
+
+    def _handle_ambiguity(
+        self, 
+        envelope: InputEnvelope, 
+        result: RetrievalResult, 
+        existing: Optional[PendingState], 
+        question: str,
+        decision_type: DecisionType = DecisionType.AMBIGUOUS
+    ) -> EngineResult:
         """
         [OVERHAUL] Clarification Round Lifecycle (Review Kedua).
         Menangani increment round dan fallback jika MAX_CLARIFICATION_ROUNDS tercapai.
+
+        [EVIDENCE LOCKING] decision_type dapat berupa AMBIGUOUS,
+        INSUFFICIENT_EVIDENCE, atau CONTRADICTORY_EVIDENCE — ketiganya berbeda.
         """
+        top = result.candidates[0] if result.candidates else None
+        decision_kwargs = dict(
+            confidence=top.confidence if top else 0.0,
+            support_count=top.support_count if top else 0,
+            evidence_strength=top.evidence_strength if top else 0.0,
+            contradiction_score=top.contradiction_score if top else 0.0,
+            decision_reason=result.analysis_notes
+        )
+
         if existing and existing.status == PendingStatus.ACTIVE:
             round_num = existing.clarification_round + 1
             if round_num > CONFIG.fast_memory.MAX_CLARIFICATION_ROUNDS:
@@ -399,7 +713,10 @@ class MemoryEngine:
                 return EngineResult(
                     assistant_response=fallback_msg,
                     decision=EngineDecision(decision_type=DecisionType.INSUFFICIENT, message=fallback_msg),
-                    persistence_status="PENDING_EXPIRED"
+                    persistence_status="PENDING_EXPIRED",
+                    evidence_summary=result.evidence_summary,
+                    # [EVIDENCE LOCKING] Kandidat tetap disertakan untuk audit.
+                    candidates=result.candidates
                 )
             
             existing.clarification_round = round_num
@@ -409,8 +726,11 @@ class MemoryEngine:
                 self.storage.save_pending_state(tx, existing)
             return EngineResult(
                 assistant_response=question,
-                decision=EngineDecision(decision_type=DecisionType.AMBIGUOUS, message=question),
-                persistence_status="PENDING_UPDATED"
+                decision=EngineDecision(decision_type=decision_type, message=question, **decision_kwargs),
+                persistence_status="PENDING_UPDATED",
+                evidence_summary=result.evidence_summary,
+                # [EVIDENCE LOCKING] Kandidat tetap disertakan untuk audit.
+                candidates=result.candidates
             )
 
         new_pending = PendingState(
@@ -430,8 +750,11 @@ class MemoryEngine:
             
         return EngineResult(
             assistant_response=question,
-            decision=EngineDecision(decision_type=DecisionType.AMBIGUOUS, message=question),
-            persistence_status="PENDING_CREATED"
+            decision=EngineDecision(decision_type=decision_type, message=question, **decision_kwargs),
+            persistence_status="PENDING_CREATED",
+            evidence_summary=result.evidence_summary,
+            # [EVIDENCE LOCKING] Kandidat tetap disertakan untuk audit.
+            candidates=result.candidates
         )
 
     def _reconstruct_memories(self, fragment_ids: List[str]) -> Tuple[List[dict], ReconstructionStatus]:
@@ -497,6 +820,8 @@ class MemoryEngine:
         [CRITICAL FIX] Generalized Topic Switch (Review Kedua).
         Menghapus hardcoded domain_shift_triggers. Menggunakan heuristik struktural murni:
         User Overlap + Retrieval Semantic Score + Short Probe Detection + Continuation Markers.
+
+        [EVIDENCE LOCKING] Hasil analisis kini juga membawa izin mutasi memori.
         """
         if retrieval.selected_key_id:
             if retrieval.selected_key_id == current_active_id:
@@ -562,11 +887,27 @@ class MemoryEngine:
         active_key_for_fragment = retrieval.selected_key_id
         if classification == MemoryClassification.NEW_TOPIC:
             active_key_for_fragment = None
+
+        # [EVIDENCE LOCKING] EVIDENCE BEFORE MUTATION.
+        selected_candidate = next(
+            (c for c in retrieval.candidates if c.key_id == active_key_for_fragment),
+            None
+        )
+        (mutation_allowed, desc_allowed, mutation_reason,
+         ev_strength, support_count, contradiction) = self._compute_mutation_permissions(
+            envelope, retrieval, selected_candidate, classification
+        )
             
         return TurnAnalysisResult(
             classification=classification,
             continuity_score=retrieval.candidates[0].final_score if retrieval.candidates else 0.0,
-            active_topic_key_id=active_key_for_fragment
+            active_topic_key_id=active_key_for_fragment,
+            evidence_strength=ev_strength,
+            support_count=support_count,
+            contradiction_score=contradiction,
+            mutation_allowed=mutation_allowed,
+            description_update_allowed=desc_allowed,
+            mutation_reason=mutation_reason
         )
 
     def _persist_memory(
@@ -579,6 +920,10 @@ class MemoryEngine:
     ):
         """
         Layer 14 & 15: Transaksi Penyimpanan Memori (Fail-Closed).
+
+        [EVIDENCE LOCKING] Mutasi profil topik HANYA dilakukan bila
+        analysis.mutation_allowed == True. Fragmen tetap disimpan agar
+        percakapan tidak hilang, tetapi cluster tidak tercemar.
         """
         raw_content = f"User: {envelope.raw_text}\nAI: {response}"
         try:
@@ -592,6 +937,18 @@ class MemoryEngine:
         token_counts = {}
         for t in new_tokens:
             token_counts[t] = token_counts.get(t, 0) + 1
+
+        # [EVIDENCE LOCKING] Token low-information tidak boleh masuk profil topik.
+        signal = retrieval.signal_profile
+        quality_map = (signal.token_quality if signal else {}) or {}
+        meaningful_tokens = [
+            t for t in new_tokens
+            if quality_map.get(t, TokenQuality.NORMAL) != TokenQuality.LOW_INFORMATION
+        ]
+        profile_tokens = meaningful_tokens if meaningful_tokens else []
+        profile_counts = {}
+        for t in profile_tokens:
+            profile_counts[t] = profile_counts.get(t, 0) + 1
 
         key_id = analysis.active_topic_key_id
         new_key = None
@@ -619,29 +976,36 @@ class MemoryEngine:
             existing_keys = self.storage.get_all_topic_keys()
             existing_key = next((k for k in existing_keys if k.key_id == key_id), None)
             if existing_key:
-                updated_profile = dict(existing_key.token_profile)
-                for t, count in token_counts.items():
-                    updated_profile[t] = updated_profile.get(t, 0) + count
-                existing_key.token_profile = updated_profile
-                
-                # [NEW] Update Co-occurrence Profile
-                updated_cooc = dict(existing_key.co_occurrence_profile)
-                for i in range(len(new_tokens) - 1):
-                    pair = f"{new_tokens[i]}↔{new_tokens[i+1]}"
-                    updated_cooc[pair] = updated_cooc.get(pair, 0) + 1
-                existing_key.co_occurrence_profile = updated_cooc
-                
-                # [NEW] Evolve Helper Description dengan batas (Review Kedua)
-                MAX_DESC_TOKENS = 50
-                current_desc_tokens = existing_key.helper_description.split()
-                if len(current_desc_tokens) < MAX_DESC_TOKENS:
-                    current_desc_lower = existing_key.helper_description.lower()
-                    new_rep_tokens = []
-                    for t in new_tokens:
-                        if t not in current_desc_lower and len(new_rep_tokens) < 3:
-                            new_rep_tokens.append(t)
-                    if new_rep_tokens:
-                        existing_key.helper_description += f" | {' '.join(new_rep_tokens)}"
+                # [EVIDENCE LOCKING] GERBANG MUTASI.
+                if analysis.mutation_allowed and profile_counts:
+                    updated_profile = dict(existing_key.token_profile)
+                    for t, count in profile_counts.items():
+                        updated_profile[t] = updated_profile.get(t, 0) + count
+                    existing_key.token_profile = updated_profile
+                    
+                    # [NEW] Update Co-occurrence Profile
+                    # [EVIDENCE LOCKING] Window co-occurrence agar selaras dengan retrieval.
+                    updated_cooc = dict(existing_key.co_occurrence_profile)
+                    for pair, count in self._build_window_pairs(profile_tokens).items():
+                        updated_cooc[pair] = updated_cooc.get(pair, 0) + count
+                    existing_key.co_occurrence_profile = updated_cooc
+                    
+                    # [NEW] Evolve Helper Description dengan batas (Review Kedua)
+                    MAX_DESC_TOKENS = 50
+                    current_desc_tokens = existing_key.helper_description.split()
+                    if analysis.description_update_allowed and len(current_desc_tokens) < MAX_DESC_TOKENS:
+                        current_desc_lower = existing_key.helper_description.lower()
+                        new_rep_tokens = []
+                        for t in profile_tokens:
+                            if t not in current_desc_lower and len(new_rep_tokens) < 3:
+                                new_rep_tokens.append(t)
+                        if new_rep_tokens:
+                            existing_key.helper_description += f" | {' '.join(new_rep_tokens)}"
+                else:
+                    logger.info(
+                        f"EVIDENCE GATE: profil topik {key_id[:8]}... tidak dimutasi. "
+                        f"({analysis.mutation_reason})"
+                    )
                     
                 existing_key.updated_at = envelope.timestamp
                 existing_key.activation_count += 1
@@ -650,10 +1014,8 @@ class MemoryEngine:
 
         # [CRITICAL FIX] True Fragment-Level Relevance Profiles
         # Fragment kini memiliki profil token & co-occurrence independen miliknya sendiri.
-        frag_cooc = {}
-        for i in range(len(new_tokens) - 1):
-            pair = f"{new_tokens[i]}↔{new_tokens[i+1]}"
-            frag_cooc[pair] = frag_cooc.get(pair, 0) + 1
+        # [EVIDENCE LOCKING] Fragment menyimpan window pairs agar query window dapat cocok.
+        frag_cooc = self._build_window_pairs(new_tokens)
 
         fragment = FragmentMetadata(
             fragment_id=str(uuid.uuid4()),

@@ -13,13 +13,18 @@ PRINSIP:
 - Strict Budgeting: Memori tidak boleh melanggar batas token.
 - Semantic Isolation: Memori lama dan prompt baru harus terisolasi secara visual/struktural.
 - Fail-Open: Jika tidak ada memori, percakapan tetap berjalan dengan prompt saat ini.
+
+[ASSOCIATIVE EVIDENCE LOCKING]
+Context != sekadar memori terbaru.
+Context = memori paling terbukti relevan.
+Urutan: Relevance -> Temporal -> Graph -> Recency.
 """
 
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 
 from config import CONFIG
-from models import ModelRequest
+from models import ModelRequest, RetrievedMemory
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +46,14 @@ class ContextBuilder:
     def build_context(
         self,
         current_user_input: str,
-        exact_memories: List[Dict],
+        exact_memories: Union[List[Dict], List[RetrievedMemory]],
         active_topic_title: Optional[str] = None,
         system_instructions: Optional[str] = None
     ) -> ModelRequest:
         """
         Merakit konteks final untuk Model API.
+
+        [EVIDENCE LOCKING] Menerima dict legacy MAUPUN RetrievedMemory terstruktur.
         """
         
         # 1. Siapkan System Context
@@ -70,9 +77,36 @@ class ContextBuilder:
             current_user_message=current_user_input
         )
 
+    def _normalize_memories(
+        self,
+        memories: Union[List[Dict], List[RetrievedMemory]]
+    ) -> List[Dict]:
+        """
+        [EVIDENCE LOCKING] Menyeragamkan input menjadi dict agar jalur legacy
+        (dict tanpa metadata bukti) dan jalur baru (RetrievedMemory) dapat
+        diproses oleh logika yang sama.
+        """
+        normalized: List[Dict] = []
+        for mem in memories:
+            if isinstance(mem, RetrievedMemory):
+                normalized.append({
+                    'fragment_id': mem.fragment_id,
+                    'text': mem.text,
+                    'timestamp': mem.timestamp,
+                    'topic_key_id': mem.topic_key_id,
+                    'relevance_score': mem.relevance_score,
+                    'temporal_score': mem.temporal_score,
+                    'graph_score': mem.graph_score,
+                    'evidence_strength': mem.evidence_strength,
+                    'exact_temporal_match': mem.exact_temporal_match,
+                })
+            elif isinstance(mem, dict):
+                normalized.append(mem)
+        return normalized
+
     def _assemble_and_budget_memories(
         self, 
-        memories: List[Dict], 
+        memories: Union[List[Dict], List[RetrievedMemory]], 
         topic_title: Optional[str],
         memory_budget: int
     ) -> str:
@@ -83,10 +117,25 @@ class ContextBuilder:
         if not memories:
             return ""
 
+        memories = self._normalize_memories(memories)
+        if not memories:
+            return ""
+
         # [OVERHAUL] Prioritas Fragment: Relevance Score -> Recency (Review Kedua)
+        # [EVIDENCE LOCKING] Urutan dinaikkan menjadi:
+        #   1. Exact temporal match
+        #   2. Relevance (fragment-level)
+        #   3. Temporal score
+        #   4. Graph relationship
+        #   5. Recency (timestamp)
         def sort_key(mem):
-            # Tuple sorting: relevance_score (desc), then timestamp (desc)
-            return (mem.get('relevance_score', 0.0), mem.get('timestamp', ''))
+            return (
+                1 if mem.get('exact_temporal_match', False) else 0,
+                mem.get('relevance_score', 0.0),
+                mem.get('temporal_score', 0.0),
+                mem.get('graph_score', 0.0),
+                mem.get('timestamp', ''),
+            )
             
         memories = sorted(memories, key=sort_key, reverse=True)
 

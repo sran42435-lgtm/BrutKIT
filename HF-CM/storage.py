@@ -13,7 +13,7 @@ import logging
 import os  # [FIX] Ditambahkan untuk manipulasi direktori
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 from sqlalchemy import (
     create_engine, Column, String, DateTime, Float, Integer, 
@@ -587,3 +587,81 @@ class MemoryStorage:
                     for token in k.token_profile.keys():
                         global_counts[token] = global_counts.get(token, 0) + 1
             return global_counts
+
+    # ==========================================
+    # [ASSOCIATIVE EVIDENCE LOCKING] GLOBAL STATISTICS
+    # ==========================================
+
+    def get_total_topic_key_count(self) -> int:
+        """
+        Total Topic Key aktif. Dipakai sebagai numerator pada formula rarity:
+            rarity(t) = log((TotalKeys+1)/(DF(t)+1)) / log(TotalKeys+1)
+        """
+        with self.SessionLocal() as session:
+            return session.query(TopicKeyDB).filter_by(status="ACTIVE").count()
+
+    def count_topic_keys_containing_token(self, token: str) -> int:
+        """
+        Document Frequency satu token: di berapa Topic Key berbeda token ini muncul.
+        Token yang jarang muncul memiliki nilai identitas lebih tinggi.
+        """
+        with self.SessionLocal() as session:
+            db_keys = session.query(TopicKeyDB).filter_by(status="ACTIVE").all()
+            count = 0
+            for k in db_keys:
+                if k.token_profile and token in k.token_profile:
+                    count += 1
+            return count
+
+    def get_token_document_frequency(self, token: str) -> int:
+        """Alias eksplisit sesuai dokumentasi Associative Evidence Locking."""
+        return self.count_topic_keys_containing_token(token)
+
+    def get_fragment_graph_evidence(
+        self,
+        fragment_ids: List[str],
+        reference_fragment_ids: Optional[List[str]] = None
+    ) -> Dict[str, float]:
+        """
+        Graph sebagai EVIDENCE, bukan absolute truth.
+
+        Mengembalikan skor graph (0..1) per fragment, berdasarkan kekuatan
+        hubungan terhadap fragment referensi (misal fragment topik yang sedang aktif).
+        Jika tidak ada referensi, dipakai kekuatan edge terkuat milik fragment itu.
+        """
+        if not fragment_ids:
+            return {}
+
+        with self.SessionLocal() as session:
+            edges = session.query(GraphEdgeDB).filter(
+                (GraphEdgeDB.source_node_id.in_(fragment_ids)) |
+                (GraphEdgeDB.target_node_id.in_(fragment_ids))
+            ).all()
+
+            reference_set = set(reference_fragment_ids or [])
+            scores: Dict[str, float] = {fid: 0.0 for fid in fragment_ids}
+
+            for e in edges:
+                strength = max(0.0, min(1.0, e.strength if e.strength is not None else e.weight))
+                for fid in fragment_ids:
+                    if e.source_node_id != fid and e.target_node_id != fid:
+                        continue
+                    other = e.target_node_id if e.source_node_id == fid else e.source_node_id
+                    if reference_set:
+                        if other in reference_set:
+                            scores[fid] = max(scores[fid], strength)
+                    else:
+                        scores[fid] = max(scores[fid], strength)
+
+            return scores
+
+    def get_active_fragment_ids_for_key(self, topic_key_id: str, limit: int = 5) -> List[str]:
+        """
+        Fragment terbaru milik satu Topic Key. Dipakai sebagai titik referensi
+        untuk menghitung graph evidence pada retrieval.
+        """
+        with self.SessionLocal() as session:
+            db_frags = session.query(FragmentDB).filter_by(
+                topic_key_id=topic_key_id
+            ).order_by(FragmentDB.created_at.desc()).limit(limit).all()
+            return [f.id for f in db_frags]
