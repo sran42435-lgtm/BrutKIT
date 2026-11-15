@@ -42,6 +42,7 @@ from context_builder import ContextBuilder
 from llm_client import FakeLLMClient
 import memory_engine as memory_engine_module
 import retrieval as retrieval_module
+import fragment_hierarchy as fragment_hierarchy_module
 
 
 # ==========================================
@@ -576,13 +577,20 @@ def test_m5_f21_max_depth_2_no_depth_3(engine: MemoryEngine, tz: ZoneInfo):
 def test_m5_f22_max_depth_3_allows_depth_3(engine: MemoryEngine, tz: ZoneInfo, monkeypatch):
     """
     [INTEGRATION + CONFIG OVERRIDE] Kondisi 22: MAX=3 -> depth 3 diizinkan.
+
     CONFIG frozen, jadi dibangkitkan ulang via dataclasses.replace lalu
-    di-bind ke module global. Monkeypatch memulihkan otomatis.
+    di-bind ke module global. Monkeypatch otomatis memulihkan setelah test.
+
+    [FIX Batch 3] CONFIG harus di-patch di SEMUA module yang memakai:
+        - memory_engine (orchestrator)
+        - retrieval (scoring fallback)
+        - fragment_hierarchy (placement decision — module baru di Batch 3)
     """
     new_hierarchy = dataclasses.replace(CONFIG.hierarchy, MAX_FRAGMENT_DEPTH=3)
     new_cfg = dataclasses.replace(CONFIG, hierarchy=new_hierarchy)
     monkeypatch.setattr(memory_engine_module, "CONFIG", new_cfg)
     monkeypatch.setattr(retrieval_module, "CONFIG", new_cfg)
+    monkeypatch.setattr(fragment_hierarchy_module, "CONFIG", new_cfg)
 
     session_id = "m5_f22"
     key_id = "m5_f22_key"
@@ -604,7 +612,8 @@ def test_m5_f22_max_depth_3_allows_depth_3(engine: MemoryEngine, tz: ZoneInfo, m
     )
     placement = engine._determine_fragment_placement(key_id, retrieval, is_new_topic=False)
     print(f"\nMAX=3 PLACEMENT depth={placement.depth} kind={placement.kind.value} "
-          f"score={placement.match_score:.3f}")
+          f"score={placement.match_score:.3f} parent={placement.parent_fragment_id}")
+    print(f"CONSIDERED: {placement.considered_parent_ids}")
     assert placement.depth == 3
     assert placement.kind == FragmentPlacementKind.CHILD
     assert placement.parent_fragment_id == "d22"

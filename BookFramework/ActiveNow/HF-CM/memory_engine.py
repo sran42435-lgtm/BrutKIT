@@ -22,11 +22,38 @@ URUTAN WAJIB:
     EXTRACT METADATA (dari exact text) -> COMPRESS -> PERSIST
     -> COMMIT -> PLACE -> PROPAGATE
 
-CATATAN TRANSACTION BOUNDARY:
-    Helper propagation dijalankan SETELAH transaksi inti commit.
-    Alasannya: storage.get_topic_key() / get_fragment_ancestors() membuka
-    session sendiri. Jika dipanggil di dalam transaksi yang belum commit,
-    ia membaca nilai LAMA lalu menimpanya kembali (stale-read overwrite).
+[REFACTOR BATCH 1]
+Logika Mekanisme 1 (Clarification State Management) dipindahkan ke
+clarification_state.py. memory_engine.py sekarang mendelegasikan semua
+operasi pending/clarification ke ClarificationStateManager.
+
+[REFACTOR BATCH 2]
+Fragment Identity Extraction dipindahkan ke fragment_identity.py.
+Identitas fragment sekarang dianalisis dari USER + AI RESPONSE (bukan
+hanya user input), menghasilkan fragment_key + helper_description
+yang lebih representatif.
+
+[REFACTOR BATCH 3]
+Fragment Placement dipindahkan ke fragment_hierarchy.py.
+Parent selection sekarang memakai FragmentIdentity (Batch 2) sebagai
+PRIMARY signal, dengan retrieval.signal_profile sebagai fallback.
+
+[REFACTOR BATCH 4]
+Helper Propagation dipindahkan ke helper_propagation.py.
+Propagasi child -> parent -> root -> TopicKey dikelola oleh
+HelperPropagationManager.
+
+[REFACTOR BATCH 5]
+Composite Detection dipindahkan ke composite_memory.py.
+Analisis multi-source composite dikelola oleh CompositeMemoryAnalyzer.
+Forwarding method _detect_composite_sources dipertahankan untuk
+backward compatibility dengan test suite.
+
+[REFACTOR BATCH 6]
+Trend Navigation dipindahkan ke trend_navigation.py.
+TrendNavigator mengelola Mode A (TopicKey trend) dan Mode B (Fragment
+trend), dengan perbaikan Prioritas 4: temporal score berbasis activity
+density (bukan binary match).
 """
 
 import logging
@@ -50,6 +77,12 @@ from models import (
 from storage import MemoryStorage
 from retrieval import RetrievalEngine, RetrievalResult
 from compression import PayloadCompressor, DecompressionError, IntegrityError
+from clarification_state import ClarificationStateManager, STRONG_NOVELTY_INDICATORS
+from fragment_identity import FragmentIdentityExtractor, FragmentIdentity
+from fragment_hierarchy import FragmentHierarchyManager
+from helper_propagation import HelperPropagationManager
+from composite_memory import CompositeMemoryAnalyzer
+from trend_navigation import TrendNavigator
 
 logger = logging.getLogger(__name__)
 
@@ -67,13 +100,6 @@ class MemoryEngine:
         "graph": EvidenceFamily.RELATIONAL,
     }
 
-    _STRONG_NOVELTY_INDICATORS: frozenset = frozenset({
-        "pointer", "reference", "coding", "program", "algoritma",
-        "c++", "c#", "python", "java", "astronomi", "hukum", "matematika",
-    })
-
-    _SYMBOL_IDENTITY_PATTERN = re.compile(r"[a-z0-9_]+(?:\+\+|\+|#)+", re.IGNORECASE)
-
     def __init__(self, storage: MemoryStorage, retrieval: RetrievalEngine,
                  compressor: PayloadCompressor, context_builder=None, llm_client=None):
         self.storage = storage
@@ -81,6 +107,18 @@ class MemoryEngine:
         self.compressor = compressor
         self.context_builder = context_builder
         self.llm_client = llm_client
+        # [REFACTOR BATCH 1] ClarificationStateManager
+        self.clarification_state = ClarificationStateManager(storage)
+        # [REFACTOR BATCH 2] FragmentIdentityExtractor
+        self.identity_extractor = FragmentIdentityExtractor()
+        # [REFACTOR BATCH 3] FragmentHierarchyManager
+        self.hierarchy_manager = FragmentHierarchyManager(storage)
+        # [REFACTOR BATCH 4] HelperPropagationManager
+        self.helper_propagator = HelperPropagationManager(storage)
+        # [REFACTOR BATCH 5] CompositeMemoryAnalyzer
+        self.composite_analyzer = CompositeMemoryAnalyzer(storage)
+        # [REFACTOR BATCH 6] TrendNavigator (dengan temporal density recomputation)
+        self.trend_navigator = TrendNavigator(storage, retrieval)
 
     def process_input(self, envelope: InputEnvelope) -> EngineResult:
         """Main Entry Point. Memproses satu turn percakapan secara utuh."""
@@ -108,20 +146,20 @@ class MemoryEngine:
         is_cross_session_pending = False
         clarification_ctx: Optional[ClarificationAccumulation] = None
 
-        explicit_cancel = self._detect_explicit_cancellation(envelope)
+        explicit_cancel = self.clarification_state.detect_explicit_cancellation(envelope)
         if explicit_cancel and active_pending:
-            self._pause_pending(active_pending)
+            self.clarification_state.pause_pending(active_pending)
             active_pending = None
 
         if active_pending:
-            is_relevant = self._check_pending_relevance(envelope, active_pending)
+            is_relevant = self.clarification_state.check_pending_relevance(envelope, active_pending)
             if is_relevant:
-                clarification_ctx = self._build_clarification_accumulation(
+                clarification_ctx = self.clarification_state.build_accumulation(
                     envelope, active_pending
                 )
                 context_text = clarification_ctx.combined_text
             else:
-                self._pause_pending(active_pending)
+                self.clarification_state.pause_pending(active_pending)
                 active_pending = None
         elif not explicit_cancel:
             global_pendings = self.storage.get_global_active_pendings()
@@ -132,9 +170,13 @@ class MemoryEngine:
             for gp in global_pendings:
                 if gp.session_id == session_id:
                     continue
-                if not self._check_pending_relevance(envelope, gp, all_keys=keys_for_pending):
+                if not self.clarification_state.check_pending_relevance(
+                    envelope, gp, all_keys=keys_for_pending
+                ):
                     continue
-                score = self._score_pending_relevance(envelope, gp, all_keys=keys_for_pending)
+                score = self.clarification_state.score_pending_relevance(
+                    envelope, gp, all_keys=keys_for_pending
+                )
                 if score > best_score:
                     best_score = score
                     best_pending = gp
@@ -142,7 +184,7 @@ class MemoryEngine:
             if best_pending:
                 active_pending = best_pending
                 is_cross_session_pending = True
-                clarification_ctx = self._build_clarification_accumulation(
+                clarification_ctx = self.clarification_state.build_accumulation(
                     envelope, best_pending
                 )
                 context_text = clarification_ctx.combined_text
@@ -170,6 +212,7 @@ class MemoryEngine:
         decision = self._make_decision(retrieval_result, active_pending)
         decision = self._apply_continuation_protection(decision, retrieval_result)
 
+        # [REFACTOR BATCH 6] Delegate ke TrendNavigator
         trend_candidates = self._resolve_trend_candidates(
             decision=decision,
             retrieval=retrieval_result,
@@ -278,7 +321,7 @@ class MemoryEngine:
                 active_depth=analysis.active_depth,
             )
 
-        composite_analysis = self._detect_composite_sources(
+        composite_analysis = self.composite_analyzer.detect_composite_sources(
             response=assistant_response,
             retrieved_memories=retrieved_memories,
             primary_topic_key_id=analysis.active_topic_key_id,
@@ -336,60 +379,29 @@ class MemoryEngine:
             continuation_intent=retrieval_result.continuation_intent,
         )
 
+    # ==========================================
+    # FORWARDING METHODS (Backward Compat untuk Test)
+    # ==========================================
+
     def _extract_input_tokens(self, envelope: InputEnvelope) -> set:
-        """Single source of truth untuk tokenisasi input user."""
-        raw_tokens = re.findall(r'\b\w+\b', envelope.raw_text.lower())
-        return {t for t in raw_tokens if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
+        """Forwarding ke ClarificationStateManager.extract_input_tokens."""
+        return self.clarification_state.extract_input_tokens(envelope)
 
     def _extract_symbol_identity_tokens(self, raw_text: str) -> set:
-        r"""
-        Ekstrak identity token INCLUDING identifier simbolik.
-
-        "C++" melalui re.findall(r'\b\w+\b', ...) hanya menghasilkan ["c"],
-        lalu terfilter MIN_TOKEN_LENGTH=3 -> himpunan kosong.
-        Fungsi ini menangkap "c++", "c#", "f#" secara utuh.
-        """
-        text = raw_text.lower()
-        tokens = set(self._SYMBOL_IDENTITY_PATTERN.findall(text))
-        tokens |= {t for t in re.findall(r'\b\w+\b', text) if t}
-        return tokens
+        """Forwarding ke ClarificationStateManager.extract_symbol_identity_tokens."""
+        return self.clarification_state.extract_symbol_identity_tokens(raw_text)
 
     def _get_input_token_quality(self, envelope: InputEnvelope) -> Dict[str, TokenQuality]:
-        """Klasifikasi token kualitas (re-use SignalExtractor logic)."""
-        from retrieval import SignalExtractor
-        extractor = SignalExtractor()
-        raw_tokens = re.findall(r'\b\w+\b', envelope.raw_text.lower())
-        unique_tokens = [t for t in set(raw_tokens) if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH]
-        return {t: extractor._classify_token(t) for t in unique_tokens}
+        """Forwarding ke ClarificationStateManager.get_input_token_quality."""
+        return self.clarification_state.get_input_token_quality(envelope)
 
     def _collect_pending_evidence_tokens(
         self,
         pending: PendingState,
         all_keys: Optional[List[TopicKey]] = None
     ) -> set:
-        """Bukti Pending: TITLE + TOKEN PROFILE + HELPER + AGGREGATED HELPER."""
-        if all_keys is None:
-            all_keys = self.storage.get_all_topic_keys()
-
-        pending_tokens = set()
-        for k in all_keys:
-            if k.key_id in pending.candidate_keys:
-                pending_tokens.update(k.token_profile.keys())
-                title_words = re.findall(r'\b\w+\b', k.title.lower())
-                pending_tokens.update(
-                    w for w in title_words if len(w) >= CONFIG.signal.MIN_TOKEN_LENGTH
-                )
-                desc_words = re.findall(r'\b\w+\b', k.helper_description.lower())
-                pending_tokens.update(
-                    w for w in desc_words if len(w) >= CONFIG.signal.MIN_TOKEN_LENGTH
-                )
-                agg_words = re.findall(
-                    r'\b\w+\b', (k.aggregated_helper_description or "").lower()
-                )
-                pending_tokens.update(
-                    w for w in agg_words if len(w) >= CONFIG.signal.MIN_TOKEN_LENGTH
-                )
-        return pending_tokens
+        """Forwarding ke ClarificationStateManager.collect_pending_evidence_tokens."""
+        return self.clarification_state.collect_pending_evidence_tokens(pending, all_keys)
 
     def _score_pending_relevance(
         self,
@@ -397,64 +409,12 @@ class MemoryEngine:
         pending: PendingState,
         all_keys: Optional[List[TopicKey]] = None
     ) -> float:
-        """Skor komposit relevansi pending untuk RANKING antar pending."""
-        new_tokens = self._extract_input_tokens(envelope)
-        if not new_tokens or len(new_tokens) < 3:
-            return 0.5
-
-        pending_tokens = self._collect_pending_evidence_tokens(pending, all_keys=all_keys)
-        overlap = new_tokens.intersection(pending_tokens)
-        overlap_ratio = len(overlap) / len(new_tokens)
-        overlap_bonus = min(len(overlap), 5) * 0.01
-        return overlap_ratio + overlap_bonus
+        """Forwarding ke ClarificationStateManager.score_pending_relevance."""
+        return self.clarification_state.score_pending_relevance(envelope, pending, all_keys)
 
     def _detect_explicit_selection(self, raw_text: str, pending: PendingState) -> bool:
-        """Deteksi pilihan eksplisit: 'nomor 1', 'yang pertama', '1'."""
-        n_candidates = len(pending.candidate_keys)
-        if n_candidates == 0:
-            return False
-
-        text_lower = raw_text.lower().strip()
-
-        number_patterns = [
-            r'\bnomor\s+(\d+)\b',
-            r'\bpilihan\s+(\d+)\b',
-            r'\boption\s+(\d+)\b',
-            r'\boptions?\s+(\d+)\b',
-            r'\bopsi\s+(\d+)\b',
-            r'^\s*(\d+)\s*$',
-        ]
-        for pattern in number_patterns:
-            match = re.search(pattern, text_lower)
-            if match:
-                try:
-                    idx = int(match.group(1))
-                    if 1 <= idx <= n_candidates:
-                        return True
-                except ValueError:
-                    continue
-
-        ordinal_map = {
-            "pertama": 1, "kesatu": 1, "kedua": 2, "ketiga": 3,
-            "keempat": 4, "kelima": 5, "keenam": 6, "ketujuh": 7,
-            "terakhir": n_candidates, "last": n_candidates,
-            "first": 1, "second": 2, "third": 3,
-        }
-        for word, idx in ordinal_map.items():
-            if re.search(rf'\b{re.escape(word)}\b', text_lower):
-                if 1 <= idx <= n_candidates:
-                    return True
-
-        cardinal_map = {
-            "satu": 1, "dua": 2, "tiga": 3, "empat": 4, "lima": 5,
-            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-        }
-        for word, idx in cardinal_map.items():
-            if re.search(rf'\b{re.escape(word)}\b', text_lower):
-                if 1 <= idx <= n_candidates:
-                    return True
-
-        return False
+        """Forwarding ke ClarificationStateManager.detect_explicit_selection."""
+        return self.clarification_state.detect_explicit_selection(raw_text, pending)
 
     def _check_pending_relevance(
         self,
@@ -462,123 +422,24 @@ class MemoryEngine:
         pending: PendingState,
         all_keys: Optional[List[TopicKey]] = None
     ) -> bool:
-        """SHORT INPUT != AUTOMATICALLY RELEVANT."""
-        new_tokens = self._extract_input_tokens(envelope)
-        short_threshold = CONFIG.fast_memory.SHORT_PENDING_INPUT_THRESHOLD
-        min_match = CONFIG.fast_memory.SHORT_PENDING_MIN_MATCH
-
-        if not new_tokens or len(new_tokens) < short_threshold:
-            if not new_tokens:
-                raw_stripped = envelope.raw_text.strip()
-                if not raw_stripped:
-                    return True
-                if self._detect_explicit_selection(raw_stripped, pending):
-                    return True
-
-                identity_tokens = self._extract_symbol_identity_tokens(raw_stripped)
-                from retrieval import SignalExtractor
-                extractor = SignalExtractor()
-                meaningful_identity = [
-                    t for t in identity_tokens
-                    if extractor._classify_token(t) != TokenQuality.LOW_INFORMATION
-                ]
-                if not meaningful_identity:
-                    return True
-                if any(t in self._STRONG_NOVELTY_INDICATORS for t in meaningful_identity):
-                    return False
-
-                pending_tokens = self._collect_pending_evidence_tokens(
-                    pending, all_keys=all_keys
-                )
-                if set(meaningful_identity).intersection(pending_tokens):
-                    return True
-                return False
-
-            quality_map = self._get_input_token_quality(envelope)
-            meaningful = [
-                t for t in new_tokens
-                if quality_map.get(t, TokenQuality.NORMAL) != TokenQuality.LOW_INFORMATION
-            ]
-            if not meaningful:
-                return True
-            if self._detect_explicit_selection(envelope.raw_text, pending):
-                return True
-
-            pending_tokens = self._collect_pending_evidence_tokens(pending, all_keys=all_keys)
-            overlap = set(meaningful).intersection(pending_tokens)
-            if len(overlap) >= min_match:
-                return True
-            if any(t in self._STRONG_NOVELTY_INDICATORS for t in meaningful):
-                return False
-            return False
-
-        pending_tokens = self._collect_pending_evidence_tokens(pending, all_keys=all_keys)
-        overlap = new_tokens.intersection(pending_tokens)
-        if len(overlap) >= 2:
-            return True
-        if len(overlap) == 0 and len(new_tokens) >= 3:
-            return False
-        overlap_ratio = len(overlap) / len(new_tokens) if new_tokens else 0.0
-        return overlap_ratio >= CONFIG.fast_memory.PENDING_SWITCH_THRESHOLD
+        """Forwarding ke ClarificationStateManager.check_pending_relevance."""
+        return self.clarification_state.check_pending_relevance(envelope, pending, all_keys)
 
     def _pause_pending(self, pending: PendingState):
-        """Mengubah status Pending menjadi PAUSED."""
-        pending.status = PendingStatus.PAUSED
-        pending.last_updated_at = datetime.now()
-        with self.storage.transaction() as tx:
-            self.storage.save_pending_state(tx, pending)
+        """Forwarding ke ClarificationStateManager.pause_pending."""
+        return self.clarification_state.pause_pending(pending)
 
     def _detect_explicit_cancellation(self, envelope: InputEnvelope) -> bool:
-        """[M1] Deteksi pembatalan / perpindahan topik eksplisit."""
-        from retrieval import SignalExtractor
-        extractor = SignalExtractor()
-        signal = extractor.extract(envelope.raw_text, envelope.timestamp)
-        return bool(signal.cancellation_intent)
+        """Forwarding ke ClarificationStateManager.detect_explicit_cancellation."""
+        return self.clarification_state.detect_explicit_cancellation(envelope)
 
     def _build_clarification_accumulation(
         self,
         envelope: InputEnvelope,
         pending: PendingState,
     ) -> ClarificationAccumulation:
-        """[M1] original_input + history = sumber kebenaran. combined = cache."""
-        cc = CONFIG.clarification
-
-        history = list(pending.clarification_history or [])
-        history.append(envelope.raw_text)
-        if len(history) > cc.MAX_CLARIFICATION_HISTORY_ENTRIES:
-            history = history[-cc.MAX_CLARIFICATION_HISTORY_ENTRIES:]
-
-        parts = [pending.original_input] + history
-        combined = " ".join(p for p in parts if p)
-        if len(combined) > cc.CLARIFICATION_HISTORY_MAX_CHARS:
-            tail_budget = (
-                cc.CLARIFICATION_HISTORY_MAX_CHARS - len(pending.original_input) - 1
-            )
-            tail = " ".join(history)
-            if tail_budget > 0:
-                tail = tail[-tail_budget:]
-                combined = f"{pending.original_input} {tail}"
-            else:
-                combined = pending.original_input[:cc.CLARIFICATION_HISTORY_MAX_CHARS]
-
-        from retrieval import SignalExtractor
-        extractor = SignalExtractor()
-        signal = extractor.extract(combined, envelope.timestamp)
-
-        excluded_tokens = sorted(
-            set(pending.excluded_tokens or []) | set(signal.excluded_tokens or [])
-        )
-
-        return ClarificationAccumulation(
-            original_input=pending.original_input,
-            clarification_history=history,
-            combined_text=combined,
-            excluded_tokens=excluded_tokens,
-            excluded_candidate_keys=list(pending.excluded_candidate_keys or []),
-            negation_scopes=list(signal.negation_scopes or []),
-            round_number=(pending.clarification_round or 1),
-            retained_candidate_keys=list(pending.candidate_keys or []),
-        )
+        """Forwarding ke ClarificationStateManager.build_accumulation."""
+        return self.clarification_state.build_accumulation(envelope, pending)
 
     def _persist_clarification_state(
         self,
@@ -588,28 +449,14 @@ class MemoryEngine:
         envelope: InputEnvelope,
         question: str,
     ) -> None:
-        """[M1] Pending BERKEMBANG, bukan dibuat ulang."""
-        if clarification is not None:
-            pending.clarification_history = list(clarification.clarification_history)
-            pending.combined_clarification_text = clarification.combined_text
-            pending.excluded_tokens = list(clarification.excluded_tokens)
+        """Forwarding ke ClarificationStateManager.persist_state."""
+        return self.clarification_state.persist_state(
+            pending, clarification, result, envelope, question
+        )
 
-        excluded = set(pending.excluded_candidate_keys or [])
-        excluded.update(result.excluded_candidate_keys or [])
-        pending.excluded_candidate_keys = sorted(excluded)
-
-        new_keys = [c.key_id for c in result.candidates]
-        if new_keys:
-            pending.candidate_keys = new_keys
-            pending.candidate_scores = {
-                c.key_id: c.final_score for c in result.candidates
-            }
-            hist = list(pending.candidate_history or [])
-            hist.append(new_keys)
-            pending.candidate_history = hist
-
-        pending.assistant_question = question
-        pending.last_updated_at = envelope.timestamp
+    # ==========================================
+    # CONTINUATION PROTECTION (M2)
+    # ==========================================
 
     def _apply_continuation_protection(
         self,
@@ -673,7 +520,7 @@ class MemoryEngine:
         pending = existing
         if pending is not None and pending.status == PendingStatus.ACTIVE:
             pending.clarification_round = (pending.clarification_round or 1) + 1
-            self._persist_clarification_state(
+            self.clarification_state.persist_state(
                 pending, clarification, result, envelope, message
             )
             with self.storage.transaction() as tx:
@@ -726,6 +573,10 @@ class MemoryEngine:
             excluded_candidate_keys=result.excluded_candidate_keys,
         )
 
+    # ==========================================
+    # TREND NAVIGATION (M5) — BATCH 6: Delegate to TrendNavigator
+    # ==========================================
+
     def _resolve_trend_candidates(
         self,
         decision: EngineDecision,
@@ -733,43 +584,26 @@ class MemoryEngine:
         envelope: InputEnvelope,
         session_state: Optional[SessionActiveState],
     ) -> List[TrendCandidate]:
-        """[M5] Trend untuk navigasi, bukan identitas final."""
-        if not retrieval.continuation_intent:
-            return []
-        if decision.decision_type not in (
-            DecisionType.AMBIGUOUS,
-            DecisionType.UNRESOLVED_CONTINUATION,
-            DecisionType.INSUFFICIENT_EVIDENCE,
-        ):
-            return []
+        """
+        [BATCH 6] Forwarding ke TrendNavigator.
 
-        temporal_range = None
-        if retrieval.signal_profile is not None:
-            temporal_range = self.retrieval.temporal_resolver.resolve(
-                retrieval.signal_profile.temporal_signals, envelope.timestamp
-            )
-
-        if retrieval.selected_key_id:
-            depth = CONFIG.hierarchy.NEW_BRANCH_DEPTH
-            if (session_state
-                    and session_state.active_topic_key_id == retrieval.selected_key_id):
-                depth = min(
-                    session_state.active_depth + 1,
-                    CONFIG.hierarchy.MAX_FRAGMENT_DEPTH,
-                )
-            if depth > CONFIG.hierarchy.MAX_FRAGMENT_DEPTH:
-                return []
-            return self.storage.get_trending_fragments(
-                topic_key_id=retrieval.selected_key_id,
-                depth=depth,
-                reference_time=envelope.timestamp,
-                temporal_range=temporal_range,
-            )
-
-        return self.storage.get_trending_topic_keys(
-            reference_time=envelope.timestamp,
-            temporal_range=temporal_range,
+        TrendNavigator melakukan:
+            1. Resolve temporal_range dari signal.
+            2. Mode A: TopicKey trend (jika topik belum jelas).
+            3. Mode B: Fragment trend (jika topik jelas, bagian belum).
+            4. Recompute temporal_score dengan activity density (Prioritas 4).
+            5. Re-sort dan re-limit candidates.
+        """
+        return self.trend_navigator.resolve_trend_candidates(
+            decision=decision,
+            retrieval=retrieval,
+            envelope=envelope,
+            session_state=session_state,
         )
+
+    # ==========================================
+    # SESSION STATE & CONTINUITY
+    # ==========================================
 
     def _update_session_state(
         self,
@@ -827,6 +661,10 @@ class MemoryEngine:
         for k in keys:
             fragments.extend(self.storage.get_fragment_metadata_by_key(k.key_id))
         return fragments
+
+    # ==========================================
+    # GRAPH EVIDENCE
+    # ==========================================
 
     def _build_graph_evidence(
         self,
@@ -917,6 +755,10 @@ class MemoryEngine:
             ))
         return results
 
+    # ==========================================
+    # CO-OCCURRENCE & MUTATION GATE
+    # ==========================================
+
     def _build_window_pairs(self, tokens: List[str]) -> Dict[str, int]:
         """Co-occurrence berbasis window untuk PERSISTENCE."""
         cc = CONFIG.co_occurrence
@@ -992,6 +834,10 @@ class MemoryEngine:
         desc_allowed = evidence_strength >= mut.MIN_EVIDENCE_TO_UPDATE_DESCRIPTION
         reason = "allowed" if desc_allowed else "allowed: description held"
         return (True, desc_allowed, reason, evidence_strength, support_count, contradiction)
+
+    # ==========================================
+    # CONTINUITY PURITY
+    # ==========================================
 
     def _compute_turn_continuity(
         self,
@@ -1087,6 +933,10 @@ class MemoryEngine:
             f"  cont_sources     : {analysis.continuity_evidence_sources or '(none)'}",
         ]
         return "\n".join(lines)
+
+    # ==========================================
+    # DECISION GATE
+    # ==========================================
 
     def _make_decision(
         self,
@@ -1247,6 +1097,10 @@ class MemoryEngine:
 
         return (None, "")
 
+    # ==========================================
+    # AMBIGUITY LIFECYCLE
+    # ==========================================
+
     def _handle_ambiguity(
         self,
         envelope: InputEnvelope,
@@ -1275,7 +1129,7 @@ class MemoryEngine:
 
         if existing and existing.status == PendingStatus.ACTIVE:
             round_num = existing.clarification_round + 1
-            self._persist_clarification_state(
+            self.clarification_state.persist_state(
                 existing, clarification, result, envelope, question
             )
 
@@ -1361,6 +1215,10 @@ class MemoryEngine:
             continuation_intent=result.continuation_intent,
         )
 
+    # ==========================================
+    # RECONSTRUCTION & GENERATION
+    # ==========================================
+
     def _reconstruct_memories(
         self,
         fragment_ids: List[str]
@@ -1418,12 +1276,36 @@ class MemoryEngine:
             return decision.message or "Mohon maaf, bisa diperjelas maksud Anda?"
         return f"Response simulasi untuk: {user_input}"
 
+    # ==========================================
+    # FRAGMENT IDENTITY (M3) — BATCH 2: Combined User+AI
+    # ==========================================
+
     def _extract_fragment_identity(
+        self,
+        envelope: InputEnvelope,
+        assistant_response: str,
+        retrieval: RetrievalResult,
+        topic_key: Optional[TopicKey] = None,
+    ) -> FragmentIdentity:
+        """
+        [M3 — Batch 2] Ekstrak identitas fragment dari USER + AI RESPONSE.
+        """
+        return self.identity_extractor.extract(
+            user_text=envelope.raw_text,
+            assistant_text=assistant_response,
+            topic_key=topic_key,
+            signal_profile=retrieval.signal_profile,
+        )
+
+    def _extract_fragment_identity_legacy(
         self,
         raw_text: str,
         meaningful_tokens: List[str],
     ) -> Tuple[str, str]:
-        """[M3] Ekstrak fragment_key + helper SEBELUM kompresi."""
+        """
+        [LEGACY] Versi lama yang hanya menggunakan user tokens.
+        Dipertahankan untuk backward compat dengan test.
+        """
         hc = CONFIG.hierarchy
         hp = CONFIG.helper_propagation
 
@@ -1440,254 +1322,34 @@ class MemoryEngine:
 
         return fragment_key, helper
 
+    # ==========================================
+    # FRAGMENT PLACEMENT (M5) — BATCH 3: Delegate to Hierarchy Manager
+    # ==========================================
+
     def _determine_fragment_placement(
         self,
         topic_key_id: str,
         retrieval: RetrievalResult,
         is_new_topic: bool,
+        fragment_identity: Optional[FragmentIdentity] = None,
     ) -> FragmentPlacementResult:
-        """[M5] MAX_FRAGMENT_DEPTH adalah HARD BOUNDARY."""
-        hc = CONFIG.hierarchy
-
-        if is_new_topic:
-            return FragmentPlacementResult(
-                kind=FragmentPlacementKind.ROOT,
-                parent_fragment_id=None,
-                depth=0,
-                reason="new topic -> root fragment",
-            )
-
-        existing = self.storage.get_fragment_metadata_by_key(topic_key_id)
-        if not existing:
-            return FragmentPlacementResult(
-                kind=FragmentPlacementKind.ROOT,
-                parent_fragment_id=None,
-                depth=0,
-                reason="first fragment of topic -> root",
-            )
-
-        signal = retrieval.signal_profile
-        if signal is None or not signal.unique_terms:
-            root = next((f for f in existing if f.parent_fragment_id is None), None)
-            return FragmentPlacementResult(
-                kind=FragmentPlacementKind.SIBLING,
-                parent_fragment_id=root.fragment_id if root else None,
-                depth=min(hc.NEW_BRANCH_DEPTH, hc.MAX_FRAGMENT_DEPTH),
-                reason="no signal -> new sibling branch",
-            )
-
-        eligible = [f for f in existing if f.depth < hc.MAX_FRAGMENT_DEPTH]
-        scored = self.retrieval.score_parent_candidates(signal, eligible)
-        considered = [s.fragment_id for s in scored]
-
-        if not scored:
-            root = next((f for f in existing if f.parent_fragment_id is None), None)
-            return FragmentPlacementResult(
-                kind=FragmentPlacementKind.SIBLING,
-                parent_fragment_id=root.fragment_id if root else None,
-                depth=min(hc.NEW_BRANCH_DEPTH, hc.MAX_FRAGMENT_DEPTH),
-                considered_parent_ids=considered,
-                reason="no eligible parent -> sibling",
-            )
-
-        best = scored[0]
-        runner = scored[1] if len(scored) > 1 else None
-        runner_score = runner.final_score if runner else 0.0
-        margin = best.final_score - runner_score
-
-        strong_enough = best.final_score >= hc.MIN_PARENT_MATCH_SCORE
-        clear_enough = (runner is None) or (margin >= hc.MIN_CHILD_MATCH_MARGIN)
-
-        if strong_enough and clear_enough:
-            parent_depth = best.depth
-            if parent_depth + 1 <= hc.MAX_FRAGMENT_DEPTH:
-                return FragmentPlacementResult(
-                    kind=FragmentPlacementKind.CHILD,
-                    parent_fragment_id=best.fragment_id,
-                    depth=parent_depth + 1,
-                    match_score=best.final_score,
-                    runner_up_score=runner_score,
-                    margin=margin,
-                    considered_parent_ids=considered,
-                    reason=f"parent '{best.fragment_key}' score={best.final_score:.3f}",
-                )
-            return FragmentPlacementResult(
-                kind=FragmentPlacementKind.DEPTH_CAPPED_ATTACH,
-                parent_fragment_id=best.parent_fragment_id,
-                depth=parent_depth,
-                match_score=best.final_score,
-                runner_up_score=runner_score,
-                margin=margin,
-                depth_capped=True,
-                considered_parent_ids=considered,
-                reason=f"MAX_FRAGMENT_DEPTH={hc.MAX_FRAGMENT_DEPTH} reached",
-            )
-
-        root = next((f for f in existing if f.parent_fragment_id is None), None)
-        return FragmentPlacementResult(
-            kind=FragmentPlacementKind.SIBLING,
-            parent_fragment_id=root.fragment_id if root else None,
-            depth=min(hc.NEW_BRANCH_DEPTH, hc.MAX_FRAGMENT_DEPTH),
-            match_score=best.final_score,
-            runner_up_score=runner_score,
-            margin=margin,
-            considered_parent_ids=considered,
-            reason=f"no parent above threshold (best={best.final_score:.3f})",
+        """[M5 — Batch 3] Delegate ke FragmentHierarchyManager."""
+        return self.hierarchy_manager.determine_placement(
+            topic_key_id=topic_key_id,
+            retrieval=retrieval,
+            is_new_topic=is_new_topic,
+            fragment_identity=fragment_identity,
         )
 
-    def _helper_similarity(self, a: str, b: str) -> float:
-        """Jaccard-style token overlap untuk dedup kontribusi helper."""
-        min_len = CONFIG.helper_propagation.MIN_HELPER_TOKEN_LENGTH
-        ta = {t for t in re.findall(r'\b\w+\b', a.lower()) if len(t) >= min_len}
-        tb = {t for t in re.findall(r'\b\w+\b', b.lower()) if len(t) >= min_len}
-        if not ta or not tb:
-            return 0.0
-        return len(ta & tb) / len(ta | tb)
+    # ==========================================
+    # HELPER PROPAGATION (M3) — BATCH 4
+    # ==========================================
+    # Method _helper_similarity, _aggregate_helper, _propagate_helper
+    # dipindahkan ke helper_propagation.py.
 
-    def _aggregate_helper(self, own: str, contributions: List[str]) -> str:
-        """Aggregated helper: own + ringkasan descendant. Bounded + dedup."""
-        hp = CONFIG.helper_propagation
-        own = (own or "").strip()
-        if not contributions:
-            return own[:hp.MAX_HELPER_LENGTH]
-
-        joined = hp.CONTRIBUTION_SEPARATOR.join(contributions)
-        if own:
-            aggregate = f"{own}. {hp.CHILD_SUMMARY_PREFIX}{joined}"
-        else:
-            aggregate = f"{hp.CHILD_SUMMARY_PREFIX}{joined}"
-        if len(aggregate) > hp.MAX_HELPER_LENGTH:
-            aggregate = aggregate[:hp.MAX_HELPER_LENGTH].rstrip()
-        return aggregate
-
-    def _propagate_helper(
-        self,
-        session,
-        new_fragment: FragmentMetadata,
-        topic_key_id: str,
-        analysis: TurnAnalysisResult,
-    ) -> HelperPropagationResult:
-        """
-        [M3] child -> parent -> ancestor -> root -> TopicKey.
-
-        DIPANGGIL SETELAH transaksi inti commit, sehingga semua pembacaan
-        (get_fragment_ancestors, get_topic_key) melihat data terkini dan
-        tidak menimpa update dengan nilai stale.
-        """
-        hp = CONFIG.helper_propagation
-        result = HelperPropagationResult()
-
-        if hp.REQUIRE_MUTATION_PERMISSION:
-            if not (analysis.mutation_allowed and analysis.description_update_allowed):
-                result.reason = "blocked by mutation gate"
-                return result
-
-        contribution = (
-            new_fragment.fragment_helper_description
-            or new_fragment.fragment_key
-            or ""
-        ).strip()
-        if not contribution:
-            result.reason = "no helper contribution"
-            return result
-
-        ancestors = self.storage.get_fragment_ancestors(
-            new_fragment.fragment_id, max_depth=hp.MAX_PROPAGATION_DEPTH
-        )
-        result.chain_depth = len(ancestors)
-
-        updated_ids: List[str] = []
-        added = 0
-        deduped = 0
-        truncated = False
-
-        for ancestor in ancestors:
-            if new_fragment.fragment_id in (ancestor.helper_contributor_ids or []):
-                deduped += 1
-                continue
-
-            evidence = list(ancestor.descendant_helper_evidence or [])
-            contributors = list(ancestor.helper_contributor_ids or [])
-
-            duplicate = any(
-                self._helper_similarity(contribution, existing)
-                >= hp.DEDUP_SIMILARITY_THRESHOLD
-                for existing in evidence
-            )
-            if duplicate:
-                deduped += 1
-                continue
-
-            if len(evidence) >= hp.MAX_DESCENDANT_EVIDENCE:
-                truncated = True
-                evidence = evidence[-(hp.MAX_DESCENDANT_EVIDENCE - 1):]
-
-            evidence.append(contribution)
-            contributors.append(new_fragment.fragment_id)
-
-            new_aggregate = self._aggregate_helper(
-                ancestor.fragment_helper_description, evidence
-            )
-            updated = ancestor.model_copy(update={
-                "descendant_helper_evidence": evidence,
-                "helper_contributor_ids": contributors,
-                "aggregated_helper_description": new_aggregate,
-            })
-            self.storage.update_fragment_helper(session, updated)
-            updated_ids.append(ancestor.fragment_id)
-            added += 1
-
-        if hp.PROPAGATE_TO_TOPIC_KEY:
-            key_obj = self.storage.get_topic_key(topic_key_id)
-            if key_obj is not None:
-                if new_fragment.fragment_id in (key_obj.helper_source_fragment_ids or []):
-                    deduped += 1
-                else:
-                    k_evidence: List[str] = []
-                    roots = self.storage.get_root_fragments_for_topic(topic_key_id)
-                    for r in roots:
-                        text = (
-                            r.aggregated_helper_description
-                            or r.fragment_helper_description
-                        )
-                        if text:
-                            k_evidence.append(text)
-
-                    bounded: List[str] = []
-                    for text in k_evidence:
-                        already = any(
-                            self._helper_similarity(text, b)
-                            >= hp.DEDUP_SIMILARITY_THRESHOLD
-                            for b in bounded
-                        )
-                        if already:
-                            continue
-                        bounded.append(text)
-                        if len(bounded) >= hp.MAX_DESCENDANT_EVIDENCE:
-                            truncated = True
-                            break
-
-                    sources = list(key_obj.helper_source_fragment_ids or [])
-                    sources.append(new_fragment.fragment_id)
-                    new_key_aggregate = self._aggregate_helper(
-                        key_obj.helper_description, bounded
-                    )
-                    updated_key = key_obj.model_copy(update={
-                        "aggregated_helper_description": new_key_aggregate,
-                        "helper_source_fragment_ids": sources,
-                        "updated_at": new_fragment.created_at,
-                    })
-                    self.storage.update_topic_helper(session, updated_key)
-                    result.updated_topic_key_id = topic_key_id
-                    added += 1
-
-        result.propagated = added > 0
-        result.updated_fragment_ids = updated_ids
-        result.contributions_added = added
-        result.contributions_deduplicated = deduped
-        result.truncated = truncated
-        result.reason = f"propagated {added} contribution(s)"
-        return result
+    # ==========================================
+    # COMPOSITE DETECTION (M4) — BATCH 5
+    # ==========================================
 
     def _detect_composite_sources(
         self,
@@ -1695,104 +1357,19 @@ class MemoryEngine:
         retrieved_memories: List[RetrievedMemory],
         primary_topic_key_id: Optional[str],
     ) -> CompositeSourceAnalysis:
-        """[M4] Composite HANYA jika lintas topik dengan bukti beragam."""
-        cs = CONFIG.composite
-        analysis = CompositeSourceAnalysis(primary_topic_key_id=primary_topic_key_id)
+        """
+        [BACKWARD COMPAT] Forwarding ke CompositeMemoryAnalyzer.
+        Dipakai oleh test yang memanggil engine._detect_composite_sources langsung.
+        """
+        return self.composite_analyzer.detect_composite_sources(
+            response=response,
+            retrieved_memories=retrieved_memories,
+            primary_topic_key_id=primary_topic_key_id,
+        )
 
-        if not retrieved_memories or not response:
-            analysis.reason = "no retrieved memory or empty response"
-            return analysis
-
-        resp_tokens = {
-            t for t in re.findall(r'\b\w+\b', response.lower())
-            if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH
-        }
-        if not resp_tokens:
-            analysis.reason = "no meaningful response tokens"
-            return analysis
-
-        sources: List[FragmentSourceContribution] = []
-
-        for mem in retrieved_memories:
-            frag = self.storage.get_fragment(mem.fragment_id)
-            if frag is None:
-                continue
-
-            frag_tokens = set(frag.token_profile.keys())
-            if not frag_tokens:
-                continue
-
-            overlap = resp_tokens.intersection(frag_tokens)
-            token_ratio = len(overlap) / len(frag_tokens)
-            if token_ratio < cs.MIN_SOURCE_TOKEN_OVERLAP:
-                continue
-
-            evidence_names: List[str] = ["token"]
-            families: Set[EvidenceFamily] = {EvidenceFamily.LEXICAL}
-
-            helper_text = (
-                frag.aggregated_helper_description
-                or frag.fragment_helper_description
-                or ""
-            )
-            helper_tokens = {
-                t for t in re.findall(r'\b\w+\b', helper_text.lower())
-                if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH
-            }
-            helper_ratio = 0.0
-            if helper_tokens:
-                helper_ratio = len(
-                    resp_tokens.intersection(helper_tokens)
-                ) / len(helper_tokens)
-                if helper_ratio >= cs.MIN_SOURCE_TOKEN_OVERLAP:
-                    evidence_names.append("helper")
-                    families.add(EvidenceFamily.CONTEXTUAL)
-
-            if mem.fragment_graph_score >= CONFIG.evidence.EVIDENCE_SUPPORT_THRESHOLD:
-                evidence_names.append("graph")
-                families.add(EvidenceFamily.RELATIONAL)
-
-            if len(families) < cs.MIN_SOURCE_EVIDENCE_FAMILIES:
-                continue
-
-            contribution = max(token_ratio, helper_ratio)
-            is_cross = (
-                primary_topic_key_id is not None
-                and frag.topic_key_id != primary_topic_key_id
-            )
-            if is_cross:
-                contribution = min(1.0, contribution + cs.CROSS_TOPIC_CONTRIBUTION_BONUS)
-
-            if contribution < cs.MIN_SOURCE_CONTRIBUTION_SCORE:
-                continue
-
-            sources.append(FragmentSourceContribution(
-                fragment_id=frag.fragment_id,
-                topic_key_id=frag.topic_key_id,
-                fragment_key=frag.fragment_key,
-                contribution_score=contribution,
-                supporting_evidence_names=evidence_names,
-                is_cross_topic=is_cross,
-            ))
-
-        sources.sort(key=lambda s: s.contribution_score, reverse=True)
-        sources = sources[:cs.MAX_SOURCE_FRAGMENTS]
-
-        distinct_topics = {s.topic_key_id for s in sources}
-        analysis.sources = sources
-        analysis.source_fragment_ids = [s.fragment_id for s in sources]
-        analysis.distinct_topic_count = len(distinct_topics)
-
-        if (len(sources) >= cs.MIN_DISTINCT_SOURCES
-                and any(s.is_cross_topic for s in sources)
-                and len(distinct_topics) >= 2):
-            analysis.is_composite = True
-            analysis.reason = f"{len(sources)} sources across {len(distinct_topics)} topics"
-        else:
-            analysis.is_composite = False
-            analysis.source_fragment_ids = []
-            analysis.reason = "not cross-key composite"
-        return analysis
+    # ==========================================
+    # TURN ANALYSIS
+    # ==========================================
 
     def _analyze_turn(
         self,
@@ -1849,7 +1426,7 @@ class MemoryEngine:
                         )
                         has_strong_novelty = any(
                             trigger in user_tokens
-                            for trigger in self._STRONG_NOVELTY_INDICATORS
+                            for trigger in STRONG_NOVELTY_INDICATORS
                         )
 
                         if (user_overlap_ratio < CONFIG.topic_switch.MIN_ACTIVE_TOPIC_OVERLAP
@@ -1941,6 +1518,10 @@ class MemoryEngine:
             active_depth=active_depth,
         )
 
+    # ==========================================
+    # PERSISTENCE
+    # ==========================================
+
     def _persist_memory(
         self,
         envelope: InputEnvelope,
@@ -1956,11 +1537,7 @@ class MemoryEngine:
         URUTAN:
             exact text -> extract identity -> compress
             -> TX1: persist topic/payload/fragment/edges -> COMMIT
-            -> TX2: helper propagation
-
-        Propagasi dipisah ke TX2 karena storage.get_topic_key() dan
-        get_fragment_ancestors() membuka session sendiri. Jika dijalankan
-        di TX1 yang belum commit, ia membaca nilai LAMA lalu menimpanya.
+            -> TX2: helper propagation (delegate ke HelperPropagationManager)
         """
         raw_content = f"User: {envelope.raw_text}\nAI: {response}"
 
@@ -1981,9 +1558,18 @@ class MemoryEngine:
         for t in profile_tokens:
             profile_counts[t] = profile_counts.get(t, 0) + 1
 
-        fragment_key, fragment_helper = self._extract_fragment_identity(
-            raw_content, meaningful_tokens
+        active_key_obj = None
+        if analysis.active_topic_key_id:
+            active_key_obj = self.storage.get_topic_key(analysis.active_topic_key_id)
+
+        fragment_identity = self._extract_fragment_identity(
+            envelope=envelope,
+            assistant_response=response,
+            retrieval=retrieval,
+            topic_key=active_key_obj,
         )
+        fragment_key = fragment_identity.fragment_key
+        fragment_helper = fragment_identity.helper_description
 
         try:
             payload = self.compressor.compress(raw_content)
@@ -2055,6 +1641,7 @@ class MemoryEngine:
             topic_key_id=key_id,
             retrieval=retrieval,
             is_new_topic=is_new_topic,
+            fragment_identity=fragment_identity,
         )
 
         is_composite = bool(composite_analysis and composite_analysis.is_composite)
@@ -2159,11 +1746,12 @@ class MemoryEngine:
 
         # ==========================================
         # TX2: helper propagation (setelah commit)
+        # [BATCH 4] Delegate ke HelperPropagationManager
         # ==========================================
         propagation: Optional[HelperPropagationResult] = None
         try:
             with self.storage.transaction() as tx2:
-                propagation = self._propagate_helper(
+                propagation = self.helper_propagator.propagate(
                     session=tx2,
                     new_fragment=fragment,
                     topic_key_id=key_id,
