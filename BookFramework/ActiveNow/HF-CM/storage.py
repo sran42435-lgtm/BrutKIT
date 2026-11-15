@@ -6,6 +6,17 @@ Fungsi: Menjamin integritas ACID pada SQLite. Mencegah "Half Memory"
 (Fragment tersimpan tapi Payload hilang, atau sebaliknya).
 Memisahkan Metadata (Index) dan Payload (Binary) secara fisik di database 
 agar pencarian temporal/asosiatif tidak perlu memuat blob besar ke RAM.
+
+[HIERARCHICAL FRAGMENT EXPANSION]
+FragmentDB sekarang menyimpan struktur hierarkis:
+    parent_fragment_id, depth, fragment_key, fragment_helper_description,
+    descendant_helper_evidence, aggregated_helper_description
+
+Semua query hierarchy & trend BERADA DI SINI. memory_engine.py tidak boleh
+melakukan SQL langsung.
+
+CHILD COUNT adalah DERIVED value (COUNT(parent_fragment_id == X)),
+bukan kolom yang disimpan — sesuai spesifikasi butir 1.3.
 """
 
 import json
@@ -18,7 +29,7 @@ from typing import Optional, List, Dict, Set, Tuple
 
 from sqlalchemy import (
     create_engine, Column, String, DateTime, Float, Integer, 
-    LargeBinary, JSON, ForeignKey, Index
+    LargeBinary, JSON, ForeignKey, Index, Boolean, func, inspect, text
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
 from sqlalchemy.exc import SQLAlchemyError
@@ -39,6 +50,25 @@ class SessionDB(Base):
     created_at = Column(DateTime, nullable=False)
     last_active_at = Column(DateTime, nullable=False)
 
+
+class SessionStateDB(Base):
+    """
+    [MEKANISME 3] Current Conversational State ("STATE NOW").
+
+    Menyimpan topik & fragment yang sedang aktif dalam satu sesi, sehingga
+    kelanjutan lokal tidak perlu selalu membandingkan ulang seluruh kandidat.
+
+    BUKAN probabilitas permanen — jika evidence menunjukkan topik lain,
+    engine tetap harus berpindah.
+    """
+    __tablename__ = "session_states"
+    session_id = Column(String, ForeignKey("sessions.id"), primary_key=True)
+    active_topic_key_id = Column(String, nullable=True)
+    active_fragment_id = Column(String, nullable=True)
+    active_depth = Column(Integer, default=0)
+    last_updated = Column(DateTime, nullable=True)
+
+
 class TopicKeyDB(Base):
     __tablename__ = "topic_keys"
     id = Column(String, primary_key=True)
@@ -54,6 +84,10 @@ class TopicKeyDB(Base):
     activation_count = Column(Integer, default=0)
     related_fragment_ids = Column(JSON, default=list)
     status = Column(String, default="ACTIVE")
+    # [MEKANISME 3] Helper propagation dari root fragments.
+    # helper_description = identitas OWN. aggregated = warisan descendant.
+    aggregated_helper_description = Column(String, default="")
+    helper_source_fragment_ids = Column(JSON, default=list)
     
     # Relationship (Lazy loading untuk menghemat memori)
     fragments = relationship("FragmentDB", back_populates="topic_key", lazy="dynamic")
@@ -71,6 +105,15 @@ class PayloadDB(Base):
     compression_version = Column(String, default="1.0")
 
 class FragmentDB(Base):
+    """
+    [MEKANISME 3 + 5] Fragment sebagai NODE HIERARKIS.
+
+    parent_fragment_id menunjuk fragment lain (self-referential).
+    depth: 0 = root/opening, 1 = section, 2 = child spesifik.
+
+    CATATAN: child_count TIDAK disimpan. Ia dihitung via
+    COUNT(parent_fragment_id == X) dengan index idx_fragment_parent.
+    """
     __tablename__ = "fragments"
     id = Column(String, primary_key=True)
     topic_key_id = Column(String, ForeignKey("topic_keys.id"), nullable=False)
@@ -86,12 +129,29 @@ class FragmentDB(Base):
     # [CRITICAL FIX] True Fragment-Level Relevance Profiles
     token_profile = Column(JSON, default=dict)
     co_occurrence_profile = Column(JSON, default=dict)
+    # [MEKANISME 3] Identitas fragment sebagai subtopik.
+    fragment_key = Column(String, default="")
+    fragment_helper_description = Column(String, default="")
+    # [MEKANISME 5] Hierarchy structure.
+    parent_fragment_id = Column(String, ForeignKey("fragments.id"), nullable=True)
+    depth = Column(Integer, default=0)
+    # [MEKANISME 3] Helper propagation (bounded + deduplicated).
+    descendant_helper_evidence = Column(JSON, default=list)
+    aggregated_helper_description = Column(String, default="")
+    helper_contributor_ids = Column(JSON, default=list)
+    # [MEKANISME 4] Cross-key composite.
+    is_composite = Column(Boolean, default=False)
+    source_topic_key_ids = Column(JSON, default=list)
     
     # Indexing untuk Temporal Filtering & Fast Retrieval (Spek Tinggi)
     __table_args__ = (
         Index('idx_fragment_topic', 'topic_key_id'),
         Index('idx_fragment_session', 'session_id'),
         Index('idx_fragment_temporal', 'temporal_index'),
+        # [MEKANISME 5] Index hierarchy: query "semua child dari X" harus cepat.
+        Index('idx_fragment_parent', 'parent_fragment_id'),
+        # Trend retrieval sering butuh "fragment depth tertentu dalam topik".
+        Index('idx_fragment_topic_depth', 'topic_key_id', 'depth'),
     )
 
     topic_key = relationship("TopicKeyDB", back_populates="fragments")
@@ -125,6 +185,14 @@ class PendingStateDB(Base):
     status = Column(String, default="ACTIVE")
     temporal_reference = Column(String, nullable=True)
     origin_session_id = Column(String, nullable=True)
+    # [MEKANISME 1] Recursive ambiguity accumulation.
+    # SUMBER KEBENARAN = original_input + clarification_history.
+    # combined_clarification_text hanya CACHE/derived.
+    clarification_history = Column(JSON, default=list)
+    combined_clarification_text = Column(String, default="")
+    excluded_candidate_keys = Column(JSON, default=list)
+    excluded_tokens = Column(JSON, default=list)
+    candidate_history = Column(JSON, default=list)
     
     __table_args__ = (
         Index('idx_pending_status', 'status'),
@@ -164,6 +232,91 @@ class MemoryStorage:
         # Inisialisasi Schema
         Base.metadata.create_all(bind=self.engine)
 
+        # [MEKANISME 3+5] Migrasi aditif untuk DB yang SUDAH ADA.
+        # create_all() melewati tabel existing → kolom baru tidak muncul.
+        # Ini menutup celah itu tanpa pernah menghapus/mengubah data lama.
+        self._ensure_additive_columns()
+
+    # ==========================================
+    # [MIGRASI] ADDITIVE-ONLY SCHEMA UPGRADE
+    # ==========================================
+
+    def _ensure_additive_columns(self):
+        """
+        Menambahkan kolom & index yang belum ada pada tabel EXISTING.
+
+        ATURAN KEAMANAN:
+            ✅ ALTER TABLE ... ADD COLUMN  (hanya jika kolom belum ada)
+            ✅ CREATE INDEX IF NOT EXISTS
+            ❌ TIDAK PERNAH DROP COLUMN / DROP TABLE / RENAME / ubah tipe
+
+        Kenapa perlu:
+            Base.metadata.create_all() hanya membuat tabel yang BELUM ada.
+            Database lama (data/memory.db) tidak akan mendapat kolom hierarchy
+            tanpa langkah ini, dan semua query baru akan gagal.
+
+        Kolom JSON ditambahkan sebagai TEXT (SQLite menyimpan JSON sebagai TEXT),
+        sehingga kompatibel dengan tipe SQLAlchemy JSON yang sudah dipakai.
+        """
+        expected_columns: Dict[str, Dict[str, str]] = {
+            "fragments": {
+                "fragment_key": "VARCHAR DEFAULT ''",
+                "fragment_helper_description": "VARCHAR DEFAULT ''",
+                "parent_fragment_id": "VARCHAR",
+                "depth": "INTEGER DEFAULT 0",
+                "descendant_helper_evidence": "TEXT",
+                "aggregated_helper_description": "VARCHAR DEFAULT ''",
+                "helper_contributor_ids": "TEXT",
+                "is_composite": "BOOLEAN DEFAULT 0",
+                "source_topic_key_ids": "TEXT",
+            },
+            "topic_keys": {
+                "aggregated_helper_description": "VARCHAR DEFAULT ''",
+                "helper_source_fragment_ids": "TEXT",
+            },
+            "pending_states": {
+                "clarification_history": "TEXT",
+                "combined_clarification_text": "VARCHAR DEFAULT ''",
+                "excluded_candidate_keys": "TEXT",
+                "excluded_tokens": "TEXT",
+                "candidate_history": "TEXT",
+            },
+        }
+
+        expected_indexes: Dict[str, Tuple[str, str]] = {
+            "idx_fragment_parent": ("fragments", "parent_fragment_id"),
+            "idx_fragment_topic_depth": ("fragments", "topic_key_id, depth"),
+        }
+
+        try:
+            inspector = inspect(self.engine)
+            with self.engine.begin() as conn:
+                for table_name, columns in expected_columns.items():
+                    if not inspector.has_table(table_name):
+                        # Tabel baru sudah dibuat create_all dengan kolom lengkap.
+                        continue
+                    existing = {c["name"] for c in inspector.get_columns(table_name)}
+                    for col_name, col_ddl in columns.items():
+                        if col_name in existing:
+                            continue
+                        conn.execute(text(
+                            f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_ddl}"
+                        ))
+                        logger.info(
+                            f"SCHEMA MIGRATION: {table_name}.{col_name} ditambahkan (additive)."
+                        )
+
+                for index_name, (table_name, col_expr) in expected_indexes.items():
+                    if not inspector.has_table(table_name):
+                        continue
+                    conn.execute(text(
+                        f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} ({col_expr})"
+                    ))
+        except SQLAlchemyError as e:
+            # Migrasi gagal tidak boleh membuat engine mati total; tapi harus terlihat.
+            logger.error(f"SCHEMA MIGRATION GAGAL (additive): {e}")
+            raise
+
     @contextmanager
     def transaction(self):
         """
@@ -185,6 +338,83 @@ class MemoryStorage:
             raise
         finally:
             session.close()
+
+    # ==========================================
+    # [MAPPER] DB ROW → PYDANTIC (dipakai method hierarchy/trend baru)
+    # ==========================================
+
+    def _to_fragment_model(self, f: "FragmentDB") -> models.FragmentMetadata:
+        """
+        Mapper tunggal untuk method hierarchy/trend baru.
+
+        Method read lama tetap memakai mapping inline mereka (diperluas dengan
+        field baru) agar tidak ada kode existing yang dihapus. Method baru
+        memakai helper ini supaya tidak menambah belasan duplikasi 25-baris.
+        """
+        return models.FragmentMetadata(
+            fragment_id=f.id,
+            topic_key_id=f.topic_key_id,
+            session_id=f.session_id,
+            created_at=f.created_at,
+            temporal_index=f.temporal_index,
+            payload_reference=f.payload_id,
+            content_hash=f.content_hash,
+            sequence_index=f.sequence_index or 0,
+            source_fragment_ids=f.source_fragment_ids or [],
+            relationship_strength=f.relationship_strength or 0.0,
+            token_profile=f.token_profile or {},
+            co_occurrence_profile=f.co_occurrence_profile or {},
+            fragment_key=f.fragment_key or "",
+            fragment_helper_description=f.fragment_helper_description or "",
+            parent_fragment_id=f.parent_fragment_id,
+            depth=f.depth or 0,
+            descendant_helper_evidence=f.descendant_helper_evidence or [],
+            aggregated_helper_description=f.aggregated_helper_description or "",
+            helper_contributor_ids=f.helper_contributor_ids or [],
+            is_composite=bool(f.is_composite),
+            source_topic_key_ids=f.source_topic_key_ids or [],
+        )
+
+    def _to_topic_model(self, k: "TopicKeyDB") -> models.TopicKey:
+        """Mapper tunggal TopicKey untuk method trend baru."""
+        return models.TopicKey(
+            key_id=k.id,
+            title=k.title,
+            helper_description=k.helper_description,
+            representative_tokens=k.representative_tokens or [],
+            unique_tokens=k.unique_tokens or [],
+            token_profile=k.token_profile or {},
+            co_occurrence_profile=k.co_occurrence_profile or {},
+            created_at=k.created_at,
+            updated_at=k.updated_at,
+            activation_count=k.activation_count or 0,
+            related_fragment_ids=k.related_fragment_ids or [],
+            status=k.status,
+            aggregated_helper_description=k.aggregated_helper_description or "",
+            helper_source_fragment_ids=k.helper_source_fragment_ids or [],
+        )
+
+    def _to_pending_model(self, p: "PendingStateDB") -> models.PendingState:
+        """Mapper tunggal PendingState untuk method clarification baru."""
+        return models.PendingState(
+            pending_id=p.id,
+            session_id=p.session_id,
+            original_input=p.original_input,
+            candidate_keys=p.candidate_keys or [],
+            candidate_scores=p.candidate_scores or {},
+            assistant_question=p.assistant_question,
+            clarification_round=p.clarification_round or 1,
+            created_at=p.created_at,
+            last_updated_at=p.last_updated_at,
+            status=models.PendingStatus(p.status),
+            temporal_reference=p.temporal_reference,
+            origin_session_id=p.origin_session_id,
+            clarification_history=p.clarification_history or [],
+            combined_clarification_text=p.combined_clarification_text or "",
+            excluded_candidate_keys=p.excluded_candidate_keys or [],
+            excluded_tokens=p.excluded_tokens or [],
+            candidate_history=p.candidate_history or [],
+        )
 
     # ==========================================
     # OPERASI PENYIMPANAN (WRITE)
@@ -219,7 +449,10 @@ class MemoryStorage:
             updated_at=key.updated_at,
             activation_count=key.activation_count,
             related_fragment_ids=key.related_fragment_ids,
-            status=key.status
+            status=key.status,
+            # [MEKANISME 3] Helper propagation.
+            aggregated_helper_description=key.aggregated_helper_description,
+            helper_source_fragment_ids=key.helper_source_fragment_ids,
         )
         session.merge(db_obj) # Merge mencegah error jika Key sudah ada (Update profile)
 
@@ -248,7 +481,20 @@ class MemoryStorage:
             source_fragment_ids=fragment.source_fragment_ids,
             relationship_strength=fragment.relationship_strength,
             token_profile=fragment.token_profile,
-            co_occurrence_profile=fragment.co_occurrence_profile
+            co_occurrence_profile=fragment.co_occurrence_profile,
+            # [MEKANISME 3] Identitas subtopik.
+            fragment_key=fragment.fragment_key,
+            fragment_helper_description=fragment.fragment_helper_description,
+            # [MEKANISME 5] Hierarchy.
+            parent_fragment_id=fragment.parent_fragment_id,
+            depth=fragment.depth,
+            # [MEKANISME 3] Helper propagation.
+            descendant_helper_evidence=fragment.descendant_helper_evidence,
+            aggregated_helper_description=fragment.aggregated_helper_description,
+            helper_contributor_ids=fragment.helper_contributor_ids,
+            # [MEKANISME 4] Composite.
+            is_composite=fragment.is_composite,
+            source_topic_key_ids=fragment.source_topic_key_ids,
         )
         session.add(db_obj)
 
@@ -276,6 +522,16 @@ class MemoryStorage:
             existing.clarification_round = pending.clarification_round
             existing.candidate_keys = pending.candidate_keys
             existing.candidate_scores = pending.candidate_scores
+            # [FIX — Batch 3] assistant_question sebelumnya TIDAK diperbarui di
+            # branch update. Mekanisme 1 membutuhkan pertanyaan yang makin
+            # spesifik per round, jadi field ini wajib ikut diperbarui.
+            existing.assistant_question = pending.assistant_question
+            # [MEKANISME 1] Akumulasi klarifikasi.
+            existing.clarification_history = pending.clarification_history
+            existing.combined_clarification_text = pending.combined_clarification_text
+            existing.excluded_candidate_keys = pending.excluded_candidate_keys
+            existing.excluded_tokens = pending.excluded_tokens
+            existing.candidate_history = pending.candidate_history
         else:
             db_obj = PendingStateDB(
                 id=pending.pending_id, 
@@ -289,9 +545,103 @@ class MemoryStorage:
                 last_updated_at=pending.last_updated_at,
                 status=pending.status.value, 
                 temporal_reference=pending.temporal_reference,
-                origin_session_id=pending.origin_session_id
+                origin_session_id=pending.origin_session_id,
+                # [MEKANISME 1] Akumulasi klarifikasi.
+                clarification_history=pending.clarification_history,
+                combined_clarification_text=pending.combined_clarification_text,
+                excluded_candidate_keys=pending.excluded_candidate_keys,
+                excluded_tokens=pending.excluded_tokens,
+                candidate_history=pending.candidate_history,
             )
             session.add(db_obj)
+
+    # ==========================================
+    # [MEKANISME 3] HELPER PROPAGATION WRITE
+    # ==========================================
+
+    def update_fragment_helper(self, session: Session, fragment: models.FragmentMetadata):
+        """
+        [MEKANISME 3] Update HANYA field helper pada fragment existing.
+
+        KENAPA METHOD TERPISAH:
+            FragmentMetadata bersifat frozen. Propagasi membuat instance BARU
+            via model_copy(update={...}). Method ini menulis HANYA kolom helper:
+                fragment_helper_description
+                descendant_helper_evidence
+                aggregated_helper_description
+                helper_contributor_ids
+
+        YANG TIDAK PERNAH DISENTUH:
+            payload_id, content_hash, created_at, temporal_index,
+            relationship_strength, parent_fragment_id, depth
+
+        Dengan begitu integritas exact memory & invariant Continuity Purity
+        (relationship_strength == turn_continuity_score) tetap terjaga.
+        """
+        existing = session.query(FragmentDB).filter_by(id=fragment.fragment_id).first()
+        if existing is None:
+            logger.warning(
+                f"HELPER PROPAGATION: fragment {fragment.fragment_id[:8]}... tidak ditemukan."
+            )
+            return
+        existing.fragment_helper_description = fragment.fragment_helper_description
+        existing.descendant_helper_evidence = fragment.descendant_helper_evidence
+        existing.aggregated_helper_description = fragment.aggregated_helper_description
+        existing.helper_contributor_ids = fragment.helper_contributor_ids
+
+    def update_topic_helper(self, session: Session, topic_key: models.TopicKey):
+        """
+        [MEKANISME 3] Update HANYA helper TopicKey (titik akhir propagasi).
+
+        helper_description boleh diperbarui HANYA jika engine sudah
+        memverifikasi mutation gate. Storage tidak membuat keputusan itu.
+        """
+        existing = session.query(TopicKeyDB).filter_by(id=topic_key.key_id).first()
+        if existing is None:
+            return
+        existing.helper_description = topic_key.helper_description
+        existing.aggregated_helper_description = topic_key.aggregated_helper_description
+        existing.helper_source_fragment_ids = topic_key.helper_source_fragment_ids
+        existing.updated_at = topic_key.updated_at
+
+    # ==========================================
+    # [MEKANISME 3] SESSION ACTIVE STATE
+    # ==========================================
+
+    def save_session_state(self, state: models.SessionActiveState):
+        """Simpan/perbarui active topic & fragment untuk satu sesi."""
+        with self.SessionLocal() as session:
+            existing = session.query(SessionStateDB).filter_by(
+                session_id=state.session_id
+            ).first()
+            if existing:
+                existing.active_topic_key_id = state.active_topic_key_id
+                existing.active_fragment_id = state.active_fragment_id
+                existing.active_depth = state.active_depth
+                existing.last_updated = state.last_updated
+            else:
+                session.add(SessionStateDB(
+                    session_id=state.session_id,
+                    active_topic_key_id=state.active_topic_key_id,
+                    active_fragment_id=state.active_fragment_id,
+                    active_depth=state.active_depth,
+                    last_updated=state.last_updated,
+                ))
+            session.commit()
+
+    def get_session_state(self, session_id: str) -> Optional[models.SessionActiveState]:
+        """Ambil active state sesi. None jika belum ada."""
+        with self.SessionLocal() as session:
+            s = session.query(SessionStateDB).filter_by(session_id=session_id).first()
+            if not s:
+                return None
+            return models.SessionActiveState(
+                session_id=s.session_id,
+                active_topic_key_id=s.active_topic_key_id,
+                active_fragment_id=s.active_fragment_id,
+                active_depth=s.active_depth or 0,
+                last_updated=s.last_updated,
+            )
 
     # ==========================================
     # OPERASI PEMBACAAN (READ)
@@ -314,7 +664,9 @@ class MemoryStorage:
                     updated_at=k.updated_at,
                     activation_count=k.activation_count or 0,
                     related_fragment_ids=k.related_fragment_ids or [],
-                    status=k.status
+                    status=k.status,
+                    aggregated_helper_description=k.aggregated_helper_description or "",
+                    helper_source_fragment_ids=k.helper_source_fragment_ids or [],
                 ) for k in db_keys
             ]
 
@@ -336,7 +688,9 @@ class MemoryStorage:
                 updated_at=k.updated_at,
                 activation_count=k.activation_count or 0,
                 related_fragment_ids=k.related_fragment_ids or [],
-                status=k.status
+                status=k.status,
+                aggregated_helper_description=k.aggregated_helper_description or "",
+                helper_source_fragment_ids=k.helper_source_fragment_ids or [],
             )
 
     def get_active_pending_state(self, session_id: str) -> Optional[models.PendingState]:
@@ -362,7 +716,12 @@ class MemoryStorage:
                 last_updated_at=db_pending.last_updated_at,
                 status=models.PendingStatus(db_pending.status), 
                 temporal_reference=db_pending.temporal_reference,
-                origin_session_id=db_pending.origin_session_id
+                origin_session_id=db_pending.origin_session_id,
+                clarification_history=db_pending.clarification_history or [],
+                combined_clarification_text=db_pending.combined_clarification_text or "",
+                excluded_candidate_keys=db_pending.excluded_candidate_keys or [],
+                excluded_tokens=db_pending.excluded_tokens or [],
+                candidate_history=db_pending.candidate_history or [],
             )
 
     def get_pending_by_reference(self, pending_id: str) -> Optional[models.PendingState]:
@@ -383,7 +742,12 @@ class MemoryStorage:
                 last_updated_at=db_pending.last_updated_at,
                 status=models.PendingStatus(db_pending.status), 
                 temporal_reference=db_pending.temporal_reference,
-                origin_session_id=db_pending.origin_session_id
+                origin_session_id=db_pending.origin_session_id,
+                clarification_history=db_pending.clarification_history or [],
+                combined_clarification_text=db_pending.combined_clarification_text or "",
+                excluded_candidate_keys=db_pending.excluded_candidate_keys or [],
+                excluded_tokens=db_pending.excluded_tokens or [],
+                candidate_history=db_pending.candidate_history or [],
             )
 
     def get_fragment_metadata_by_key(self, topic_key_id: str) -> List[models.FragmentMetadata]:
@@ -403,7 +767,16 @@ class MemoryStorage:
                     source_fragment_ids=f.source_fragment_ids or [],
                     relationship_strength=f.relationship_strength or 0.0,
                     token_profile=f.token_profile or {},
-                    co_occurrence_profile=f.co_occurrence_profile or {}
+                    co_occurrence_profile=f.co_occurrence_profile or {},
+                    fragment_key=f.fragment_key or "",
+                    fragment_helper_description=f.fragment_helper_description or "",
+                    parent_fragment_id=f.parent_fragment_id,
+                    depth=f.depth or 0,
+                    descendant_helper_evidence=f.descendant_helper_evidence or [],
+                    aggregated_helper_description=f.aggregated_helper_description or "",
+                    helper_contributor_ids=f.helper_contributor_ids or [],
+                    is_composite=bool(f.is_composite),
+                    source_topic_key_ids=f.source_topic_key_ids or [],
                 ) for f in db_frags
             ]
 
@@ -425,7 +798,16 @@ class MemoryStorage:
                 source_fragment_ids=f.source_fragment_ids or [],
                 relationship_strength=f.relationship_strength or 0.0,
                 token_profile=f.token_profile or {},
-                co_occurrence_profile=f.co_occurrence_profile or {}
+                co_occurrence_profile=f.co_occurrence_profile or {},
+                fragment_key=f.fragment_key or "",
+                fragment_helper_description=f.fragment_helper_description or "",
+                parent_fragment_id=f.parent_fragment_id,
+                depth=f.depth or 0,
+                descendant_helper_evidence=f.descendant_helper_evidence or [],
+                aggregated_helper_description=f.aggregated_helper_description or "",
+                helper_contributor_ids=f.helper_contributor_ids or [],
+                is_composite=bool(f.is_composite),
+                source_topic_key_ids=f.source_topic_key_ids or [],
             )
 
     def get_recent_fragments(self, session_id: str, limit: int = 10) -> List[models.FragmentMetadata]:
@@ -447,7 +829,16 @@ class MemoryStorage:
                     source_fragment_ids=f.source_fragment_ids or [],
                     relationship_strength=f.relationship_strength or 0.0,
                     token_profile=f.token_profile or {},
-                    co_occurrence_profile=f.co_occurrence_profile or {}
+                    co_occurrence_profile=f.co_occurrence_profile or {},
+                    fragment_key=f.fragment_key or "",
+                    fragment_helper_description=f.fragment_helper_description or "",
+                    parent_fragment_id=f.parent_fragment_id,
+                    depth=f.depth or 0,
+                    descendant_helper_evidence=f.descendant_helper_evidence or [],
+                    aggregated_helper_description=f.aggregated_helper_description or "",
+                    helper_contributor_ids=f.helper_contributor_ids or [],
+                    is_composite=bool(f.is_composite),
+                    source_topic_key_ids=f.source_topic_key_ids or [],
                 ) for f in db_frags
             ]
 
@@ -506,7 +897,16 @@ class MemoryStorage:
                     source_fragment_ids=f.source_fragment_ids or [],
                     relationship_strength=f.relationship_strength or 0.0,
                     token_profile=f.token_profile or {},
-                    co_occurrence_profile=f.co_occurrence_profile or {}
+                    co_occurrence_profile=f.co_occurrence_profile or {},
+                    fragment_key=f.fragment_key or "",
+                    fragment_helper_description=f.fragment_helper_description or "",
+                    parent_fragment_id=f.parent_fragment_id,
+                    depth=f.depth or 0,
+                    descendant_helper_evidence=f.descendant_helper_evidence or [],
+                    aggregated_helper_description=f.aggregated_helper_description or "",
+                    helper_contributor_ids=f.helper_contributor_ids or [],
+                    is_composite=bool(f.is_composite),
+                    source_topic_key_ids=f.source_topic_key_ids or [],
                 ) for f in db_frags
             ]
 
@@ -546,7 +946,9 @@ class MemoryStorage:
                     updated_at=k.updated_at,
                     activation_count=k.activation_count or 0,
                     related_fragment_ids=k.related_fragment_ids or [],
-                    status=k.status
+                    status=k.status,
+                    aggregated_helper_description=k.aggregated_helper_description or "",
+                    helper_source_fragment_ids=k.helper_source_fragment_ids or [],
                 ) for k in db_keys
             ]
 
@@ -569,7 +971,12 @@ class MemoryStorage:
                     clarification_round=p.clarification_round, created_at=p.created_at,
                     last_updated_at=p.last_updated_at,
                     status=models.PendingStatus(p.status), temporal_reference=p.temporal_reference,
-                    origin_session_id=p.origin_session_id
+                    origin_session_id=p.origin_session_id,
+                    clarification_history=p.clarification_history or [],
+                    combined_clarification_text=p.combined_clarification_text or "",
+                    excluded_candidate_keys=p.excluded_candidate_keys or [],
+                    excluded_tokens=p.excluded_tokens or [],
+                    candidate_history=p.candidate_history or [],
                 ) for p in db_pendings
             ]
 
@@ -879,3 +1286,462 @@ class MemoryStorage:
                 session, start_ids, target_ids, max_depth
             )
             return path_info
+
+    # ==========================================
+    # [MEKANISME 5] HIERARCHY TRAVERSAL API
+    # ==========================================
+
+    def get_root_fragments_for_topic(self, topic_key_id: str) -> List[models.FragmentMetadata]:
+        """
+        Fragment root/opening dari satu TopicKey (parent_fragment_id IS NULL).
+
+        Dipakai untuk:
+            - membandingkan fragment baru dengan konteks pembuka
+            - titik awal propagasi helper ke TopicKey
+        """
+        with self.SessionLocal() as session:
+            rows = session.query(FragmentDB).filter(
+                FragmentDB.topic_key_id == topic_key_id,
+                FragmentDB.parent_fragment_id.is_(None),
+            ).order_by(FragmentDB.created_at.asc()).all()
+            return [self._to_fragment_model(f) for f in rows]
+
+    def get_child_fragments(
+        self,
+        parent_fragment_id: str,
+        limit: Optional[int] = None,
+    ) -> List[models.FragmentMetadata]:
+        """Semua child langsung dari satu fragment (terindex idx_fragment_parent)."""
+        with self.SessionLocal() as session:
+            q = session.query(FragmentDB).filter(
+                FragmentDB.parent_fragment_id == parent_fragment_id
+            ).order_by(FragmentDB.created_at.asc())
+            if limit is not None:
+                q = q.limit(limit)
+            return [self._to_fragment_model(f) for f in q.all()]
+
+    def get_fragment_children_count(self, parent_fragment_id: str) -> int:
+        """
+        [SPESIFIKASI 1.3] child_count adalah DERIVED, bukan kolom tersimpan.
+
+            child_count = COUNT(parent_fragment_id == fragment_id)
+        """
+        with self.SessionLocal() as session:
+            return session.query(func.count(FragmentDB.id)).filter(
+                FragmentDB.parent_fragment_id == parent_fragment_id
+            ).scalar() or 0
+
+    def get_fragment_children_counts(self, parent_ids: List[str]) -> Dict[str, int]:
+        """
+        Batch child count untuk trend ranking (satu query, bukan N query).
+
+        Node tanpa child tetap muncul dengan nilai 0 agar caller tidak
+        perlu membedakan "tidak ada" vs "nol".
+        """
+        if not parent_ids:
+            return {}
+        with self.SessionLocal() as session:
+            rows = session.query(
+                FragmentDB.parent_fragment_id,
+                func.count(FragmentDB.id),
+            ).filter(
+                FragmentDB.parent_fragment_id.in_(parent_ids)
+            ).group_by(FragmentDB.parent_fragment_id).all()
+            counts = {pid: 0 for pid in parent_ids}
+            for pid, cnt in rows:
+                counts[pid] = int(cnt or 0)
+            return counts
+
+    def get_fragment_ancestors(
+        self,
+        fragment_id: str,
+        max_depth: Optional[int] = None,
+    ) -> List[models.FragmentMetadata]:
+        """
+        Rantai parent ke ATAS, dimulai dari parent langsung.
+
+        Cycle-safe via visited set. Dipakai Helper Propagation untuk
+        meneruskan representasi ringkas sampai root.
+        """
+        limit = max_depth if max_depth is not None else CONFIG.hierarchy.MAX_ANCESTOR_TRAVERSAL
+        ancestors: List[models.FragmentMetadata] = []
+        visited: Set[str] = {fragment_id}
+
+        with self.SessionLocal() as session:
+            current = session.query(FragmentDB).filter_by(id=fragment_id).first()
+            hops = 0
+            while current is not None and current.parent_fragment_id and hops < limit:
+                pid = current.parent_fragment_id
+                if pid in visited:
+                    break  # proteksi siklus
+                visited.add(pid)
+                parent = session.query(FragmentDB).filter_by(id=pid).first()
+                if parent is None:
+                    break
+                ancestors.append(self._to_fragment_model(parent))
+                current = parent
+                hops += 1
+        return ancestors
+
+    def get_fragment_descendants(
+        self,
+        fragment_id: str,
+        max_depth: Optional[int] = None,
+    ) -> List[models.FragmentMetadata]:
+        """
+        Semua descendant (BFS ke BAWAH). Cycle-safe.
+
+        Dipakai untuk audit struktur & agregasi bukti cabang.
+        """
+        limit = max_depth if max_depth is not None else CONFIG.hierarchy.MAX_FRAGMENT_DEPTH
+        result: List[models.FragmentMetadata] = []
+        visited: Set[str] = {fragment_id}
+
+        with self.SessionLocal() as session:
+            queue: deque = deque([(fragment_id, 0)])
+            while queue:
+                node_id, depth = queue.popleft()
+                if depth >= limit:
+                    continue
+                children = session.query(FragmentDB).filter(
+                    FragmentDB.parent_fragment_id == node_id
+                ).all()
+                for c in children:
+                    if c.id in visited:
+                        continue
+                    visited.add(c.id)
+                    result.append(self._to_fragment_model(c))
+                    queue.append((c.id, depth + 1))
+        return result
+
+    def get_fragments_by_topic_and_depth(
+        self,
+        topic_key_id: str,
+        depth: int,
+    ) -> List[models.FragmentMetadata]:
+        """
+        Fragment pada depth tertentu dalam satu TopicKey.
+
+        Terindex idx_fragment_topic_depth. Dipakai placement analysis
+        (bandingkan dengan section depth 1) dan trend navigation.
+        """
+        with self.SessionLocal() as session:
+            rows = session.query(FragmentDB).filter(
+                FragmentDB.topic_key_id == topic_key_id,
+                FragmentDB.depth == depth,
+            ).order_by(FragmentDB.created_at.asc()).all()
+            return [self._to_fragment_model(f) for f in rows]
+
+    def get_fragment_depth(self, fragment_id: str) -> Optional[int]:
+        """Depth satu fragment. None jika fragment tidak ada."""
+        with self.SessionLocal() as session:
+            row = session.query(FragmentDB.depth).filter_by(id=fragment_id).first()
+            if row is None:
+                return None
+            return int(row[0] or 0)
+
+    def count_fragments_for_topic(self, topic_key_id: str) -> int:
+        """Total fragment dalam satu TopicKey (sinyal trend level topik)."""
+        with self.SessionLocal() as session:
+            return session.query(func.count(FragmentDB.id)).filter(
+                FragmentDB.topic_key_id == topic_key_id
+            ).scalar() or 0
+
+    # ==========================================
+    # [MEKANISME 5] TREND RETRIEVAL
+    # ==========================================
+
+    def _normalize_trend_count(self, count_signal: int) -> float:
+        """Normalisasi count agar 500 child tidak mendominasi tak terbatas."""
+        cap = max(1, CONFIG.trend.TREND_COUNT_NORMALIZATION_CAP)
+        return min(count_signal, cap) / float(cap)
+
+    def _compute_trend_score(
+        self,
+        count_signal: int,
+        recency_score: float,
+        temporal_score: float,
+    ) -> float:
+        """
+        Skor trend. SINYAL UTAMA = count (anak/fragment).
+
+        CHILD_COUNT_WEIGHT (0.60) > RECENCY + TEMPORAL (0.40),
+        mengunci aturan "recency hanya bukti tambahan".
+        """
+        tc = CONFIG.trend
+        return (
+            tc.TREND_CHILD_COUNT_WEIGHT * self._normalize_trend_count(count_signal)
+            + tc.TREND_RECENCY_WEIGHT * max(0.0, min(1.0, recency_score))
+            + tc.TREND_TEMPORAL_WEIGHT * max(0.0, min(1.0, temporal_score))
+        )
+
+    def _compute_recency_score(
+        self,
+        latest: Optional[datetime],
+        reference_time: Optional[datetime],
+    ) -> float:
+        """Recency 0..1 dengan decay per hari. Normalisasi timezone naive dari SQLite."""
+        if latest is None or reference_time is None:
+            return 0.0
+        if latest.tzinfo is None and reference_time.tzinfo is not None:
+            latest = latest.replace(tzinfo=reference_time.tzinfo)
+        age_days = max(0.0, (reference_time - latest).total_seconds() / 86400.0)
+        decay_days = max(1.0, CONFIG.trend.TREND_RECENCY_DECAY_DAYS)
+        return max(0.0, 1.0 - (age_days / decay_days))
+
+    def get_trending_topic_keys(
+        self,
+        limit: Optional[int] = None,
+        reference_time: Optional[datetime] = None,
+        temporal_range: Optional[Tuple[datetime, datetime]] = None,
+    ) -> List[models.TrendCandidate]:
+        """
+        [MEKANISME 5A] Top-N TopicKey untuk continuation tanpa key spesifik.
+
+        Contoh: "Lanjutkan topik sebelumnya."
+
+        Ranking:
+            fragment_count + branch richness   (SINYAL UTAMA)
+            + recency                          (tambahan)
+            + temporal match jika mode temporal aktif (tambahan)
+
+        Semua query agregat dijalankan di SQL, bukan loop Python per topik.
+        """
+        top_n = limit if limit is not None else CONFIG.trend.TREND_TOPIC_LIMIT
+
+        with self.SessionLocal() as session:
+            keys = session.query(TopicKeyDB).filter_by(status="ACTIVE").all()
+            if not keys:
+                return []
+
+            # Agregat: jumlah fragment + aktivitas terakhir per topik.
+            frag_rows = session.query(
+                FragmentDB.topic_key_id,
+                func.count(FragmentDB.id),
+                func.max(FragmentDB.created_at),
+            ).group_by(FragmentDB.topic_key_id).all()
+            frag_count = {tid: int(cnt or 0) for tid, cnt, _ in frag_rows}
+            last_activity = {tid: ts for tid, _, ts in frag_rows}
+
+            # Branch richness: berapa fragment yang PUNYA parent (cabang hidup).
+            branch_rows = session.query(
+                FragmentDB.topic_key_id,
+                func.count(FragmentDB.id),
+            ).filter(
+                FragmentDB.parent_fragment_id.isnot(None)
+            ).group_by(FragmentDB.topic_key_id).all()
+            branch_count = {tid: int(cnt or 0) for tid, cnt in branch_rows}
+
+            # Temporal match per topik (hanya jika ada constraint waktu).
+            temporal_hits: Dict[str, int] = {}
+            if temporal_range is not None:
+                start_t, end_t = temporal_range
+                temp_rows = session.query(
+                    FragmentDB.topic_key_id,
+                    func.count(FragmentDB.id),
+                ).filter(
+                    FragmentDB.temporal_index >= start_t.replace(tzinfo=None),
+                    FragmentDB.temporal_index <= end_t.replace(tzinfo=None),
+                ).group_by(FragmentDB.topic_key_id).all()
+                temporal_hits = {tid: int(cnt or 0) for tid, cnt in temp_rows}
+
+            candidates: List[models.TrendCandidate] = []
+            for k in keys:
+                fc = frag_count.get(k.id, 0)
+                bc = branch_count.get(k.id, 0)
+                # Sinyal utama: total fragment + kekayaan cabang.
+                count_signal = fc + bc
+                recency = self._compute_recency_score(
+                    last_activity.get(k.id) or k.updated_at or k.created_at,
+                    reference_time,
+                )
+                temporal = 1.0 if temporal_hits.get(k.id, 0) > 0 else 0.0
+                score = self._compute_trend_score(count_signal, recency, temporal)
+
+                candidates.append(models.TrendCandidate(
+                    node_id=k.id,
+                    node_type=models.TrendNodeType.TOPIC_KEY,
+                    label=k.title,
+                    helper_description=(
+                        k.aggregated_helper_description or k.helper_description or ""
+                    ),
+                    depth=0,
+                    parent_fragment_id=None,
+                    child_count=bc,
+                    fragment_count=fc,
+                    recency_score=recency,
+                    temporal_score=temporal,
+                    evidence_score=self._normalize_trend_count(count_signal),
+                    trend_score=score,
+                    # TopicKey selalu bisa di-expand ke fragment-nya.
+                    expandable=True,
+                ))
+
+            candidates.sort(key=lambda c: c.trend_score, reverse=True)
+            return candidates[:top_n]
+
+    def get_trending_fragments(
+        self,
+        topic_key_id: str,
+        depth: Optional[int] = None,
+        limit: Optional[int] = None,
+        reference_time: Optional[datetime] = None,
+        temporal_range: Optional[Tuple[datetime, datetime]] = None,
+    ) -> List[models.TrendCandidate]:
+        """
+        [MEKANISME 5B] Top-N fragment pada depth tertentu dalam satu TopicKey.
+
+        Contoh: "Lanjutkan bisnis kopi." → topik jelas, bagian belum.
+        Default depth = NEW_BRANCH_DEPTH (1) = section utama.
+
+        Ranking: jumlah child (SINYAL UTAMA) + recency + temporal.
+
+        expandable = depth < MAX_FRAGMENT_DEPTH.
+        Setelah user memilih node di depth maksimum, tidak ada expansion lagi.
+        """
+        target_depth = depth if depth is not None else CONFIG.hierarchy.NEW_BRANCH_DEPTH
+        top_n = limit if limit is not None else CONFIG.trend.TREND_FRAGMENT_LIMIT
+
+        with self.SessionLocal() as session:
+            rows = session.query(FragmentDB).filter(
+                FragmentDB.topic_key_id == topic_key_id,
+                FragmentDB.depth == target_depth,
+            ).all()
+            if not rows:
+                return []
+
+            ids = [r.id for r in rows]
+            child_counts = self._get_children_counts_in_session(session, ids)
+
+            temporal_hits: Set[str] = set()
+            if temporal_range is not None:
+                start_t, end_t = temporal_range
+                temp_rows = session.query(FragmentDB.id).filter(
+                    FragmentDB.id.in_(ids),
+                    FragmentDB.temporal_index >= start_t.replace(tzinfo=None),
+                    FragmentDB.temporal_index <= end_t.replace(tzinfo=None),
+                ).all()
+                temporal_hits = {r[0] for r in temp_rows}
+
+            candidates: List[models.TrendCandidate] = []
+            for r in rows:
+                cc = child_counts.get(r.id, 0)
+                recency = self._compute_recency_score(r.created_at, reference_time)
+                temporal = 1.0 if r.id in temporal_hits else 0.0
+                score = self._compute_trend_score(cc, recency, temporal)
+                candidates.append(models.TrendCandidate(
+                    node_id=r.id,
+                    node_type=models.TrendNodeType.FRAGMENT,
+                    label=r.fragment_key or (r.fragment_helper_description or "")[:60],
+                    helper_description=(
+                        r.aggregated_helper_description
+                        or r.fragment_helper_description
+                        or ""
+                    ),
+                    depth=r.depth or 0,
+                    parent_fragment_id=r.parent_fragment_id,
+                    child_count=cc,
+                    fragment_count=cc,
+                    recency_score=recency,
+                    temporal_score=temporal,
+                    evidence_score=self._normalize_trend_count(cc),
+                    trend_score=score,
+                    expandable=(r.depth or 0) < CONFIG.hierarchy.MAX_FRAGMENT_DEPTH,
+                ))
+
+            candidates.sort(key=lambda c: c.trend_score, reverse=True)
+            return candidates[:top_n]
+
+    def get_trending_children(
+        self,
+        parent_fragment_id: str,
+        limit: Optional[int] = None,
+        reference_time: Optional[datetime] = None,
+        temporal_range: Optional[Tuple[datetime, datetime]] = None,
+    ) -> List[models.TrendCandidate]:
+        """
+        [MEKANISME 5C] Trend expansion ke child dari node yang dipilih user.
+
+        ATURAN DEPTH (DIKUNCI):
+            Expansion HANYA dilakukan jika current_depth < MAX_FRAGMENT_DEPTH.
+            Jika parent sudah di depth maksimum → return [] (tidak ada level berikut).
+        """
+        top_n = limit if limit is not None else CONFIG.trend.TREND_FRAGMENT_LIMIT
+
+        with self.SessionLocal() as session:
+            parent = session.query(FragmentDB).filter_by(id=parent_fragment_id).first()
+            if parent is None:
+                return []
+
+            parent_depth = parent.depth or 0
+            if CONFIG.trend.ENABLE_DEPTH_AWARE_EXPANSION:
+                if parent_depth >= CONFIG.hierarchy.MAX_FRAGMENT_DEPTH:
+                    # Depth limit tercapai — jangan cari trend level berikutnya.
+                    return []
+
+            rows = session.query(FragmentDB).filter(
+                FragmentDB.parent_fragment_id == parent_fragment_id
+            ).all()
+            if not rows:
+                return []
+
+            ids = [r.id for r in rows]
+            child_counts = self._get_children_counts_in_session(session, ids)
+
+            temporal_hits: Set[str] = set()
+            if temporal_range is not None:
+                start_t, end_t = temporal_range
+                temp_rows = session.query(FragmentDB.id).filter(
+                    FragmentDB.id.in_(ids),
+                    FragmentDB.temporal_index >= start_t.replace(tzinfo=None),
+                    FragmentDB.temporal_index <= end_t.replace(tzinfo=None),
+                ).all()
+                temporal_hits = {r[0] for r in temp_rows}
+
+            candidates: List[models.TrendCandidate] = []
+            for r in rows:
+                cc = child_counts.get(r.id, 0)
+                recency = self._compute_recency_score(r.created_at, reference_time)
+                temporal = 1.0 if r.id in temporal_hits else 0.0
+                score = self._compute_trend_score(cc, recency, temporal)
+                candidates.append(models.TrendCandidate(
+                    node_id=r.id,
+                    node_type=models.TrendNodeType.FRAGMENT,
+                    label=r.fragment_key or (r.fragment_helper_description or "")[:60],
+                    helper_description=(
+                        r.aggregated_helper_description
+                        or r.fragment_helper_description
+                        or ""
+                    ),
+                    depth=r.depth or 0,
+                    parent_fragment_id=r.parent_fragment_id,
+                    child_count=cc,
+                    fragment_count=cc,
+                    recency_score=recency,
+                    temporal_score=temporal,
+                    evidence_score=self._normalize_trend_count(cc),
+                    trend_score=score,
+                    expandable=(r.depth or 0) < CONFIG.hierarchy.MAX_FRAGMENT_DEPTH,
+                ))
+
+            candidates.sort(key=lambda c: c.trend_score, reverse=True)
+            return candidates[:top_n]
+
+    def _get_children_counts_in_session(
+        self,
+        session: Session,
+        parent_ids: List[str],
+    ) -> Dict[str, int]:
+        """Versi in-session dari batch child count (dipakai trend query)."""
+        if not parent_ids:
+            return {}
+        rows = session.query(
+            FragmentDB.parent_fragment_id,
+            func.count(FragmentDB.id),
+        ).filter(
+            FragmentDB.parent_fragment_id.in_(parent_ids)
+        ).group_by(FragmentDB.parent_fragment_id).all()
+        counts = {pid: 0 for pid in parent_ids}
+        for pid, cnt in rows:
+            counts[pid] = int(cnt or 0)
+        return counts

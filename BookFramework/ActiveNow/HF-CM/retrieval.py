@@ -27,6 +27,11 @@ PRINSIP:
   berdasarkan kedekatan waktu (distance-based decay).
 - graph_score fragment dihitung dari edge nyata (CONTINUES / CROSS_SESSION_LINK),
   bukan dari relationship_strength metadata.
+
+[HIERARCHICAL FRAGMENT EXPANSION]
+- M1: Negation scope-aware + combined clarification evidence + candidate narrowing.
+- M2: Continuation intent detection (translasi state ada di engine).
+- M3/M5: Fragment-key & helper scoring untuk retrieval dan hierarchy placement.
 """
 
 import re
@@ -34,13 +39,14 @@ import math
 import logging
 import calendar
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Set
 from pydantic import BaseModel, Field
 
 from config import CONFIG
 from models import (
     SignalProfile, TopicKey, CandidateScore, FragmentMetadata, 
-    DecisionType, PendingStatus, TokenQuality, EvidenceProfile, EvidenceFamily
+    DecisionType, PendingStatus, TokenQuality, EvidenceProfile, EvidenceFamily,
+    NegationScope, ClarificationAccumulation, FragmentCandidateScore
 )
 
 logger = logging.getLogger(__name__)
@@ -72,6 +78,16 @@ class RetrievalResult(BaseModel):
     turn_continuity_score: float = 0.0
     # Sumber bukti continuity (untuk audit: "overlap", "history", "fragments").
     continuity_evidence_sources: List[str] = Field(default_factory=list)
+    # [MEKANISME 1] Kandidat yang dieliminasi oleh negative evidence.
+    excluded_candidate_keys: List[str] = Field(default_factory=list)
+    # Kandidat yang gugur karena narrowing (bukan karena exclusion).
+    narrowed_out_keys: List[str] = Field(default_factory=list)
+    # [MEKANISME 2] Intent melanjutkan terdeteksi pada input ini.
+    # Retrieval HANYA melaporkan sinyal; translasi NO_MATCH →
+    # UNRESOLVED_CONTINUATION dilakukan memory_engine.
+    continuation_intent: bool = False
+    # [MEKANISME 1] Explicit cancellation / topic switch terdeteksi.
+    cancellation_intent: bool = False
 
 # ==========================================
 # 1. SIGNAL EXTRACTION (LAYER 3)
@@ -101,6 +117,26 @@ class SignalExtractor:
     # Jika tidak di-strip, kata "clarification" menjadi sinyal palsu dan
     # mendilusi token score pada jalur klarifikasi.
     _SCAFFOLDING_PATTERN = re.compile(r'\[clarification\s*:?', re.IGNORECASE)
+
+    # [MEKANISME 1] Marker negation SCOPE-AWARE.
+    #
+    # "bukan cpp"  → cpp dieliminasi
+    # "cpp bukan?" → TIDAK dieliminasi (marker di belakang, scope kosong)
+    #
+    # CATATAN PENTING: "tidak" SENGAJA tidak dimasukkan.
+    # "Tidak, saya sekarang mau belajar C++" adalah penolakan terhadap
+    # pertanyaan, bukan penolakan terhadap topik C++. Memasukkan "tidak"
+    # akan menghasilkan false exclusion pada alur topic-switch yang sah.
+    _NEGATION_MARKERS: Tuple[str, ...] = ("bukan", "jangan", "kecuali", "tanpa")
+
+    # Pembatas scope negation: tanda baca & konjungsi.
+    _SCOPE_STOP_PATTERN = re.compile(
+        r'[,.;:!?\n]|\bdan\b|\batau\b|\btapi\b|\byang\b|\buntuk\b',
+        re.IGNORECASE
+    )
+
+    # [MEKANISME 1] Identifier simbolik yang tidak ditangkap \b\w+\b.
+    _SYMBOL_IDENTITY_PATTERN = re.compile(r"[a-z0-9_]+(?:\+\+|\+|#)+", re.IGNORECASE)
 
     def _strip_scaffolding(self, text: str) -> str:
         """Membuang penanda internal sistem sebelum tokenisasi."""
@@ -138,6 +174,179 @@ class SignalExtractor:
         if quality == TokenQuality.TOPIC_SIGNAL:
             return tq.TOPIC_SIGNAL_WEIGHT
         return tq.NORMAL_WEIGHT
+
+    # ==========================================
+    # [MEKANISME 1] IDENTITY NORMALIZATION
+    # ==========================================
+
+    def normalize_identity(self, term: str) -> str:
+        """
+        Normalisasi identifier agar "cpp" dan "c++" dianggap sama.
+
+        Tanpa ini, exclusion "bukan cpp" tidak akan pernah kena kandidat
+        yang token-nya "c++" (karena \\b\\w+\\b pada "c++" hanya menangkap "c").
+        """
+        t = (term or "").lower().strip()
+        if t in ("c++", "cpp"):
+            return "cpp"
+        if t in ("c#", "csharp"):
+            return "csharp"
+        if t in ("f#", "fsharp"):
+            return "fsharp"
+        return t
+
+    def extract_identity_terms(self, text: str) -> Set[str]:
+        """
+        Kumpulkan term identitas dari teks, INCLUDING identifier simbolik.
+
+        Dipakai untuk exclusion matching terhadap title/helper kandidat.
+        """
+        if not text:
+            return set()
+        lower = text.lower()
+        terms: Set[str] = set()
+        for t in self._TOKEN_PATTERN.findall(lower):
+            if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH:
+                terms.add(self.normalize_identity(t))
+        for t in self._SYMBOL_IDENTITY_PATTERN.findall(lower):
+            terms.add(self.normalize_identity(t))
+        return terms
+
+    # ==========================================
+    # [MEKANISME 1] NEGATION SCOPE EXTRACTION
+    # ==========================================
+
+    def _extract_negation_scopes(
+        self,
+        clean_text: str,
+    ) -> Tuple[List[NegationScope], List[str]]:
+        """
+        Ekstrak negative evidence DENGAN SCOPE.
+
+        Aturan:
+            1. Marker harus muncul SEBELUM target (scope = teks setelah marker).
+            2. Scope berhenti di tanda baca / konjungsi pembatas.
+            3. Hanya token bermakna (bukan low-information) yang jadi target.
+            4. Jumlah target dibatasi NEGATION_SCOPE_TOKEN_WINDOW.
+
+        Contoh:
+            "yang penting bukan topik cpp" → targets {topik, cpp}
+            "cpp bukan?"                   → scope kosong → tidak ada target
+            "bukan cpp, tapi kopi"         → scope berhenti di koma → {cpp}
+        """
+        cc = CONFIG.clarification
+        text_lower = clean_text.lower()
+        scopes: List[NegationScope] = []
+        excluded: Set[str] = set()
+
+        for marker in self._NEGATION_MARKERS:
+            pattern = rf'\b{re.escape(marker)}\b'
+            for m in re.finditer(pattern, text_lower):
+                if len(scopes) >= cc.MAX_NEGATION_SCOPES:
+                    break
+
+                tail = text_lower[m.end():]
+                stop = self._SCOPE_STOP_PATTERN.search(tail)
+                scope_text = tail[:stop.start()] if stop else tail
+
+                targets: List[str] = []
+                for t in self._TOKEN_PATTERN.findall(scope_text):
+                    if len(t) < CONFIG.signal.MIN_TOKEN_LENGTH:
+                        continue
+                    if self._classify_token(t) == TokenQuality.LOW_INFORMATION:
+                        continue
+                    targets.append(t)
+                    if len(targets) >= cc.NEGATION_SCOPE_TOKEN_WINDOW:
+                        break
+
+                # Identifier simbolik dalam scope (mis. "bukan c++").
+                for t in self._SYMBOL_IDENTITY_PATTERN.findall(scope_text):
+                    if len(targets) >= cc.NEGATION_SCOPE_TOKEN_WINDOW:
+                        break
+                    if t not in targets:
+                        targets.append(t)
+
+                if not targets:
+                    # Marker di akhir kalimat / diikuti tanda baca → bukan exclusion.
+                    continue
+
+                scope_end = m.end() + (stop.start() if stop else len(tail))
+                scopes.append(NegationScope(
+                    marker=marker,
+                    target_tokens=targets,
+                    marker_position=m.start(),
+                    scope_end_position=scope_end,
+                    raw_fragment=clean_text[m.start():scope_end].strip(),
+                ))
+                for t in targets:
+                    excluded.add(self.normalize_identity(t))
+
+        return scopes, sorted(excluded)
+
+    # ==========================================
+    # [MEKANISME 2] CONTINUATION INTENT DETECTION
+    # ==========================================
+
+    def _detect_continuation_intent(
+        self,
+        clean_text: str,
+    ) -> Tuple[bool, List[str]]:
+        """
+        Deteksi apakah user meminta MELANJUTKAN memori, bukan membuka topik baru.
+
+        "lanjutkan topik ini" / "yang kemarin" / "pembahasan tadi"
+
+        Retrieval hanya melaporkan sinyal ini. Keputusan
+        NO_MATCH → UNRESOLVED_CONTINUATION ada di memory_engine,
+        sehingga kontrak retrieval tetap stabil.
+        """
+        cfg = CONFIG.continuation
+        lower = clean_text.lower()
+        found: List[str] = []
+
+        for phrase in cfg.CONTINUATION_PHRASE_MARKERS:
+            if phrase in lower:
+                found.append(phrase)
+
+        tokens = set(self._TOKEN_PATTERN.findall(lower))
+        for marker in cfg.CONTINUATION_TOKEN_MARKERS:
+            if marker in tokens:
+                found.append(marker)
+
+        unique_found = sorted(set(found))
+        return (len(unique_found) > 0), unique_found
+
+    # ==========================================
+    # [MEKANISME 1] CANCELLATION / EXPLICIT SWITCH
+    # ==========================================
+
+    def _detect_cancellation_intent(
+        self,
+        clean_text: str,
+    ) -> Tuple[bool, List[str]]:
+        """
+        Deteksi pembatalan eksplisit: "ganti topik", "lupakan", "batal".
+
+        CATATAN: "saja" TIDAK dijadikan marker cancellation.
+        "Pilih saja." adalah respons ambigu terhadap klarifikasi,
+        bukan pembatalan. Memasukkan "saja" akan merusak alur
+        clarification-round yang sah.
+        """
+        cfg = CONFIG.continuation
+        lower = clean_text.lower()
+        found: List[str] = []
+
+        for phrase in cfg.CANCELLATION_PHRASE_MARKERS:
+            if phrase in lower:
+                found.append(phrase)
+
+        tokens = set(self._TOKEN_PATTERN.findall(lower))
+        for marker in cfg.CANCELLATION_TOKEN_MARKERS:
+            if marker in tokens:
+                found.append(marker)
+
+        unique_found = sorted(set(found))
+        return (len(unique_found) > 0), unique_found
 
     def extract(self, text: str, reference_time: datetime) -> SignalProfile:
         """Mengekstrak token dan sinyal temporal dari teks."""
@@ -203,6 +412,15 @@ class SignalExtractor:
         # Confidence sederhana: semakin banyak token unik, semakin tinggi (sampai batas)
         confidence = min(1.0, len(unique_terms) / 10.0)
 
+        # [MEKANISME 1] Negative evidence dengan scope.
+        negation_scopes, excluded_tokens = self._extract_negation_scopes(clean_text)
+
+        # [MEKANISME 2] Continuation intent.
+        continuation_intent, continuation_markers = self._detect_continuation_intent(clean_text)
+
+        # [MEKANISME 1] Cancellation / explicit switch.
+        cancellation_intent, cancellation_markers = self._detect_cancellation_intent(clean_text)
+
         return SignalProfile(
             raw_tokens=raw_tokens,
             tokens=raw_tokens,
@@ -219,7 +437,13 @@ class SignalExtractor:
             rare_tokens=[], # Diisi Scorer/Engine setelah DF global diketahui
             low_information_tokens=low_info_tokens,
             window_co_occurrence_signals=window_signals,
-            window_pair_strength=pair_strength
+            window_pair_strength=pair_strength,
+            excluded_tokens=excluded_tokens,
+            negation_scopes=negation_scopes,
+            continuation_intent=continuation_intent,
+            continuation_markers=continuation_markers,
+            cancellation_intent=cancellation_intent,
+            cancellation_markers=cancellation_markers,
         )
 
     def _build_window_co_occurrence(self, tokens: List[str]) -> Tuple[List[str], Dict[str, float]]:
@@ -390,6 +614,11 @@ class TopicKeyScorer:
         [REASONING PURITY]
         - family_support_count : berapa KELUARGA bukti berbeda yang aktif
         - turn_continuity_score: skor continuity murni untuk persistence
+
+        [MEKANISME 3] Aggregated helper (warisan descendant) ikut memperkuat
+        bukti description. TIDAK menambah bobot ke-8 — ia masuk melalui
+        term description yang sudah ada, sebagai max(own, aggregated).
+        Karena TopicKey lama punya aggregated "" → nilai identik dengan sebelumnya.
         """
         if not signal.unique_terms:
             return CandidateScore(key_id=key.key_id, title=key.title, final_score=0.0)
@@ -418,6 +647,18 @@ class TopicKeyScorer:
             description_score = len(desc_intersection) / len(desc_tokens)
         else:
             description_score = 0.0
+
+        # [MEKANISME 3] Aggregated Helper Score (warisan descendant).
+        # Terpisah dari description_score agar terlihat mana bukti own vs warisan.
+        aggregated_helper_score = 0.0
+        agg_text = key.aggregated_helper_description or ""
+        if agg_text:
+            agg_tokens = set(re.findall(r'\b\w+\b', agg_text.lower()))
+            agg_tokens = {t for t in agg_tokens if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
+            if agg_tokens:
+                aggregated_helper_score = len(
+                    signal_tokens.intersection(agg_tokens)
+                ) / len(agg_tokens)
 
         # C. Co-occurrence Score
         # [UPDATED] Memakai window co-occurrence (Level 2) dengan bobot decay,
@@ -486,11 +727,15 @@ class TopicKeyScorer:
         # [NEW] X. Cross-session Evidence
         x_score = cross_session_score
 
+        # [MEKANISME 3] Effective description = max(own, aggregated).
+        # Ini memasukkan hierarchical helper evidence TANPA menambah bobot baru.
+        effective_description = max(description_score, aggregated_helper_score)
+
         # F. Hitung Final Score (Weighted Sum)
         w = CONFIG.activation
         contributions = {
             "token": token_score * w.TOKEN_WEIGHT,
-            "description": description_score * w.DESCRIPTION_WEIGHT,
+            "description": effective_description * w.DESCRIPTION_WEIGHT,
             "co_occurrence": cooc_score * w.CO_OCCURRENCE_WEIGHT,
             "continuity": cont_score * w.CONTINUITY_WEIGHT,
             "temporal": temporal_score * w.TEMPORAL_WEIGHT,
@@ -505,7 +750,7 @@ class TopicKeyScorer:
         ev = CONFIG.evidence
         evidence_values = {
             "token": token_score,
-            "description": description_score,
+            "description": effective_description,
             "co_occurrence": cooc_score,
             "unique_token": unique_score,
             "temporal": temporal_score,
@@ -610,6 +855,11 @@ class TopicKeyScorer:
                 f"single-family capped at {ef.SINGLE_FAMILY_CONFIDENCE_CAP:.2f} "
                 f"(family={evidence_families[0].value if evidence_families else 'none'})"
             )
+        if aggregated_helper_score > description_score:
+            notes.append(
+                f"aggregated helper evidence used ({aggregated_helper_score:.2f} "
+                f"> own {description_score:.2f})"
+            )
 
         # [REASONING PURITY] turn_continuity_score = skor continuity murni untuk
         # persistence (relationship_strength fragment).
@@ -641,6 +891,7 @@ class TopicKeyScorer:
             evidence_families=evidence_families,
             is_single_family_dominated=is_single_family_dominated,
             turn_continuity_score=turn_continuity_score,
+            aggregated_helper_score=aggregated_helper_score,
         )
 
 # ==========================================
@@ -667,6 +918,7 @@ class RetrievalEngine:
         global_token_counts: Optional[dict] = None, # [NEW] Untuk Unique Token Evidence
         cross_session_evidence: Optional[dict] = None, # [NEW] topic_id -> score
         fragment_graph_scores: Optional[Dict[str, float]] = None, # [REASONING PURITY] fragment_id -> graph score
+        clarification: Optional[ClarificationAccumulation] = None, # [MEKANISME 1] accumulated evidence
     ) -> RetrievalResult:
         """
         Alur Retrieval Lengkap:
@@ -684,16 +936,37 @@ class RetrievalEngine:
         5b. fragment_graph_scores dipakai untuk fragment-level graph evidence
             (bukan relationship_strength metadata sebagai proxy)
         5c. temporal_distance_score dihitung berbasis kedekatan waktu, bukan binary
+
+        [MEKANISME 1] Jika `clarification` diberikan:
+            - sinyal diekstrak dari COMBINED text (original + seluruh history)
+            - exclusion penalty diterapkan pada kandidat yang ditolak user
+            - kandidat lemah DIELIMINASI dari shortlist (narrowing)
+            Jika None → perilaku identik dengan versi sebelumnya.
         """
         
         # 1. Extract Signal
-        signal = self.extractor.extract(input_text, reference_time)
+        # [MEKANISME 1] Sumber sinyal: combined clarification jika ada.
+        source_text = input_text
+        if clarification is not None and clarification.combined_text:
+            source_text = clarification.combined_text
+
+        signal = self.extractor.extract(source_text, reference_time)
+
+        # [MEKANISME 1] Gabungkan exclusion dari accumulated context.
+        if clarification is not None and clarification.excluded_tokens:
+            merged = set(signal.excluded_tokens)
+            for t in clarification.excluded_tokens:
+                merged.add(self.extractor.normalize_identity(t))
+            signal.excluded_tokens = sorted(merged)
+
         if signal.confidence < CONFIG.signal.MIN_SIGNAL_STRENGTH:
             return RetrievalResult(
                 decision_type=DecisionType.NO_MATCH,
                 analysis_notes="Sinyal terlalu lemah / noise.",
                 signal_profile=signal,
                 turn_continuity_score=continuity_score if active_topic_id else 0.0,
+                continuation_intent=signal.continuation_intent,
+                cancellation_intent=signal.cancellation_intent,
             )
 
         # 2. Score Candidates
@@ -722,6 +995,23 @@ class RetrievalEngine:
                 analysis_notes="Tidak ada Topic Key yang melewati batas minimum.",
                 signal_profile=signal,
                 turn_continuity_score=continuity_score if active_topic_id else 0.0,
+                continuation_intent=signal.continuation_intent,
+                cancellation_intent=signal.cancellation_intent,
+            )
+
+        # [MEKANISME 1] Blend combined-context score dengan last-answer score.
+        # Hanya aktif jika ada history klarifikasi.
+        if clarification is not None and clarification.clarification_history:
+            self._blend_clarification_scores(
+                candidates=candidates,
+                keys=keys,
+                clarification=clarification,
+                reference_time=reference_time,
+                active_topic_id=active_topic_id,
+                continuity_score=continuity_score,
+                cross_session_evidence=cross_session_evidence,
+                global_token_counts=global_token_counts,
+                total_topic_keys=total_topic_keys,
             )
 
         # 2b. [ASSOCIATIVE EVIDENCE LOCKING] CONTRADICTION PENALTY (relatif).
@@ -732,8 +1022,34 @@ class RetrievalEngine:
         temporal_range = self.temporal_resolver.resolve(signal.temporal_signals, reference_time)
         self._apply_contradiction_penalties(candidates, fragments, temporal_range)
 
+        # [MEKANISME 1] EXCLUSION PENALTY dari negative evidence user.
+        self._apply_exclusion_penalties(candidates, key_map, signal)
+
         # 3. Sort & Analyze Ambiguity
         candidates.sort(key=lambda x: x.final_score, reverse=True)
+
+        # [MEKANISME 1] CANDIDATE NARROWING.
+        # Kandidat yang sudah lemah / dieliminasi tidak boleh muncul lagi
+        # di round klarifikasi berikutnya.
+        narrowed_out_keys: List[str] = []
+        excluded_keys: List[str] = [c.key_id for c in candidates if c.is_excluded]
+        if clarification is not None:
+            before = [c.key_id for c in candidates]
+            candidates = self._narrow_candidates(candidates, clarification)
+            after = {c.key_id for c in candidates}
+            narrowed_out_keys = [k for k in before if k not in after]
+            if not candidates:
+                return RetrievalResult(
+                    decision_type=DecisionType.NO_MATCH,
+                    candidates=[],
+                    analysis_notes="Semua kandidat tereliminasi oleh klarifikasi.",
+                    signal_profile=signal,
+                    excluded_candidate_keys=excluded_keys,
+                    narrowed_out_keys=narrowed_out_keys,
+                    continuation_intent=signal.continuation_intent,
+                    cancellation_intent=signal.cancellation_intent,
+                )
+
         top_candidate = candidates[0]
         second_candidate = candidates[1] if len(candidates) > 1 else None
         
@@ -756,9 +1072,16 @@ class RetrievalEngine:
                 notes = f"Ambigu: {top_candidate.title} vs {second_candidate.title} (Diff: {margin:.2f})"
                 
                 # [NEW] 6. Informative Clarification Output
+                # [MEKANISME 1] Shortlist dibatasi MAX_AMBIGUITY_CANDIDATES dan
+                # memakai aggregated helper agar pertanyaan makin spesifik.
                 msg_parts = ["Saya menemukan beberapa topik yang mungkin Anda maksud:\n"]
-                for i, cand in enumerate(candidates[:3], 1):
-                    desc = key_map[cand.key_id].helper_description if cand.key_id in key_map else "pembahasan terkait."
+                max_show = CONFIG.hierarchy.MAX_AMBIGUITY_CANDIDATES
+                for i, cand in enumerate(candidates[:max_show], 1):
+                    k = key_map.get(cand.key_id)
+                    if k is None:
+                        desc = "pembahasan terkait."
+                    else:
+                        desc = k.aggregated_helper_description or k.helper_description
                     msg_parts.append(f"{i}. {cand.title} — {desc}")
                 msg_parts.append("\nYang mana yang ingin Anda lanjutkan?")
                 clarification_message = "\n".join(msg_parts)
@@ -821,7 +1144,172 @@ class RetrievalEngine:
             signal_profile=signal,
             evidence_summary=evidence_summary,
             turn_continuity_score=chosen_turn_continuity,
+            excluded_candidate_keys=excluded_keys,
+            narrowed_out_keys=narrowed_out_keys,
+            continuation_intent=signal.continuation_intent,
+            cancellation_intent=signal.cancellation_intent,
         )
+
+    # ==========================================
+    # [MEKANISME 1] CLARIFICATION ACCUMULATION HELPERS
+    # ==========================================
+
+    def _blend_clarification_scores(
+        self,
+        candidates: List[CandidateScore],
+        keys: List[TopicKey],
+        clarification: ClarificationAccumulation,
+        reference_time: datetime,
+        active_topic_id: Optional[str],
+        continuity_score: float,
+        cross_session_evidence: Dict[str, float],
+        global_token_counts: Optional[dict],
+        total_topic_keys: int,
+    ) -> None:
+        """
+        Blend skor COMBINED context dengan skor JAWABAN TERAKHIR saja.
+
+        Kenapa perlu:
+            "yang rencana kopi" sendiri terlalu miskin bukti.
+            Combined context (original + history) adalah sumber utama,
+            jawaban terakhir melengkapi.
+
+        Rumus:
+            final = W * combined_score + (1 - W) * last_answer_score
+            W = CLARIFICATION_COMBINED_INPUT_WEIGHT (0.70)
+
+        Hanya dipanggil jika ada history — jalur tanpa klarifikasi tidak berubah.
+        """
+        weight = CONFIG.clarification.CLARIFICATION_COMBINED_INPUT_WEIGHT
+        last_answer = clarification.clarification_history[-1]
+        last_signal = self.extractor.extract(last_answer, reference_time)
+        if not last_signal.unique_terms:
+            return
+
+        key_map = {k.key_id: k for k in keys}
+        for cand in candidates:
+            key = key_map.get(cand.key_id)
+            if key is None:
+                continue
+            last_score = self.scorer.score(
+                last_signal, key,
+                key.key_id == active_topic_id,
+                continuity_score,
+                cross_session_evidence.get(key.key_id, 0.0),
+                global_token_counts,
+                total_topic_keys=total_topic_keys,
+            )
+            combined_final = cand.final_score
+            blended = (weight * combined_final) + ((1.0 - weight) * last_score.final_score)
+            cand.final_score = blended
+            cand.evidence_notes.append(
+                f"clarification blend: combined={combined_final:.2f} "
+                f"last={last_score.final_score:.2f} w={weight:.2f} → {blended:.2f}"
+            )
+
+    def _candidate_identity_terms(self, key: TopicKey) -> Set[str]:
+        """
+        Term identitas kandidat untuk exclusion matching.
+
+        Menggabungkan token_profile + title + helper + aggregated helper,
+        DENGAN symbol-aware extraction dan alias normalization, sehingga
+        "bukan cpp" bisakena kandidat berjudul "C++ Kasir Kopi".
+        """
+        terms: Set[str] = set()
+        for t in (key.token_profile or {}).keys():
+            terms.add(self.extractor.normalize_identity(t))
+        terms |= self.extractor.extract_identity_terms(key.title)
+        terms |= self.extractor.extract_identity_terms(key.helper_description)
+        terms |= self.extractor.extract_identity_terms(key.aggregated_helper_description)
+        return terms
+
+    def _apply_exclusion_penalties(
+        self,
+        candidates: List[CandidateScore],
+        key_map: Dict[str, TopicKey],
+        signal: SignalProfile,
+    ) -> None:
+        """
+        [MEKANISME 1] Negative evidence → candidate elimination.
+
+        "yang penting bukan topik cpp" → kandidat C++ dipenalti & ditandai
+        is_excluded, sehingga tidak muncul lagi di shortlist klarifikasi.
+        """
+        if not signal.excluded_tokens:
+            return
+
+        weight = CONFIG.clarification.CLARIFICATION_NEGATION_WEIGHT
+        excluded_norm = {
+            self.extractor.normalize_identity(t) for t in signal.excluded_tokens
+        }
+
+        for cand in candidates:
+            key = key_map.get(cand.key_id)
+            if key is None:
+                continue
+            terms = self._candidate_identity_terms(key)
+            hits = sorted(excluded_norm.intersection(terms))
+            if not hits:
+                continue
+            cand.exclusion_score = weight
+            cand.excluded_matched_tokens = hits
+            cand.is_excluded = True
+            cand.final_score = max(0.0, cand.final_score - weight)
+            cand.confidence = max(0.0, cand.confidence - weight)
+            cand.evidence_notes.append(
+                f"exclusion (-{weight:.2f}): user menolak {hits}"
+            )
+            if cand.evidence_profile:
+                cand.evidence_profile.contradiction_count += 1
+                cand.evidence_profile.contradiction_notes.append(
+                    f"negative evidence: {hits}"
+                )
+
+    def _narrow_candidates(
+        self,
+        candidates: List[CandidateScore],
+        clarification: ClarificationAccumulation,
+    ) -> List[CandidateScore]:
+        """
+        [MEKANISME 1] Persempit shortlist kandidat.
+
+        Dua aturan retensi (harus lolos KEDUANYA):
+            1. final_score >= MIN_CANDIDATE_RETENTION_SCORE (0.35)
+            2. final_score >= top_score * CANDIDATE_RETENTION_RATIO (0.60)
+
+        Contoh: A=0.81, B=0.79, C=0.20
+            floor = max(0.35, 0.81*0.60=0.486) = 0.486
+            → C gugur. Round berikutnya hanya A & B.
+
+        Kandidat yang sudah di-exclude user selalu gugur.
+        Kandidat yang sudah di excluded_candidate_keys juga tidak boleh kembali.
+        """
+        if not candidates:
+            return []
+
+        cc = CONFIG.clarification
+        permanently_excluded = set(clarification.excluded_candidate_keys or [])
+
+        eligible = [
+            c for c in candidates
+            if not c.is_excluded and c.key_id not in permanently_excluded
+        ]
+        if not eligible:
+            return []
+
+        top_score = eligible[0].final_score
+        floor = max(
+            cc.MIN_CANDIDATE_RETENTION_SCORE,
+            top_score * cc.CANDIDATE_RETENTION_RATIO,
+        )
+        kept = [c for c in eligible if c.final_score >= floor]
+
+        # Jangan sampai shortlist kosong total jika masih ada kandidat sah.
+        if not kept:
+            kept = eligible[:1]
+
+        max_show = CONFIG.hierarchy.MAX_AMBIGUITY_CANDIDATES
+        return kept[:max_show]
 
     # ==========================================
     # [ASSOCIATIVE EVIDENCE LOCKING] HELPERS
@@ -1011,7 +1499,13 @@ class RetrievalEngine:
             f"    Temporal       {candidate.temporal_score:.3f}",
             f"    Continuity     {candidate.continuity_score:.3f}",
             f"    Graph          {candidate.graph_score:.3f}",
+            f"    Aggregated Hlp {candidate.aggregated_helper_score:.3f}",
         ]
+        if candidate.exclusion_score > 0:
+            lines.append(
+                f"  EXCLUDED (-{candidate.exclusion_score:.2f}) "
+                f"matched={candidate.excluded_matched_tokens}"
+            )
         if candidate.evidence_profile:
             lines.append(f"  Supporting: {', '.join(candidate.evidence_profile.supporting_evidence_names) or '(none)'}")
         if candidate.evidence_notes:
@@ -1213,6 +1707,10 @@ class RetrievalEngine:
           BUKAN dari relationship_strength metadata.
         - temporal_score dihitung berbasis distance (decay per jam),
           BUKAN binary 1.0/0.5.
+
+        [MEKANISME 3] fragment_key & helper (own + aggregated) ikut menjadi
+        bukti identitas fragment, sehingga "Modal Bisnis Kopi" bisa dibedakan
+        dari "Lokasi Bisnis Kopi" meski berada di TopicKey yang sama.
         """
         key_frags = [f for f in fragments if f.topic_key_id == key_id]
         
@@ -1262,6 +1760,12 @@ class RetrievalEngine:
             frag_tokens = set(f.token_profile.keys()) if f.token_profile else set()
             matched = signal_tokens.intersection(frag_tokens)
             frag_token_score = sum(token_weights[t] for t in matched) / total_weight if total_weight else 0.0
+
+            # [MEKANISME 3] Fragment identity evidence (key + own helper + aggregated).
+            identity_score = self._fragment_identity_score(f, signal_tokens)
+            # Identitas bagian adalah sinyal lexical terkuat → boleh menggantikan
+            # token_score jika lebih kuat. Tidak menambah bobot baru.
+            effective_lexical = max(frag_token_score, identity_score)
             
             # 2. TRUE Co-occurrence Relevance (Query vs Fragment Co-occurrence Profile)
             # [UPDATED] Memakai window pairs dengan bobot decay.
@@ -1318,7 +1822,7 @@ class RetrievalEngine:
                 frag_graph_score = 0.0
                 
             relevance = (
-                (frag_token_score * w_frag.FRAGMENT_TOKEN_WEIGHT) +
+                (effective_lexical * w_frag.FRAGMENT_TOKEN_WEIGHT) +
                 (frag_cooc_score * w_frag.FRAGMENT_COOC_WEIGHT) +
                 (frag_temporal_score * w_frag.FRAGMENT_TEMPORAL_WEIGHT) +
                 (frag_recency_score * w_frag.FRAGMENT_RECENCY_WEIGHT)
@@ -1341,6 +1845,14 @@ class RetrievalEngine:
                 "temporal_distance_score": frag_temporal_score,
                 # [REASONING PURITY] Untuk RetrievedMemory
                 "fragment_graph_score": frag_graph_score,
+                # [MEKANISME 3] Identity evidence untuk audit & context framing.
+                "fragment_identity_score": identity_score,
+                "fragment_key": f.fragment_key,
+                "fragment_helper_description": f.fragment_helper_description,
+                "parent_fragment_id": f.parent_fragment_id,
+                "depth": f.depth,
+                "is_composite": f.is_composite,
+                "source_fragment_ids": list(f.source_fragment_ids or []),
             }
             
         # Sort by relevance descending
@@ -1351,3 +1863,278 @@ class RetrievalEngine:
         selected = [fid for fid, score in ranked_frags[:limit]]
         selected_scores = {fid: fragment_scores[fid] for fid in selected}
         return selected, selected_scores
+
+    # ==========================================
+    # [MEKANISME 3 + 5] FRAGMENT IDENTITY & PLACEMENT SCORING
+    # ==========================================
+
+    def _fragment_identity_score(
+        self,
+        fragment: FragmentMetadata,
+        signal_tokens: Set[str],
+    ) -> float:
+        """
+        Skor identitas fragment dari fragment_key + own helper + aggregated helper.
+
+        Ini yang membedakan "Modal Bisnis Kopi" dari "Lokasi Bisnis Kopi"
+        meski keduanya berada dalam TopicKey yang sama.
+
+        Mengembalikan nilai 0..1 (rasio token sinyal yang terjelaskan).
+        """
+        if not signal_tokens:
+            return 0.0
+
+        pools: List[Set[str]] = []
+        for text in (
+            fragment.fragment_key,
+            fragment.fragment_helper_description,
+            fragment.aggregated_helper_description,
+        ):
+            if not text:
+                continue
+            toks = set(re.findall(r'\b\w+\b', text.lower()))
+            toks = {t for t in toks if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
+            if toks:
+                pools.append(toks)
+
+        if not pools:
+            return 0.0
+
+        best = 0.0
+        for pool in pools:
+            score = len(signal_tokens.intersection(pool)) / len(pool)
+            if score > best:
+                best = score
+        return min(1.0, best)
+
+    def score_fragment_candidates(
+        self,
+        signal: SignalProfile,
+        fragments: List[FragmentMetadata],
+        reference_time: datetime,
+        temporal_range: Optional[Tuple[datetime, datetime]] = None,
+        fragment_graph_scores: Optional[Dict[str, float]] = None,
+    ) -> List[FragmentCandidateScore]:
+        """
+        [MEKANISME 3] Fragment-level retrieval scoring dengan identitas bagian.
+
+        Dipakai ketika TopicKey sudah jelas tetapi bagian belum, atau ketika
+        query menyebut subtopik spesifik ("kopi yang modalnya murah").
+
+        Berbeda dari _select_fragments: method ini mengembalikan objek
+        FragmentCandidateScore lengkap dengan fragment_key & helper,
+        sehingga engine bisa menavigasi hierarchy.
+        """
+        if not fragments or not signal.unique_terms:
+            return []
+
+        signal_tokens = set(signal.unique_terms)
+        quality_map = signal.token_quality or {}
+        token_weights = {
+            t: self.extractor.token_weight(t, quality_map) for t in signal_tokens
+        }
+        total_weight = sum(token_weights.values()) or 1.0
+        w = CONFIG.fragment_ranking
+        graph_map = fragment_graph_scores or {}
+        has_specific_hour = any(
+            s.startswith("HOUR_") for s in (signal.temporal_signals or [])
+        )
+        requested_time = self._resolve_requested_time(signal, temporal_range)
+
+        results: List[FragmentCandidateScore] = []
+        for f in fragments:
+            frag_tokens = set(f.token_profile.keys()) if f.token_profile else set()
+            matched = signal_tokens.intersection(frag_tokens)
+            token_score = sum(token_weights[t] for t in matched) / total_weight
+
+            key_score = 0.0
+            if f.fragment_key:
+                kt = set(re.findall(r'\b\w+\b', f.fragment_key.lower()))
+                kt = {t for t in kt if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
+                if kt:
+                    key_score = len(signal_tokens.intersection(kt)) / len(kt)
+
+            helper_score = 0.0
+            if f.fragment_helper_description:
+                ht = set(re.findall(r'\b\w+\b', f.fragment_helper_description.lower()))
+                ht = {t for t in ht if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
+                if ht:
+                    helper_score = len(signal_tokens.intersection(ht)) / len(ht)
+
+            agg_score = 0.0
+            if f.aggregated_helper_description:
+                at = set(re.findall(r'\b\w+\b', f.aggregated_helper_description.lower()))
+                at = {t for t in at if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
+                if at:
+                    agg_score = len(signal_tokens.intersection(at)) / len(at)
+
+            cooc_score = 0.0
+            if f.co_occurrence_profile and signal.window_pair_strength:
+                total_pair = sum(signal.window_pair_strength.values())
+                hit = 0.0
+                for pair, strength in signal.window_pair_strength.items():
+                    if pair in f.co_occurrence_profile:
+                        hit += strength
+                    else:
+                        parts = pair.split("↔")
+                        if len(parts) == 2 and f"{parts[1]}↔{parts[0]}" in f.co_occurrence_profile:
+                            hit += strength
+                if total_pair > 0:
+                    cooc_score = min(1.0, hit / total_pair)
+
+            temporal_score = 0.5
+            if f.temporal_index is not None:
+                temporal_score, _ = self._compute_temporal_distance_score(
+                    f.temporal_index, temporal_range, has_specific_hour,
+                    requested_time=requested_time,
+                )
+
+            recency_score = 0.0
+            if f.created_at:
+                created = f.created_at
+                if created.tzinfo is None and reference_time.tzinfo is not None:
+                    created = created.replace(tzinfo=reference_time.tzinfo)
+                age_hours = max(0.0, (reference_time - created).total_seconds() / 3600.0)
+                recency_score = max(0.0, 1.0 - (age_hours / 720.0))
+
+            graph_score = graph_map.get(f.fragment_id, 0.0)
+
+            identity = max(key_score, helper_score, agg_score)
+            effective_lexical = max(token_score, identity)
+            final = (
+                effective_lexical * w.FRAGMENT_TOKEN_WEIGHT
+                + cooc_score * w.FRAGMENT_COOC_WEIGHT
+                + temporal_score * w.FRAGMENT_TEMPORAL_WEIGHT
+                + recency_score * w.FRAGMENT_RECENCY_WEIGHT
+            )
+
+            supporting: List[str] = []
+            ev_thr = CONFIG.evidence.EVIDENCE_SUPPORT_THRESHOLD
+            if token_score >= ev_thr:
+                supporting.append("token")
+            if key_score >= ev_thr:
+                supporting.append("fragment_key")
+            if helper_score >= ev_thr:
+                supporting.append("fragment_helper")
+            if agg_score >= ev_thr:
+                supporting.append("aggregated_helper")
+            if cooc_score >= ev_thr:
+                supporting.append("co_occurrence")
+            if graph_score >= ev_thr:
+                supporting.append("graph")
+
+            results.append(FragmentCandidateScore(
+                fragment_id=f.fragment_id,
+                fragment_key=f.fragment_key,
+                topic_key_id=f.topic_key_id,
+                depth=f.depth,
+                parent_fragment_id=f.parent_fragment_id,
+                fragment_key_score=key_score,
+                helper_score=helper_score,
+                aggregated_helper_score=agg_score,
+                token_score=token_score,
+                co_occurrence_score=cooc_score,
+                temporal_score=temporal_score,
+                graph_score=graph_score,
+                recency_score=recency_score,
+                final_score=final,
+                supporting_evidence_names=supporting,
+            ))
+
+        results.sort(key=lambda c: c.final_score, reverse=True)
+        return results
+
+    def score_parent_candidates(
+        self,
+        signal: SignalProfile,
+        candidate_parents: List[FragmentMetadata],
+    ) -> List[FragmentCandidateScore]:
+        """
+        [MEKANISME 5] Placement scoring: fragment baru → parent mana yang tepat.
+
+        [KUNCI] TEMPORAL & RECENCY SENGAJA DIKECUALIKAN.
+        Kondisi uji 20 menuntut parent dipilih berdasarkan EVIDENCE,
+        bukan sekadar fragment terbaru. Jika recency ikut dinilai,
+        fragment terakhir akan selalu menang tanpa dasar semantik.
+
+        Bobot diambil dari FragmentRankingConstants lalu DINORMALISASI
+        atas bobot yang benar-benar dipakai (tidak ada angka ajaib):
+            identity → FRAGMENT_TOKEN_WEIGHT
+            token    → FRAGMENT_COOC_WEIGHT
+            cooc     → FRAGMENT_COOC_WEIGHT
+        """
+        if not candidate_parents or not signal.unique_terms:
+            return []
+
+        signal_tokens = set(signal.unique_terms)
+        quality_map = signal.token_quality or {}
+        token_weights = {
+            t: self.extractor.token_weight(t, quality_map) for t in signal_tokens
+        }
+        total_weight = sum(token_weights.values()) or 1.0
+
+        w = CONFIG.fragment_ranking
+        w_identity = w.FRAGMENT_TOKEN_WEIGHT
+        w_token = w.FRAGMENT_COOC_WEIGHT
+        w_cooc = w.FRAGMENT_COOC_WEIGHT
+        w_sum = (w_identity + w_token + w_cooc) or 1.0
+
+        results: List[FragmentCandidateScore] = []
+        for f in candidate_parents:
+            frag_tokens = set(f.token_profile.keys()) if f.token_profile else set()
+            matched = signal_tokens.intersection(frag_tokens)
+            token_score = sum(token_weights[t] for t in matched) / total_weight
+
+            identity = self._fragment_identity_score(f, signal_tokens)
+
+            cooc_score = 0.0
+            if f.co_occurrence_profile and signal.window_pair_strength:
+                total_pair = sum(signal.window_pair_strength.values())
+                hit = 0.0
+                for pair, strength in signal.window_pair_strength.items():
+                    if pair in f.co_occurrence_profile:
+                        hit += strength
+                    else:
+                        parts = pair.split("↔")
+                        if len(parts) == 2 and f"{parts[1]}↔{parts[0]}" in f.co_occurrence_profile:
+                            hit += strength
+                if total_pair > 0:
+                    cooc_score = min(1.0, hit / total_pair)
+
+            final = (
+                identity * w_identity
+                + token_score * w_token
+                + cooc_score * w_cooc
+            ) / w_sum
+
+            supporting: List[str] = []
+            ev_thr = CONFIG.evidence.EVIDENCE_SUPPORT_THRESHOLD
+            if identity >= ev_thr:
+                supporting.append("identity")
+            if token_score >= ev_thr:
+                supporting.append("token")
+            if cooc_score >= ev_thr:
+                supporting.append("co_occurrence")
+
+            results.append(FragmentCandidateScore(
+                fragment_id=f.fragment_id,
+                fragment_key=f.fragment_key,
+                topic_key_id=f.topic_key_id,
+                depth=f.depth,
+                parent_fragment_id=f.parent_fragment_id,
+                fragment_key_score=identity,
+                helper_score=identity,
+                aggregated_helper_score=identity,
+                token_score=token_score,
+                co_occurrence_score=cooc_score,
+                # Temporal & recency Dinolkan secara eksplisit: tidak dipakai.
+                temporal_score=0.0,
+                graph_score=0.0,
+                recency_score=0.0,
+                final_score=final,
+                supporting_evidence_names=supporting,
+                notes=["placement scoring: temporal & recency excluded by design"],
+            ))
+
+        results.sort(key=lambda c: c.final_score, reverse=True)
+        return results

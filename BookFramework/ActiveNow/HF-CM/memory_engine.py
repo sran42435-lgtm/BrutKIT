@@ -2,35 +2,31 @@
 memory_engine.py
 Global Orchestrator & State Machine (Layer 16).
 
-Fungsi:
-1. Mengoordinasikan alur dari Input -> Retrieval -> Decision -> Generation -> Storage.
-2. Mengelola Fast State (Pending Ambiguity).
-3. Menerapkan Continuity Window Analysis (Mencegah 'Sticky Topic').
-4. Menjamin transaksi penyimpanan memori bersifat Atomik (No Half-Memory).
-
 [ASSOCIATIVE EVIDENCE LOCKING]
 EVIDENCE BEFORE MUTATION:
     ANALYZE -> SCORE -> VALIDATE EVIDENCE -> DECIDE -> BARU UPDATE MEMORY
-Memori tidak boleh diperbarui sebelum keputusan asosiasinya cukup tervalidasi.
 
 [REASONING PURITY]
-- final_score (relevance kandidat) TIDAK BOLEH disamakan dengan
-  turn_continuity_score (seberapa kuat turn melanjutkan state aktif).
-- relationship_strength fragment diisi dari turn_continuity_score murni.
+- final_score != turn_continuity_score != relationship_strength
 - Short pending input divalidasi, bukan otomatis dianggap relevan.
-- graph_score fragment dihitung dari edge nyata (CONTINUES / CROSS_SESSION_LINK).
+- graph_score fragment dihitung dari edge nyata.
 
-[MINOR FALLBACK LOCK]
-SHORT INPUT ≠ AUTOMATICALLY RELEVANT
-Short input harus menunjukkan salah satu dari:
-  (a) explicit candidate selection ("nomor 1", "yang pertama")
-  (b) token overlap dengan candidate evidence (title + desc + token_profile)
-  (c) semua token low-information (fallback "terserah")
-Jika tidak ada bukti → TIDAK RELEVAN (lanjut ke topic switch analysis).
+[HIERARCHICAL FRAGMENT EXPANSION - 5 MEKANISME]
+M1  Recursive Ambiguity Context Accumulation
+M2  Continuation Intent Protection
+M3  Hierarchical Fragment Identity & Helper Propagation
+M4  Cross-Key Composite Fragment
+M5  Tree + Depth + Trend
 
-[SYMBOL IDENTITY LOCK]
-Input yang tidak menghasilkan token word-character (mis. "C++", "C#")
-BUKAN input kosong. Identity-nya diekstrak dari raw_text sebelum dievaluasi.
+URUTAN WAJIB:
+    EXTRACT METADATA (dari exact text) -> COMPRESS -> PERSIST
+    -> COMMIT -> PLACE -> PROPAGATE
+
+CATATAN TRANSACTION BOUNDARY:
+    Helper propagation dijalankan SETELAH transaksi inti commit.
+    Alasannya: storage.get_topic_key() / get_fragment_ancestors() membuka
+    session sendiri. Jika dipanggil di dalam transaksi yang belum commit,
+    ia membaca nilai LAMA lalu menimpanya kembali (stale-read overwrite).
 """
 
 import logging
@@ -38,15 +34,18 @@ import re
 import uuid
 import statistics
 from datetime import datetime
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Set
 
 from config import CONFIG
 from models import (
-    InputEnvelope, EngineResult, EngineDecision, DecisionType, 
-    MemoryClassification, PendingState, PendingStatus, TopicKey, 
+    InputEnvelope, EngineResult, EngineDecision, DecisionType,
+    MemoryClassification, PendingState, PendingStatus, TopicKey,
     FragmentMetadata, CompressedPayload, MemoryGraphEdge, RelationshipType,
     CandidateScore, TurnAnalysisResult, ReconstructionStatus,
-    RetrievedMemory, TokenQuality, EvidenceFamily
+    RetrievedMemory, TokenQuality, EvidenceFamily,
+    SessionActiveState, FragmentPlacementResult, FragmentPlacementKind,
+    HelperPropagationResult, CompositeSourceAnalysis, FragmentSourceContribution,
+    TrendCandidate, TrendNodeType, ClarificationAccumulation, FragmentCandidateScore
 )
 from storage import MemoryStorage
 from retrieval import RetrievalEngine, RetrievalResult
@@ -54,14 +53,10 @@ from compression import PayloadCompressor, DecompressionError, IntegrityError
 
 logger = logging.getLogger(__name__)
 
-class MemoryEngine:
-    """
-    Otak utama sistem. Menghubungkan sinyal user dengan memori persis 
-    dan kemampuan generatif model.
-    """
 
-    # [REASONING PURITY] Pemetaan sinyal → keluarga bukti.
-    # WAJIB sinkron dengan TopicKeyScorer._SIGNAL_FAMILY di retrieval.py.
+class MemoryEngine:
+    """Otak utama sistem memori asosiatif."""
+
     _SIGNAL_FAMILY: Dict[str, EvidenceFamily] = {
         "token": EvidenceFamily.LEXICAL,
         "unique_token": EvidenceFamily.LEXICAL,
@@ -72,49 +67,35 @@ class MemoryEngine:
         "graph": EvidenceFamily.RELATIONAL,
     }
 
-    # [FIX — Batch E] Single source of truth untuk indikator domain baru yang kuat.
-    # Sebelumnya set ini diduplikasi di _check_pending_relevance dan _analyze_turn,
-    # sehingga berisiko divergen. Sekarang satu definisi untuk kedua jalur.
     _STRONG_NOVELTY_INDICATORS: frozenset = frozenset({
         "pointer", "reference", "coding", "program", "algoritma",
         "c++", "c#", "python", "java", "astronomi", "hukum", "matematika",
     })
 
-    # [FIX — Batch E] Pola identifier simbolik yang tidak ditangkap \b\w+\b.
-    # "C++" → \w+ hanya menangkap "c" (1 char, terfilter MIN_TOKEN_LENGTH).
-    # Pola ini menangkap "c++", "c#", "f#" secara utuh.
     _SYMBOL_IDENTITY_PATTERN = re.compile(r"[a-z0-9_]+(?:\+\+|\+|#)+", re.IGNORECASE)
 
-    def __init__(self, storage: MemoryStorage, retrieval: RetrievalEngine, compressor: PayloadCompressor, context_builder=None, llm_client=None):
+    def __init__(self, storage: MemoryStorage, retrieval: RetrievalEngine,
+                 compressor: PayloadCompressor, context_builder=None, llm_client=None):
         self.storage = storage
         self.retrieval = retrieval
         self.compressor = compressor
-        # [NEW] Dependency Injection untuk Context Builder & LLM Client (Spec 6.1)
         self.context_builder = context_builder
         self.llm_client = llm_client
 
     def process_input(self, envelope: InputEnvelope) -> EngineResult:
-        """
-        Main Entry Point. Memproses satu turn percakapan secara utuh.
-        """
+        """Main Entry Point. Memproses satu turn percakapan secara utuh."""
         session_id = envelope.session_id
         ref_time = envelope.timestamp
-        
-        # [NEW] Jamin Session Lifecycle (Review Kedua)
+
         self.storage.ensure_session_exists(session_id, ref_time)
-        
-        # ==========================================
-        # PHASE 1: FAST STATE CHECK (Layer 2)
-        # ==========================================
+        session_state = self.storage.get_session_state(session_id)
+
         active_pending = self.storage.get_active_pending_state(session_id)
-        
-        # [NEW] TTL Expiration Check
+
         if active_pending:
-            # [FIX] Normalisasi timezone (SQLite mengembalikan naive datetime)
             created_at = active_pending.created_at
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=ref_time.tzinfo)
-                
             age_seconds = (ref_time - created_at).total_seconds()
             if age_seconds > CONFIG.fast_memory.PENDING_TTL_SECONDS:
                 active_pending.status = PendingStatus.EXPIRED
@@ -125,73 +106,54 @@ class MemoryEngine:
 
         context_text = envelope.raw_text
         is_cross_session_pending = False
-        
+        clarification_ctx: Optional[ClarificationAccumulation] = None
+
+        explicit_cancel = self._detect_explicit_cancellation(envelope)
+        if explicit_cancel and active_pending:
+            self._pause_pending(active_pending)
+            active_pending = None
+
         if active_pending:
             is_relevant = self._check_pending_relevance(envelope, active_pending)
             if is_relevant:
-                context_text = f"{active_pending.original_input} [CLARIFICATION: {envelope.raw_text}]"
-                logger.info("PENDING STATE: Relevan. Menggabungkan konteks.")
+                clarification_ctx = self._build_clarification_accumulation(
+                    envelope, active_pending
+                )
+                context_text = clarification_ctx.combined_text
             else:
                 self._pause_pending(active_pending)
-                logger.info("PENDING STATE: Tidak relevan. Di-pause.")
-                active_pending = None 
-        else:
-            # [CRITICAL FIX] Cross-Session Pending Resolution dengan RANKING.
-            # Menggunakan SUMBER BUKTI YANG SAMA dengan jalur lokal (token_profile + helper_description),
-            # lalu di-gate oleh _check_pending_relevance dan di-ranking oleh _score_pending_relevance.
-            # Sebelumnya jalur ini memakai rumus terpisah yang lebih ketat sehingga pending
-            # lintas sesi tidak pernah ter-attach (Blueprint XXVII & XXVIII).
+                active_pending = None
+        elif not explicit_cancel:
             global_pendings = self.storage.get_global_active_pendings()
-            all_keys = self.storage.get_all_topic_keys()
-            
+            keys_for_pending = self.storage.get_all_topic_keys()
             best_pending = None
             best_score = -1.0
-            
+
             for gp in global_pendings:
                 if gp.session_id == session_id:
                     continue
-                    
-                # Gate: pakai aturan relevansi yang sama persis dengan pending lokal
-                if not self._check_pending_relevance(envelope, gp, all_keys=all_keys):
+                if not self._check_pending_relevance(envelope, gp, all_keys=keys_for_pending):
                     continue
-                    
-                # Ranking: skor komposit dari bukti yang sama
-                score = self._score_pending_relevance(envelope, gp, all_keys=all_keys)
-                
+                score = self._score_pending_relevance(envelope, gp, all_keys=keys_for_pending)
                 if score > best_score:
                     best_score = score
                     best_pending = gp
-                        
+
             if best_pending:
                 active_pending = best_pending
                 is_cross_session_pending = True
-                context_text = f"{best_pending.original_input} [CLARIFICATION: {envelope.raw_text}]"
-                logger.info(f"CROSS-SESSION PENDING: Relevan dengan sesi {best_pending.session_id} (Score: {best_score:.2f}).")
+                clarification_ctx = self._build_clarification_accumulation(
+                    envelope, best_pending
+                )
+                context_text = clarification_ctx.combined_text
 
-        # ==========================================
-        # PHASE 2: RETRIEVAL & ACTIVATION (Layer 3-6)
-        # ==========================================
         all_keys = self.storage.get_all_topic_keys()
-        
-        # [NEW] Real Continuity Window Calculation
         active_topic_id, continuity_score = self._calculate_active_state(session_id)
-        
         relevant_fragments = self._get_relevant_fragments(all_keys)
-        
-        # [NEW] Fetch Global Token Counts for Unique Token Evidence
         global_token_counts = self.storage.get_global_token_counts()
-
-        # [ASSOCIATIVE EVIDENCE LOCKING] Graph sebagai EVIDENCE, bukan absolute truth.
-        # Sebelumnya cross_session_evidence tidak pernah dikirim sehingga graph_score
-        # selalu 0 dan tidak pernah memengaruhi keputusan.
         graph_evidence = self._build_graph_evidence(all_keys, relevant_fragments, active_topic_id)
-
-        # [REASONING PURITY] Fragment graph scores dari edge nyata (Prioritas #4).
-        # Dikirim ke retrieval agar fragment ranking memakai graph evidence, bukan
-        # relationship_strength sebagai proxy. Retrieval akan fallback ke
-        # relationship_strength jika edge score = 0 (test_scenario_k compatibility).
         fragment_graph_scores = self._compute_fragment_graph_scores(relevant_fragments)
-        
+
         retrieval_result = self.retrieval.retrieve(
             input_text=context_text,
             keys=all_keys,
@@ -202,21 +164,26 @@ class MemoryEngine:
             global_token_counts=global_token_counts,
             cross_session_evidence=graph_evidence,
             fragment_graph_scores=fragment_graph_scores,
+            clarification=clarification_ctx,
         )
 
-        # ==========================================
-        # PHASE 3: DECISION GATE (Layer 5)
-        # ==========================================
         decision = self._make_decision(retrieval_result, active_pending)
-        
-        # [FIX] Jika ada pending state dan keputusan baru adalah CLEAR, 
-        # ATAU jika ini adalah Cross-Session Pending yang berhasil di-retrieval (tidak ambigu lagi),
-        # berarti klarifikasi user berhasil mengurai ambiguitas.
-        # [EVIDENCE LOCKING] Kegagalan bukti TIDAK boleh dianggap sebagai resolusi.
+        decision = self._apply_continuation_protection(decision, retrieval_result)
+
+        trend_candidates = self._resolve_trend_candidates(
+            decision=decision,
+            retrieval=retrieval_result,
+            envelope=envelope,
+            session_state=session_state,
+        )
+        if trend_candidates:
+            decision.trend_candidates = trend_candidates
+
         _unresolved_states = {
             DecisionType.AMBIGUOUS,
             DecisionType.INSUFFICIENT_EVIDENCE,
             DecisionType.CONTRADICTORY_EVIDENCE,
+            DecisionType.UNRESOLVED_CONTINUATION,
         }
         if active_pending and (
             decision.decision_type == DecisionType.CLEAR
@@ -226,47 +193,53 @@ class MemoryEngine:
             active_pending.last_updated_at = ref_time
             with self.storage.transaction() as tx:
                 self.storage.save_pending_state(tx, active_pending)
-            logger.info(f"PENDING STATE: RESOLVED (pending_id={active_pending.pending_id[:8]}..., cross_session={is_cross_session_pending}).")
-        
-        # Handle Ambiguity (Layer 15)
-        if decision.decision_type == DecisionType.AMBIGUOUS:
-            question = retrieval_result.clarification_message or "Maaf, saya kurang yakin. Maksud Anda topik yang mana?"
-            return self._handle_ambiguity(envelope, retrieval_result, active_pending, question)
 
-        # [ASSOCIATIVE EVIDENCE LOCKING] Dua kondisi gagal-bukti yang BERBEDA dari ambiguitas.
-        # AMBIGUOUS              : beberapa kandidat kuat
-        # INSUFFICIENT_EVIDENCE  : tidak ada kandidat yang cukup terbukti
-        # CONTRADICTORY_EVIDENCE : ada kecocokan tetapi bukti saling bertentangan
-        if decision.decision_type in (DecisionType.INSUFFICIENT_EVIDENCE, DecisionType.CONTRADICTORY_EVIDENCE):
+        if decision.decision_type == DecisionType.AMBIGUOUS:
+            question = retrieval_result.clarification_message or (
+                "Maaf, saya kurang yakin. Maksud Anda topik yang mana?"
+            )
+            return self._handle_ambiguity(
+                envelope, retrieval_result, active_pending, question,
+                clarification=clarification_ctx,
+                trend_candidates=trend_candidates,
+            )
+
+        if decision.decision_type in (
+            DecisionType.INSUFFICIENT_EVIDENCE, DecisionType.CONTRADICTORY_EVIDENCE
+        ):
             question = retrieval_result.clarification_message or decision.message or (
                 "Bukti yang saya miliki belum cukup untuk memilih satu topik. Bisa diperjelas?"
             )
             return self._handle_ambiguity(
                 envelope, retrieval_result, active_pending, question,
-                decision_type=decision.decision_type
+                decision_type=decision.decision_type,
+                clarification=clarification_ctx,
+                trend_candidates=trend_candidates,
             )
-            
-        # ==========================================
-        # PHASE 4: EXACT RECONSTRUCTION (Layer 7)
-        # ==========================================
+
+        if decision.decision_type == DecisionType.UNRESOLVED_CONTINUATION:
+            return self._handle_unresolved_continuation(
+                envelope, retrieval_result, active_pending,
+                trend_candidates=trend_candidates,
+                clarification=clarification_ctx,
+            )
+
         exact_memories = []
         retrieved_memories: List[RetrievedMemory] = []
         reconstruction_status = ReconstructionStatus.NO_MEMORY_REQUESTED
-        
+
         if decision.selected_fragment_ids:
-            exact_memories, reconstruction_status = self._reconstruct_memories(decision.selected_fragment_ids)
-            # [ASSOCIATIVE EVIDENCE LOCKING] Bawa metadata bukti ke Context Builder.
+            exact_memories, reconstruction_status = self._reconstruct_memories(
+                decision.selected_fragment_ids
+            )
             retrieved_memories = self._attach_evidence_metadata(exact_memories, retrieval_result)
-            
-        # ==========================================
-        # PHASE 5: GENERATION (Layer 8 & 9)
-        # ==========================================
-        if self.context_builder and self.llm_client and decision.decision_type != DecisionType.AMBIGUOUS:
+
+        if self.context_builder and self.llm_client:
             active_topic_title = None
             if retrieval_result.selected_key_id:
                 key_obj = self.storage.get_topic_key(retrieval_result.selected_key_id)
                 active_topic_title = key_obj.title if key_obj else None
-                
+
             model_request = self.context_builder.build_context(
                 current_user_input=envelope.raw_text,
                 exact_memories=retrieved_memories if retrieved_memories else exact_memories,
@@ -276,26 +249,63 @@ class MemoryEngine:
                 model_response = self.llm_client.generate(model_request)
                 assistant_response = model_response.response_text
             except Exception as e:
-                logger.error(f"LLM Generation gagal: {e}. Fallback ke simulasi.")
-                assistant_response = self._simulate_generation(envelope.raw_text, exact_memories, decision)
+                logger.error(f"LLM Generation gagal: {e}")
+                assistant_response = self._simulate_generation(
+                    envelope.raw_text, exact_memories, decision
+                )
         else:
-            assistant_response = self._simulate_generation(envelope.raw_text, exact_memories, decision)
-        
-        # ==========================================
-        # PHASE 6: MEMORY CONSTRUCTION (Layer 10-14)
-        # ==========================================
-        analysis = self._analyze_turn(envelope, assistant_response, retrieval_result, active_topic_id)
-        
-        if analysis.classification != MemoryClassification.DISCARD:
-            self._persist_memory(
-                envelope, 
-                assistant_response, 
-                analysis, 
-                retrieval_result,
-                active_topic_id
+            assistant_response = self._simulate_generation(
+                envelope.raw_text, exact_memories, decision
             )
 
-        # [REASONING PURITY] Ringkasan kemurnian reasoning untuk observability
+        analysis = self._analyze_turn(envelope, assistant_response, retrieval_result, active_topic_id)
+
+        if analysis.unresolved_continuation:
+            return EngineResult(
+                assistant_response=assistant_response,
+                decision=decision,
+                retrieved_memory_ids=decision.selected_fragment_ids,
+                active_topic_key_id=analysis.active_topic_key_id,
+                persistence_status="BLOCKED_UNRESOLVED_CONTINUATION",
+                reconstruction_status=reconstruction_status,
+                retrieved_memories=retrieved_memories,
+                evidence_summary=retrieval_result.evidence_summary,
+                candidates=retrieval_result.candidates,
+                turn_continuity_score=analysis.turn_continuity_score,
+                continuity_evidence_sources=analysis.continuity_evidence_sources,
+                continuation_intent=True,
+                active_fragment_id=analysis.active_fragment_id,
+                active_depth=analysis.active_depth,
+            )
+
+        composite_analysis = self._detect_composite_sources(
+            response=assistant_response,
+            retrieved_memories=retrieved_memories,
+            primary_topic_key_id=analysis.active_topic_key_id,
+        )
+
+        placement: Optional[FragmentPlacementResult] = None
+        propagation: Optional[HelperPropagationResult] = None
+        created_fragment_id: Optional[str] = None
+
+        if analysis.classification != MemoryClassification.DISCARD:
+            created_fragment_id, placement, propagation = self._persist_memory(
+                envelope,
+                assistant_response,
+                analysis,
+                retrieval_result,
+                active_topic_id,
+                composite_analysis=composite_analysis,
+            )
+
+        self._update_session_state(
+            session_id=session_id,
+            topic_key_id=analysis.active_topic_key_id,
+            fragment_id=created_fragment_id,
+            placement=placement,
+            ref_time=ref_time,
+        )
+
         reasoning_summary = self._build_reasoning_purity_summary(analysis, retrieval_result)
 
         return EngineResult(
@@ -307,138 +317,112 @@ class MemoryEngine:
             reconstruction_status=reconstruction_status,
             retrieved_memories=retrieved_memories,
             evidence_summary=retrieval_result.evidence_summary,
-            # [EVIDENCE LOCKING] Sertakan kandidat yang DITOLAK agar bisa diaudit.
             candidates=retrieval_result.candidates,
             reasoning_purity_summary=reasoning_summary,
-            # [FIX — Batch E] Expose turn_continuity_score AKTUAL yang dipersist
-            # ke fragment.relationship_strength, agar invariant Continuity Purity
-            # dapat diverifikasi tanpa re-computation yang rentan state-drift.
             turn_continuity_score=analysis.turn_continuity_score,
             continuity_evidence_sources=analysis.continuity_evidence_sources,
+            active_fragment_id=created_fragment_id or analysis.active_fragment_id,
+            active_depth=placement.depth if placement else analysis.active_depth,
+            created_fragment_id=created_fragment_id,
+            fragment_placement=placement,
+            helper_propagation=propagation,
+            composite_analysis=composite_analysis,
+            trend_candidates=trend_candidates,
+            clarification_round=(clarification_ctx.round_number if clarification_ctx else 0),
+            clarification_history=(
+                clarification_ctx.clarification_history if clarification_ctx else []
+            ),
+            excluded_candidate_keys=retrieval_result.excluded_candidate_keys,
+            continuation_intent=retrieval_result.continuation_intent,
         )
 
-    # ==========================================
-    # INTERNAL LOGIC & HELPERS
-    # ==========================================
-
     def _extract_input_tokens(self, envelope: InputEnvelope) -> set:
-        """
-        [NEW] Single source of truth untuk tokenisasi input user.
-        Dipakai oleh seluruh pemeriksaan relevansi pending agar tidak ada perbedaan bukti.
-        """
+        """Single source of truth untuk tokenisasi input user."""
         raw_tokens = re.findall(r'\b\w+\b', envelope.raw_text.lower())
         return {t for t in raw_tokens if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH}
 
     def _extract_symbol_identity_tokens(self, raw_text: str) -> set:
-        """
-        [FIX — Batch E] Ekstrak identity token INCLUDING identifier simbolik.
+        r"""
+        Ekstrak identity token INCLUDING identifier simbolik.
 
-        Masalah: "C++" melalui `re.findall(r'\b\w+\b', ...)` hanya menghasilkan
-        ["c"] (1 karakter), lalu terfilter MIN_TOKEN_LENGTH=3 → himpunan kosong.
-        Sistem lalu salah menyimpulkan "input kosong" dan menganggapnya relevan
-        terhadap pending apa pun.
-
-        Fungsi ini menangkap identifier simbolik secara utuh ("c++", "c#", "f#")
-        plus token alfanumerik pendek, sehingga evaluasi bukti tetap bisa jalan.
+        "C++" melalui re.findall(r'\b\w+\b', ...) hanya menghasilkan ["c"],
+        lalu terfilter MIN_TOKEN_LENGTH=3 -> himpunan kosong.
+        Fungsi ini menangkap "c++", "c#", "f#" secara utuh.
         """
         text = raw_text.lower()
         tokens = set(self._SYMBOL_IDENTITY_PATTERN.findall(text))
         tokens |= {t for t in re.findall(r'\b\w+\b', text) if t}
         return tokens
 
+    def _get_input_token_quality(self, envelope: InputEnvelope) -> Dict[str, TokenQuality]:
+        """Klasifikasi token kualitas (re-use SignalExtractor logic)."""
+        from retrieval import SignalExtractor
+        extractor = SignalExtractor()
+        raw_tokens = re.findall(r'\b\w+\b', envelope.raw_text.lower())
+        unique_tokens = [t for t in set(raw_tokens) if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH]
+        return {t: extractor._classify_token(t) for t in unique_tokens}
+
     def _collect_pending_evidence_tokens(
-        self, 
-        pending: PendingState, 
+        self,
+        pending: PendingState,
         all_keys: Optional[List[TopicKey]] = None
     ) -> set:
-        """
-        [CRITICAL FIX] Single source of truth untuk bukti milik Pending State.
-        Menggabungkan TITLE + TOKEN PROFILE + HELPER DESCRIPTION dari seluruh candidate keys.
-        
-        [MINOR FALLBACK LOCK] Ditambahkan title agar "bisnis" yang muncul di judul
-        "Bisnis Kopi" tetap terdeteksi sebagai evidence terhadap candidate.
-
-        Sebelumnya jalur cross-session hanya memakai token_profile, sehingga bukti
-        lebih lemah daripada jalur lokal dan pending lintas sesi gagal di-resolve.
-        Sesuai Blueprint: pending harus dicocokkan dengan
-        candidate keys + helper descriptions + metadata.
-        """
+        """Bukti Pending: TITLE + TOKEN PROFILE + HELPER + AGGREGATED HELPER."""
         if all_keys is None:
             all_keys = self.storage.get_all_topic_keys()
-            
+
         pending_tokens = set()
         for k in all_keys:
             if k.key_id in pending.candidate_keys:
                 pending_tokens.update(k.token_profile.keys())
-                # [MINOR FALLBACK LOCK] Sertakan title tokens
                 title_words = re.findall(r'\b\w+\b', k.title.lower())
                 pending_tokens.update(
                     w for w in title_words if len(w) >= CONFIG.signal.MIN_TOKEN_LENGTH
                 )
                 desc_words = re.findall(r'\b\w+\b', k.helper_description.lower())
-                pending_tokens.update(w for w in desc_words if len(w) >= CONFIG.signal.MIN_TOKEN_LENGTH)
+                pending_tokens.update(
+                    w for w in desc_words if len(w) >= CONFIG.signal.MIN_TOKEN_LENGTH
+                )
+                agg_words = re.findall(
+                    r'\b\w+\b', (k.aggregated_helper_description or "").lower()
+                )
+                pending_tokens.update(
+                    w for w in agg_words if len(w) >= CONFIG.signal.MIN_TOKEN_LENGTH
+                )
         return pending_tokens
 
     def _score_pending_relevance(
-        self, 
-        envelope: InputEnvelope, 
+        self,
+        envelope: InputEnvelope,
         pending: PendingState,
         all_keys: Optional[List[TopicKey]] = None
     ) -> float:
-        """
-        [NEW] Skor komposit relevansi pending untuk keperluan RANKING antar pending.
-        Bukan untuk gating (gating dilakukan oleh _check_pending_relevance).
-        
-        Komponen:
-        - overlap_ratio : proporsi token input yang terjelaskan oleh bukti pending
-        - overlap_bonus : penguat absolut agar pending dengan bukti lebih kaya menang
-        """
+        """Skor komposit relevansi pending untuk RANKING antar pending."""
         new_tokens = self._extract_input_tokens(envelope)
-        
-        # Jawaban sangat pendek ("Yang bisnis", "Terserah") tetap dianggap mungkin relevan,
-        # tetapi diberi skor sedang agar tidak mengalahkan pending dengan bukti eksplisit kuat.
         if not new_tokens or len(new_tokens) < 3:
             return 0.5
-            
+
         pending_tokens = self._collect_pending_evidence_tokens(pending, all_keys=all_keys)
         overlap = new_tokens.intersection(pending_tokens)
-        
         overlap_ratio = len(overlap) / len(new_tokens)
         overlap_bonus = min(len(overlap), 5) * 0.01
-        
         return overlap_ratio + overlap_bonus
 
-    # ==========================================
-    # [MINOR FALLBACK LOCK] EXPLICIT SELECTION DETECTION
-    # ==========================================
-
     def _detect_explicit_selection(self, raw_text: str, pending: PendingState) -> bool:
-        """
-        [MINOR FALLBACK LOCK] Deteksi apakah input pendek adalah pilihan eksplisit
-        terhadap salah satu kandidat pending.
-
-        Contoh pola yang dikenali:
-            "nomor 1", "pilihan 2", "opsi 3", "1" (angka saja)
-            "yang pertama", "yang kedua", "yang terakhir"
-            "pertama", "kedua"
-
-        Mengembalikan True jika index yang dipilih valid (1..N kandidat).
-        Tidak mengubah state pending — hanya memberi sinyal ke caller.
-        """
+        """Deteksi pilihan eksplisit: 'nomor 1', 'yang pertama', '1'."""
         n_candidates = len(pending.candidate_keys)
         if n_candidates == 0:
             return False
 
         text_lower = raw_text.lower().strip()
 
-        # 1. Pola angka eksplisit: "nomor 1", "pilihan 2", "opsi 3", "1" saja
         number_patterns = [
             r'\bnomor\s+(\d+)\b',
             r'\bpilihan\s+(\d+)\b',
             r'\boption\s+(\d+)\b',
             r'\boptions?\s+(\d+)\b',
             r'\bopsi\s+(\d+)\b',
-            r'^\s*(\d+)\s*$',      # hanya angka tunggal
+            r'^\s*(\d+)\s*$',
         ]
         for pattern in number_patterns:
             match = re.search(pattern, text_lower)
@@ -450,28 +434,17 @@ class MemoryEngine:
                 except ValueError:
                     continue
 
-        # 2. Pola ordinal: "yang pertama", "yang kedua", "yang terakhir"
         ordinal_map = {
-            "pertama": 1, "kesatu": 1,
-            "kedua": 2,
-            "ketiga": 3,
-            "keempat": 4,
-            "kelima": 5,
-            "keenam": 6,
-            "ketujuh": 7,
-            "terakhir": n_candidates,
-            "last": n_candidates,
-            "first": 1,
-            "second": 2,
-            "third": 3,
+            "pertama": 1, "kesatu": 1, "kedua": 2, "ketiga": 3,
+            "keempat": 4, "kelima": 5, "keenam": 6, "ketujuh": 7,
+            "terakhir": n_candidates, "last": n_candidates,
+            "first": 1, "second": 2, "third": 3,
         }
         for word, idx in ordinal_map.items():
-            # Cocokkan sebagai whole word agar "kedua" tidak match di "berkedua"
             if re.search(rf'\b{re.escape(word)}\b', text_lower):
                 if 1 <= idx <= n_candidates:
                     return True
 
-        # 3. Angka cardinal yang berdiri sendiri di input pendek: "satu", "dua", "tiga"
         cardinal_map = {
             "satu": 1, "dua": 2, "tiga": 3, "empat": 4, "lima": 5,
             "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
@@ -484,84 +457,43 @@ class MemoryEngine:
         return False
 
     def _check_pending_relevance(
-        self, 
-        envelope: InputEnvelope, 
+        self,
+        envelope: InputEnvelope,
         pending: PendingState,
         all_keys: Optional[List[TopicKey]] = None
     ) -> bool:
-        """
-        [OVERHAUL] Memeriksa relevansi pending.
-
-        [MINOR FALLBACK LOCK]
-        SHORT INPUT ≠ AUTOMATICALLY RELEVANT
-
-        Urutan evaluasi input pendek:
-            0. Tokenisasi kosong → cek identity simbolik (lihat sub-branch di bawah)
-            1. Input benar-benar kosong                    → RELEVANT (edge case)
-            2. Semua token low-information                 → RELEVANT ("terserah", "mana?")
-            3. Explicit candidate selection                → RELEVANT ("nomor 1", "yang pertama")
-            4. Token overlap dengan candidate evidence     → RELEVANT ("yang bisnis", "kopi")
-            5. Strong novelty indicator                    → NOT RELEVANT ("C++", "pointer")
-            6. Tidak ada bukti apapun                      → NOT RELEVANT (jangan paksa)
-
-        Urutan evaluasi input panjang:
-            - overlap >= 2 tokens                          → RELEVANT
-            - overlap == 0 dan >= 3 tokens baru            → NOT RELEVANT (topic switch)
-            - fallback: overlap_ratio >= SWITCH_THRESHOLD
-
-        [FIX — Batch E] Sub-branch untuk tokenisasi kosong:
-            "C++" tidak menghasilkan token word-character yang lolos filter panjang,
-            tetapi itu BUKAN input kosong. Identity-nya ("c++") diekstrak dari
-            raw_text, lalu dievaluasi dengan aturan bukti yang sama.
-        """
+        """SHORT INPUT != AUTOMATICALLY RELEVANT."""
         new_tokens = self._extract_input_tokens(envelope)
         short_threshold = CONFIG.fast_memory.SHORT_PENDING_INPUT_THRESHOLD
         min_match = CONFIG.fast_memory.SHORT_PENDING_MIN_MATCH
 
-        # ==========================================
-        # JALUR INPUT PENDEK
-        # ==========================================
         if not new_tokens or len(new_tokens) < short_threshold:
-            # [FIX — Batch E] 0. Tokenisasi kosong: bedakan "benar-benar kosong"
-            # dari "berisi identifier simbolik yang tidak lolos tokenisasi".
             if not new_tokens:
                 raw_stripped = envelope.raw_text.strip()
-
-                # 1. Benar-benar kosong (whitespace saja) → edge case, tetap relevan.
                 if not raw_stripped:
                     return True
-
-                # 3. Explicit selection tetap diprioritaskan (mis. "1", "2").
                 if self._detect_explicit_selection(raw_stripped, pending):
                     return True
 
-                # Ekstrak identity simbolik + token pendek dari raw_text.
                 identity_tokens = self._extract_symbol_identity_tokens(raw_stripped)
-
                 from retrieval import SignalExtractor
                 extractor = SignalExtractor()
                 meaningful_identity = [
                     t for t in identity_tokens
                     if extractor._classify_token(t) != TokenQuality.LOW_INFORMATION
                 ]
-
-                # 2. Semua identity low-information (mis. "ya", "ok") → relevan.
                 if not meaningful_identity:
                     return True
-
-                # 5. Strong novelty (mis. "c++", "c#") → BUKAN jawaban pending.
                 if any(t in self._STRONG_NOVELTY_INDICATORS for t in meaningful_identity):
                     return False
 
-                # 4. Overlap dengan bukti candidate → relevan.
-                pending_tokens = self._collect_pending_evidence_tokens(pending, all_keys=all_keys)
+                pending_tokens = self._collect_pending_evidence_tokens(
+                    pending, all_keys=all_keys
+                )
                 if set(meaningful_identity).intersection(pending_tokens):
                     return True
-
-                # 6. Tidak ada bukti apapun → jangan paksa relevan.
                 return False
 
-            # 2. Semua token low-information → RELEVANT (weak fallback)
             quality_map = self._get_input_token_quality(envelope)
             meaningful = [
                 t for t in new_tokens
@@ -569,51 +501,25 @@ class MemoryEngine:
             ]
             if not meaningful:
                 return True
-
-            # 3. Explicit candidate selection → RELEVANT
             if self._detect_explicit_selection(envelope.raw_text, pending):
                 return True
 
-            # 4. Token overlap dengan candidate evidence → RELEVANT
             pending_tokens = self._collect_pending_evidence_tokens(pending, all_keys=all_keys)
             overlap = set(meaningful).intersection(pending_tokens)
             if len(overlap) >= min_match:
                 return True
-
-            # 5. Strong novelty indicator → NOT RELEVANT
-            has_strong_novelty = any(t in self._STRONG_NOVELTY_INDICATORS for t in meaningful)
-            if has_strong_novelty:
+            if any(t in self._STRONG_NOVELTY_INDICATORS for t in meaningful):
                 return False
-
-            # 6. [MINOR FALLBACK LOCK] Tidak ada bukti apapun → NOT RELEVANT
-            # JANGAN paksa relevan. Biarkan mekanisme topic switch yang menangani.
             return False
 
-        # ==========================================
-        # JALUR INPUT PANJANG (logika lama dipertahankan)
-        # ==========================================
         pending_tokens = self._collect_pending_evidence_tokens(pending, all_keys=all_keys)
         overlap = new_tokens.intersection(pending_tokens)
-        
-        # [FIX] Jika ada minimal 2 token yang beririsan, anggap relevan (menangani long clarification)
         if len(overlap) >= 2:
             return True
-            
-        # Jika tidak ada irisan sama sekali dan ada >= 3 token baru, ini Topic Switch
         if len(overlap) == 0 and len(new_tokens) >= 3:
             return False
-            
-        # Fallback: gunakan switch threshold
         overlap_ratio = len(overlap) / len(new_tokens) if new_tokens else 0.0
         return overlap_ratio >= CONFIG.fast_memory.PENDING_SWITCH_THRESHOLD
-
-    def _get_input_token_quality(self, envelope: InputEnvelope) -> Dict[str, TokenQuality]:
-        """Helper: klasifikasi token kualitas (re-use SignalExtractor logic)."""
-        from retrieval import SignalExtractor
-        extractor = SignalExtractor()
-        raw_tokens = re.findall(r'\b\w+\b', envelope.raw_text.lower())
-        unique_tokens = [t for t in set(raw_tokens) if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH]
-        return {t: extractor._classify_token(t) for t in unique_tokens}
 
     def _pause_pending(self, pending: PendingState):
         """Mengubah status Pending menjadi PAUSED."""
@@ -622,37 +528,298 @@ class MemoryEngine:
         with self.storage.transaction() as tx:
             self.storage.save_pending_state(tx, pending)
 
+    def _detect_explicit_cancellation(self, envelope: InputEnvelope) -> bool:
+        """[M1] Deteksi pembatalan / perpindahan topik eksplisit."""
+        from retrieval import SignalExtractor
+        extractor = SignalExtractor()
+        signal = extractor.extract(envelope.raw_text, envelope.timestamp)
+        return bool(signal.cancellation_intent)
+
+    def _build_clarification_accumulation(
+        self,
+        envelope: InputEnvelope,
+        pending: PendingState,
+    ) -> ClarificationAccumulation:
+        """[M1] original_input + history = sumber kebenaran. combined = cache."""
+        cc = CONFIG.clarification
+
+        history = list(pending.clarification_history or [])
+        history.append(envelope.raw_text)
+        if len(history) > cc.MAX_CLARIFICATION_HISTORY_ENTRIES:
+            history = history[-cc.MAX_CLARIFICATION_HISTORY_ENTRIES:]
+
+        parts = [pending.original_input] + history
+        combined = " ".join(p for p in parts if p)
+        if len(combined) > cc.CLARIFICATION_HISTORY_MAX_CHARS:
+            tail_budget = (
+                cc.CLARIFICATION_HISTORY_MAX_CHARS - len(pending.original_input) - 1
+            )
+            tail = " ".join(history)
+            if tail_budget > 0:
+                tail = tail[-tail_budget:]
+                combined = f"{pending.original_input} {tail}"
+            else:
+                combined = pending.original_input[:cc.CLARIFICATION_HISTORY_MAX_CHARS]
+
+        from retrieval import SignalExtractor
+        extractor = SignalExtractor()
+        signal = extractor.extract(combined, envelope.timestamp)
+
+        excluded_tokens = sorted(
+            set(pending.excluded_tokens or []) | set(signal.excluded_tokens or [])
+        )
+
+        return ClarificationAccumulation(
+            original_input=pending.original_input,
+            clarification_history=history,
+            combined_text=combined,
+            excluded_tokens=excluded_tokens,
+            excluded_candidate_keys=list(pending.excluded_candidate_keys or []),
+            negation_scopes=list(signal.negation_scopes or []),
+            round_number=(pending.clarification_round or 1),
+            retained_candidate_keys=list(pending.candidate_keys or []),
+        )
+
+    def _persist_clarification_state(
+        self,
+        pending: PendingState,
+        clarification: Optional[ClarificationAccumulation],
+        result: RetrievalResult,
+        envelope: InputEnvelope,
+        question: str,
+    ) -> None:
+        """[M1] Pending BERKEMBANG, bukan dibuat ulang."""
+        if clarification is not None:
+            pending.clarification_history = list(clarification.clarification_history)
+            pending.combined_clarification_text = clarification.combined_text
+            pending.excluded_tokens = list(clarification.excluded_tokens)
+
+        excluded = set(pending.excluded_candidate_keys or [])
+        excluded.update(result.excluded_candidate_keys or [])
+        pending.excluded_candidate_keys = sorted(excluded)
+
+        new_keys = [c.key_id for c in result.candidates]
+        if new_keys:
+            pending.candidate_keys = new_keys
+            pending.candidate_scores = {
+                c.key_id: c.final_score for c in result.candidates
+            }
+            hist = list(pending.candidate_history or [])
+            hist.append(new_keys)
+            pending.candidate_history = hist
+
+        pending.assistant_question = question
+        pending.last_updated_at = envelope.timestamp
+
+    def _apply_continuation_protection(
+        self,
+        decision: EngineDecision,
+        retrieval: RetrievalResult,
+    ) -> EngineDecision:
+        """[M2] NO_MATCH + continuation intent != NEW_TOPIC."""
+        cfg = CONFIG.continuation
+        if not cfg.BLOCK_NEW_TOPIC_ON_CONTINUATION:
+            return decision
+        if not retrieval.continuation_intent:
+            return decision
+        if decision.decision_type not in (
+            DecisionType.NO_MATCH,
+            DecisionType.INSUFFICIENT,
+            DecisionType.INSUFFICIENT_EVIDENCE,
+        ):
+            return decision
+
+        top_score = retrieval.candidates[0].final_score if retrieval.candidates else 0.0
+        if top_score >= cfg.MIN_CONTINUATION_CANDIDATE_SCORE:
+            return decision
+
+        decision.decision_type = DecisionType.UNRESOLVED_CONTINUATION
+        decision.continuation_intent = True
+        decision.message = (
+            "Anda meminta melanjutkan pembahasan sebelumnya, tetapi saya belum "
+            "menemukan topik yang cukup cocok. Bisa sebutkan topik atau bagiannya?"
+        )
+        decision.decision_reason = (
+            f"continuation intent detected; top_score={top_score:.3f}"
+        )
+        return decision
+
+    def _handle_unresolved_continuation(
+        self,
+        envelope: InputEnvelope,
+        result: RetrievalResult,
+        existing: Optional[PendingState],
+        trend_candidates: Optional[List[TrendCandidate]] = None,
+        clarification: Optional[ClarificationAccumulation] = None,
+    ) -> EngineResult:
+        """[M2] Respons ini TIDAK dipersist sebagai fragment TopicKey baru."""
+        trend_candidates = trend_candidates or []
+        if trend_candidates:
+            lines = [
+                "Saya belum yakin pembahasan mana yang Anda maksud.",
+                "Beberapa topik yang sedang aktif:",
+            ]
+            for i, t in enumerate(trend_candidates, 1):
+                helper = t.helper_description or "pembahasan terkait."
+                lines.append(f"{i}. {t.label} — {helper}")
+            lines.append("\nYang mana yang ingin dilanjutkan?")
+            message = "\n".join(lines)
+        else:
+            message = (
+                "Saya belum menemukan pembahasan yang cocok untuk dilanjutkan. "
+                "Bisa sebutkan topik atau bagian yang Anda maksud?"
+            )
+
+        pending = existing
+        if pending is not None and pending.status == PendingStatus.ACTIVE:
+            pending.clarification_round = (pending.clarification_round or 1) + 1
+            self._persist_clarification_state(
+                pending, clarification, result, envelope, message
+            )
+            with self.storage.transaction() as tx:
+                self.storage.save_pending_state(tx, pending)
+        else:
+            pending = PendingState(
+                pending_id=str(uuid.uuid4()),
+                session_id=envelope.session_id,
+                original_input=envelope.raw_text,
+                candidate_keys=[
+                    t.node_id for t in trend_candidates
+                    if t.node_type == TrendNodeType.TOPIC_KEY
+                ],
+                candidate_scores={
+                    t.node_id: t.trend_score for t in trend_candidates
+                    if t.node_type == TrendNodeType.TOPIC_KEY
+                },
+                assistant_question=message,
+                created_at=envelope.timestamp,
+                status=PendingStatus.ACTIVE,
+                origin_session_id=envelope.session_id,
+                clarification_history=(
+                    list(clarification.clarification_history) if clarification else []
+                ),
+                combined_clarification_text=(
+                    clarification.combined_text if clarification else envelope.raw_text
+                ),
+            )
+            with self.storage.transaction() as tx:
+                self.storage.save_pending_state(tx, pending)
+
+        return EngineResult(
+            assistant_response=message,
+            decision=EngineDecision(
+                decision_type=DecisionType.UNRESOLVED_CONTINUATION,
+                message=message,
+                decision_reason="continuation intent unresolved; persistence blocked",
+                continuation_intent=True,
+                trend_candidates=trend_candidates,
+                excluded_candidate_keys=result.excluded_candidate_keys,
+            ),
+            persistence_status="BLOCKED_UNRESOLVED_CONTINUATION",
+            evidence_summary=result.evidence_summary,
+            candidates=result.candidates,
+            retrieved_memories=[],
+            trend_candidates=trend_candidates,
+            continuation_intent=True,
+            clarification_round=(pending.clarification_round if pending else 0),
+            clarification_history=(list(pending.clarification_history) if pending else []),
+            excluded_candidate_keys=result.excluded_candidate_keys,
+        )
+
+    def _resolve_trend_candidates(
+        self,
+        decision: EngineDecision,
+        retrieval: RetrievalResult,
+        envelope: InputEnvelope,
+        session_state: Optional[SessionActiveState],
+    ) -> List[TrendCandidate]:
+        """[M5] Trend untuk navigasi, bukan identitas final."""
+        if not retrieval.continuation_intent:
+            return []
+        if decision.decision_type not in (
+            DecisionType.AMBIGUOUS,
+            DecisionType.UNRESOLVED_CONTINUATION,
+            DecisionType.INSUFFICIENT_EVIDENCE,
+        ):
+            return []
+
+        temporal_range = None
+        if retrieval.signal_profile is not None:
+            temporal_range = self.retrieval.temporal_resolver.resolve(
+                retrieval.signal_profile.temporal_signals, envelope.timestamp
+            )
+
+        if retrieval.selected_key_id:
+            depth = CONFIG.hierarchy.NEW_BRANCH_DEPTH
+            if (session_state
+                    and session_state.active_topic_key_id == retrieval.selected_key_id):
+                depth = min(
+                    session_state.active_depth + 1,
+                    CONFIG.hierarchy.MAX_FRAGMENT_DEPTH,
+                )
+            if depth > CONFIG.hierarchy.MAX_FRAGMENT_DEPTH:
+                return []
+            return self.storage.get_trending_fragments(
+                topic_key_id=retrieval.selected_key_id,
+                depth=depth,
+                reference_time=envelope.timestamp,
+                temporal_range=temporal_range,
+            )
+
+        return self.storage.get_trending_topic_keys(
+            reference_time=envelope.timestamp,
+            temporal_range=temporal_range,
+        )
+
+    def _update_session_state(
+        self,
+        session_id: str,
+        topic_key_id: Optional[str],
+        fragment_id: Optional[str],
+        placement: Optional[FragmentPlacementResult],
+        ref_time: datetime,
+    ) -> None:
+        """[M3] Simpan Current Conversational State."""
+        if topic_key_id is None:
+            return
+        state = SessionActiveState(
+            session_id=session_id,
+            active_topic_key_id=topic_key_id,
+            active_fragment_id=fragment_id,
+            active_depth=placement.depth if placement else 0,
+            last_updated=ref_time,
+        )
+        try:
+            self.storage.save_session_state(state)
+        except Exception as e:
+            logger.debug(f"Gagal menyimpan session state: {e}")
+
     def _calculate_active_state(self, session_id: str) -> Tuple[Optional[str], float]:
-        """
-        [CRITICAL FIX] Real Continuity Window menggunakan Median (Review Kedua).
-        Menghitung stabilitas topik berdasarkan N-fragment terakhir.
-        """
-        recent_frags = self.storage.get_recent_fragments(session_id, limit=CONFIG.continuity.CONTINUITY_WINDOW_SIZE)
+        """Real Continuity Window menggunakan Median."""
+        recent_frags = self.storage.get_recent_fragments(
+            session_id, limit=CONFIG.continuity.CONTINUITY_WINDOW_SIZE
+        )
         if not recent_frags:
             return None, 0.0
-            
+
         latest_key_id = recent_frags[0].topic_key_id
-        
-        # Hitung rasio fragment di window yang milik topik terbaru
         match_count = sum(1 for f in recent_frags if f.topic_key_id == latest_key_id)
         freq_ratio = match_count / len(recent_frags)
-        
-        # [FIX] Gunakan relationship_strength sebagai proxy historical continuity scores
-        # untuk menghitung Median Continuity yang sesungguhnya.
-        strength_scores = [f.relationship_strength for f in recent_frags if f.topic_key_id == latest_key_id and f.relationship_strength > 0]
-        
+
+        strength_scores = [
+            f.relationship_strength for f in recent_frags
+            if f.topic_key_id == latest_key_id and f.relationship_strength > 0
+        ]
+
         if strength_scores:
             median_score = statistics.median(strength_scores)
-            # Gabungkan frekuensi dan median untuk stabilitas akhir
             stability_ratio = max(median_score, freq_ratio * 0.8)
         else:
             stability_ratio = freq_ratio
-        
+
         if stability_ratio >= CONFIG.continuity.MEDIAN_CONTINUITY_THRESHOLD:
             return latest_key_id, stability_ratio
-        else:
-            # Topik tidak stabil, continuity score meluruh
-            return latest_key_id, stability_ratio * 0.5
+        return latest_key_id, stability_ratio * 0.5
 
     def _get_relevant_fragments(self, keys: List[TopicKey]) -> List[FragmentMetadata]:
         """Mengambil metadata fragment untuk kunci-kunci yang ada."""
@@ -661,25 +828,13 @@ class MemoryEngine:
             fragments.extend(self.storage.get_fragment_metadata_by_key(k.key_id))
         return fragments
 
-    # ==========================================
-    # [ASSOCIATIVE EVIDENCE LOCKING] HELPERS
-    # ==========================================
-
     def _build_graph_evidence(
         self,
         keys: List[TopicKey],
         fragments: List[FragmentMetadata],
         active_topic_id: Optional[str]
     ) -> Dict[str, float]:
-        """
-        Graph = EVIDENCE, bukan absolute truth.
-
-        Menjawab: "Apakah kandidat ini pernah memiliki hubungan kuat dengan
-        fragment/topik yang sekarang aktif?"
-
-        Skor diambil dari kekuatan edge terkuat yang menghubungkan fragment
-        kandidat dengan fragment referensi (topik aktif).
-        """
+        """Graph = EVIDENCE, bukan absolute truth."""
         evidence: Dict[str, float] = {}
         if not active_topic_id:
             return evidence
@@ -689,11 +844,12 @@ class MemoryEngine:
         ]
         if not reference_ids:
             return evidence
-        # Batasi referensi agar tidak meledak pada dataset besar.
         reference_ids = reference_ids[:CONFIG.graph.MAX_EDGES_PER_NODE]
 
         for key in keys:
-            key_frag_ids = [f.fragment_id for f in fragments if f.topic_key_id == key.key_id]
+            key_frag_ids = [
+                f.fragment_id for f in fragments if f.topic_key_id == key.key_id
+            ]
             if not key_frag_ids:
                 continue
             scores = self.storage.get_fragment_graph_evidence(key_frag_ids, reference_ids)
@@ -707,31 +863,13 @@ class MemoryEngine:
         self,
         fragments: List[FragmentMetadata]
     ) -> Dict[str, float]:
-        """
-        [REASONING PURITY — Prioritas #4: Fragment Graph Evidence]
-
-        Hitung graph score per fragment dari edge NYATA (CONTINUES / CROSS_SESSION_LINK).
-        Bukan dari relationship_strength metadata.
-
-        Retrieval akan fallback ke relationship_strength jika score dari sini = 0.0,
-        untuk menjaga kompatibilitas dengan test yang membuat fragment manual
-        tanpa edges (e.g. test_scenario_k).
-
-        Returns:
-            Dict[fragment_id, score] — hanya fragment dengan score > 0 yang dikembalikan
-            agar retrieval tahu mana yang benar-benar punya evidence.
-        """
+        """Graph score per fragment dari edge NYATA."""
         if not fragments:
             return {}
-
         frag_ids = [f.fragment_id for f in fragments]
-        # Panggil storage — ini menghitung max edge strength per fragment.
         raw_scores = self.storage.get_fragment_graph_evidence(
-            frag_ids,
-            reference_fragment_ids=frag_ids  # referensi internal (edges antar fragment ini)
+            frag_ids, reference_fragment_ids=frag_ids
         )
-
-        # Filter: hanya kembalikan fragment dengan score > 0
         return {fid: score for fid, score in raw_scores.items() if score > 0}
 
     def _attach_evidence_metadata(
@@ -739,19 +877,17 @@ class MemoryEngine:
         exact_memories: List[dict],
         retrieval: RetrievalResult
     ) -> List[RetrievedMemory]:
-        """
-        Mengubah dict memori hasil rekonstruksi menjadi RetrievedMemory yang
-        membawa metadata kualitas bukti, agar Context Builder dapat mengurutkan
-        berdasarkan bukti dan bukan sekadar recency.
-
-        [REASONING PURITY] Populate field fragment_graph_score (dari edge nyata)
-        dan temporal_distance_score (dari kedekatan waktu).
-        """
+        """RetrievedMemory dengan metadata bukti + hierarchy framing."""
         score_map = retrieval.selected_fragment_scores or {}
         results: List[RetrievedMemory] = []
         for mem in exact_memories:
             fid = mem.get('fragment_id', '')
             meta = score_map.get(fid, {})
+            frag_meta = self.storage.get_fragment(fid)
+            topic_title = ""
+            if frag_meta is not None:
+                key_obj = self.storage.get_topic_key(frag_meta.topic_key_id)
+                topic_title = key_obj.title if key_obj else ""
             results.append(RetrievedMemory(
                 fragment_id=fid,
                 text=mem.get('text', ''),
@@ -762,24 +898,27 @@ class MemoryEngine:
                 graph_score=meta.get('graph_score', 0.0),
                 evidence_strength=meta.get('relevance_score', 0.0),
                 exact_temporal_match=meta.get('exact_temporal_match', False),
-                # [REASONING PURITY] Fragment graph score dari edge nyata
                 fragment_graph_score=meta.get('fragment_graph_score', 0.0),
                 graph_edge_count=1 if meta.get('fragment_graph_score', 0.0) > 0 else 0,
-                graph_path_types=[],  # Akan diisi saat graph reasoning diperdalam
-                # [REASONING PURITY] Temporal distance score
+                graph_path_types=[],
                 temporal_distance_score=meta.get('temporal_distance_score', 0.0),
                 temporal_distance_minutes=meta.get('temporal_distance_minutes'),
+                topic_key_title=topic_title,
+                fragment_key=(frag_meta.fragment_key if frag_meta else ""),
+                fragment_helper_description=(
+                    frag_meta.fragment_helper_description if frag_meta else ""
+                ),
+                parent_fragment_id=(frag_meta.parent_fragment_id if frag_meta else None),
+                depth=(frag_meta.depth if frag_meta else 0),
+                source_fragment_ids=(
+                    list(frag_meta.source_fragment_ids) if frag_meta else []
+                ),
+                is_composite=(frag_meta.is_composite if frag_meta else False),
             ))
         return results
 
     def _build_window_pairs(self, tokens: List[str]) -> Dict[str, int]:
-        """
-        [ASSOCIATIVE EVIDENCE LOCKING] Co-occurrence berbasis window untuk PERSISTENCE.
-
-        Wajib selaras dengan retrieval: jika retrieval mencocokkan window pairs
-        tetapi persistence hanya menyimpan adjacent pairs, maka
-        "bisnis kecil di bidang kopi" tidak akan pernah cocok dengan query "bisnis kopi".
-        """
+        """Co-occurrence berbasis window untuk PERSISTENCE."""
         cc = CONFIG.co_occurrence
         pairs: Dict[str, int] = {}
         for i, token_a in enumerate(tokens):
@@ -789,9 +928,12 @@ class MemoryEngine:
                 if token_a == token_b:
                     continue
                 distance = j - i
-                strength = cc.ADJACENT_PAIR_BONUS if distance == 1 else (
-                    cc.ADJACENT_PAIR_BONUS * (cc.CO_OCCURRENCE_DECAY ** (distance - 1))
-                )
+                if distance == 1:
+                    strength = cc.ADJACENT_PAIR_BONUS
+                else:
+                    strength = cc.ADJACENT_PAIR_BONUS * (
+                        cc.CO_OCCURRENCE_DECAY ** (distance - 1)
+                    )
                 if strength < cc.CO_OCCURRENCE_MIN_STRENGTH:
                     continue
                 left, right = sorted([token_a, token_b])
@@ -806,19 +948,9 @@ class MemoryEngine:
         candidate: Optional[CandidateScore],
         classification: MemoryClassification
     ) -> Tuple[bool, bool, str, float, int, float]:
-        """
-        EVIDENCE BEFORE MUTATION.
-
-        Mengembalikan:
-        (mutation_allowed, description_update_allowed, reason,
-         evidence_strength, support_count, contradiction_score)
-
-        Mencegah "evidence pollution": token C++/pointer masuk ke Token Profile,
-        Co-occurrence, dan Helper Description milik cluster Bisnis Kopi.
-        """
+        """EVIDENCE BEFORE MUTATION."""
         mut = CONFIG.mutation
 
-        # Topik baru selalu boleh dibuat (tidak ada cluster lama yang bisa tercemar).
         if classification == MemoryClassification.NEW_TOPIC or candidate is None:
             return (True, True, "new topic / no candidate", 0.0, 0, 0.0)
 
@@ -826,16 +958,12 @@ class MemoryEngine:
         support_count = candidate.support_count
         contradiction = candidate.contradiction_score
 
-        # 1. Kontradiksi tinggi memblokir mutasi walaupun skor akhir tinggi.
         if contradiction > mut.MUTATION_CONTRADICTION_BLOCK:
-            return (False, False,
-                    f"blocked: contradiction {contradiction:.2f} > {mut.MUTATION_CONTRADICTION_BLOCK:.2f}",
+            return (False, False, "blocked: contradiction",
                     evidence_strength, support_count, contradiction)
 
-        # 2. Continuation harus punya bukti cukup.
         if evidence_strength < mut.MIN_EVIDENCE_TO_MUTATE_TOPIC:
-            return (False, False,
-                    f"blocked: evidence {evidence_strength:.2f} < {mut.MIN_EVIDENCE_TO_MUTATE_TOPIC:.2f}",
+            return (False, False, "blocked: weak evidence",
                     evidence_strength, support_count, contradiction)
 
         if support_count < mut.MIN_SUPPORT_TO_MUTATE_TOPIC:
@@ -844,12 +972,9 @@ class MemoryEngine:
                 and candidate.continuity_score >= CONFIG.evidence.EVIDENCE_SUPPORT_THRESHOLD
             )
             if not continuity_only_ok:
-                return (False, False,
-                        f"blocked: support {support_count} < {mut.MIN_SUPPORT_TO_MUTATE_TOPIC}",
+                return (False, False, "blocked: low support",
                         evidence_strength, support_count, contradiction)
 
-        # 3. [ANTI-POLLUTION] Token low-information tidak membawa identitas topik.
-        # "Bagaimana itu?" tidak boleh memperkaya profil cluster apa pun.
         signal = retrieval.signal_profile
         quality_map = (signal.token_quality if signal else {}) or {}
         user_tokens = [
@@ -861,18 +986,12 @@ class MemoryEngine:
             if quality_map.get(t, TokenQuality.NORMAL) != TokenQuality.LOW_INFORMATION
         ]
         if user_tokens and not meaningful_tokens:
-            return (True, False,
-                    "fragment stored, topic profile untouched: only low-information tokens",
+            return (True, False, "only low-information tokens",
                     evidence_strength, support_count, contradiction)
 
-        # 4. Deskripsi adalah identitas manusia-readable -> butuh bukti lebih kuat.
         desc_allowed = evidence_strength >= mut.MIN_EVIDENCE_TO_UPDATE_DESCRIPTION
-        reason = "allowed" if desc_allowed else "allowed: description update held (evidence below description threshold)"
+        reason = "allowed" if desc_allowed else "allowed: description held"
         return (True, desc_allowed, reason, evidence_strength, support_count, contradiction)
-
-    # ==========================================
-    # [REASONING PURITY] CONTINUITY PURITY (Prioritas #1)
-    # ==========================================
 
     def _compute_turn_continuity(
         self,
@@ -881,35 +1000,13 @@ class MemoryEngine:
         top_candidate: Optional[CandidateScore],
         history_ratio: float,
     ) -> Tuple[float, List[str]]:
-        """
-        [REASONING PURITY — Prioritas #1]
-
-        Hitung CONTINUITY SCORE MURNI untuk turn ini.
-        BERBEDA dari CandidateScore.continuity_score (yang hanya satu komponen final_score).
-
-        Menjawab: "Seberapa kuat turn ini melanjutkan state aktif?"
-        - Bukan "Seberapa relevan kandidat secara keseluruhan"
-        - Bukan "Seberapa cocok token input dengan topik aktif"
-
-        Formula:
-            continuity = (
-                ACTIVE_TOPIC_OVERLAP_WEIGHT * user_overlap_ratio
-                + CONTINUITY_HISTORY_WEIGHT * history_ratio
-                + CONTINUITY_FRAGMENT_WEIGHT * active_frag_rel
-                - CONTINUITY_NOVELTY_PENALTY * novelty_ratio (jika > threshold)
-                - CONTINUITY_CONTRADICTION_PENALTY * contradiction_score (jika > threshold)
-            )
-
-        Returns:
-            (continuity_score, evidence_sources) — score dalam [0, 1]
-        """
+        """CONTINUITY SCORE MURNI. Bukan relevance kandidat."""
         cc = CONFIG.continuity
         ev = CONFIG.evidence
 
         if active_key is None or top_candidate is None:
             return 0.0, []
 
-        # 1. User overlap dengan active topic
         user_tokens = [
             t for t in re.findall(r'\b\w+\b', envelope.raw_text.lower())
             if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH
@@ -921,12 +1018,8 @@ class MemoryEngine:
             overlap_count = sum(1 for t in user_tokens if t in active_tokens)
             overlap_ratio = overlap_count / len(user_tokens)
 
-        # 2. History ratio — dari caller (hasil _calculate_active_state)
-        # Sudah dihitung, tinggal pakai
         hist = history_ratio if history_ratio else 0.0
 
-        # 3. Active fragment relationship strength
-        # Ambil fragment terakhir milik active key di session ini
         active_frag_rel = 0.0
         try:
             recent_frags = self.storage.get_fragment_metadata_by_key(active_key.key_id)
@@ -941,20 +1034,17 @@ class MemoryEngine:
         except Exception as e:
             logger.debug(f"Gagal mengambil active fragment relationship: {e}")
 
-        # 4. Novelty penalty — jika user sangat baru terhadap topik aktif
         novelty_ratio = 1.0 - overlap_ratio
         novelty_penalty = 0.0
         if novelty_ratio > CONFIG.topic_switch.NOVELTY_THRESHOLD:
             novelty_penalty = cc.CONTINUITY_NOVELTY_PENALTY * novelty_ratio
 
-        # 5. Contradiction penalty
         contradiction_penalty = 0.0
         if top_candidate.contradiction_score > ev.MAX_CONTRADICTION_SCORE:
             contradiction_penalty = (
                 cc.CONTINUITY_CONTRADICTION_PENALTY * top_candidate.contradiction_score
             )
 
-        # Hitung raw continuity
         raw = (
             cc.ACTIVE_TOPIC_OVERLAP_WEIGHT * overlap_ratio
             + cc.CONTINUITY_HISTORY_WEIGHT * hist
@@ -962,11 +1052,8 @@ class MemoryEngine:
             - novelty_penalty
             - contradiction_penalty
         )
-
-        # Clamp ke [0, 1]
         continuity = max(0.0, min(1.0, raw))
 
-        # Catat sumber bukti (untuk audit)
         sources = []
         if overlap_ratio >= 0.15:
             sources.append("overlap")
@@ -986,49 +1073,42 @@ class MemoryEngine:
         analysis: TurnAnalysisResult,
         retrieval: RetrievalResult
     ) -> str:
-        """
-        Ringkasan kemurnian reasoning untuk observability (field EngineResult.reasoning_purity_summary).
-        Menjawab: "Apakah skor yang dihasilkan konsisten secara semantik?"
-        """
+        """Ringkasan kemurnian reasoning untuk observability."""
         top = retrieval.candidates[0] if retrieval.candidates else None
         if top is None:
             return ""
-
         lines = [
             f"PURITY CHECK: {analysis.classification.value}",
-            f"  final_score (relevance)   : {top.final_score:.3f}",
-            f"  turn_continuity (persistence) : {analysis.turn_continuity_score:.3f}",
-            f"  Δ (harus ≠ 0 jika bukan continuation trivial) : "
-            f"{abs(top.final_score - analysis.turn_continuity_score):.3f}",
-            f"  evidence families          : {[f.value for f in top.evidence_families]}",
-            f"  family_support_count       : {top.family_support_count}",
-            f"  continuity sources         : {analysis.continuity_evidence_sources or '(none)'}",
+            f"  final_score      : {top.final_score:.3f}",
+            f"  turn_continuity  : {analysis.turn_continuity_score:.3f}",
+            f"  delta            : {abs(top.final_score - analysis.turn_continuity_score):.3f}",
+            f"  families         : {[f.value for f in top.evidence_families]}",
+            f"  family_count     : {top.family_support_count}",
+            f"  cont_sources     : {analysis.continuity_evidence_sources or '(none)'}",
         ]
         return "\n".join(lines)
 
-    def _make_decision(self, result: RetrievalResult, pending: Optional[PendingState]) -> EngineDecision:
-        """
-        Menerjemahkan hasil retrieval menjadi keputusan mesin.
-
-        [ASSOCIATIVE EVIDENCE LOCKING] Engine tidak boleh langsung percaya
-        kandidat tertinggi. Keputusan membawa alasan yang bisa diaudit.
-
-        [REASONING PURITY] Keputusan juga membawa family_support_count dan
-        evidence_families untuk audit independensi bukti.
-        """
+    def _make_decision(
+        self,
+        result: RetrievalResult,
+        pending: Optional[PendingState]
+    ) -> EngineDecision:
+        """Menerjemahkan hasil retrieval menjadi keputusan mesin."""
         if result.decision_type == DecisionType.AMBIGUOUS:
             top = result.candidates[0] if result.candidates else None
             return EngineDecision(
                 decision_type=DecisionType.AMBIGUOUS,
-                message=result.clarification_message or "Ambiguitas terdeteksi. Memerlukan klarifikasi.",
+                message=result.clarification_message or "Ambiguitas terdeteksi.",
                 decision_reason=result.analysis_notes,
                 family_support_count=top.family_support_count if top else 0,
                 evidence_families=top.evidence_families if top else [],
+                excluded_candidate_keys=result.excluded_candidate_keys,
+                continuation_intent=result.continuation_intent,
             )
 
-        # [EVIDENCE LOCKING] Dua state gagal-bukti dipertahankan apa adanya,
-        # TIDAK dilipat menjadi NO_MATCH.
-        if result.decision_type in (DecisionType.INSUFFICIENT_EVIDENCE, DecisionType.CONTRADICTORY_EVIDENCE):
+        if result.decision_type in (
+            DecisionType.INSUFFICIENT_EVIDENCE, DecisionType.CONTRADICTORY_EVIDENCE
+        ):
             top = result.candidates[0] if result.candidates else None
             return EngineDecision(
                 decision_type=result.decision_type,
@@ -1040,15 +1120,15 @@ class MemoryEngine:
                 decision_reason=result.analysis_notes,
                 family_support_count=top.family_support_count if top else 0,
                 evidence_families=top.evidence_families if top else [],
+                excluded_candidate_keys=result.excluded_candidate_keys,
+                continuation_intent=result.continuation_intent,
             )
-            
+
         if result.decision_type == DecisionType.CLEAR:
             selected = next(
                 (c for c in result.candidates if c.key_id == result.selected_key_id),
                 result.candidates[0] if result.candidates else None
             )
-
-            # Re-validasi di sisi Engine: jangan langsung percaya candidates[0].
             gate_decision, gate_reason = self._validate_candidate_evidence(selected)
             if gate_decision is not None:
                 return EngineDecision(
@@ -1061,6 +1141,8 @@ class MemoryEngine:
                     decision_reason=gate_reason,
                     family_support_count=selected.family_support_count if selected else 0,
                     evidence_families=selected.evidence_families if selected else [],
+                    excluded_candidate_keys=result.excluded_candidate_keys,
+                    continuation_intent=result.continuation_intent,
                 )
 
             return EngineDecision(
@@ -1075,35 +1157,23 @@ class MemoryEngine:
                 decision_reason=result.analysis_notes,
                 family_support_count=selected.family_support_count if selected else 0,
                 evidence_families=selected.evidence_families if selected else [],
+                excluded_candidate_keys=result.excluded_candidate_keys,
+                continuation_intent=result.continuation_intent,
             )
-            
+
         return EngineDecision(
             decision_type=DecisionType.NO_MATCH,
             message="Tidak ada memori relevan ditemukan.",
-            decision_reason=result.analysis_notes
+            decision_reason=result.analysis_notes,
+            excluded_candidate_keys=result.excluded_candidate_keys,
+            continuation_intent=result.continuation_intent,
         )
-
-    # ==========================================
-    # [REASONING PURITY] EVIDENCE FAMILY INFERENCE
-    # ==========================================
 
     def _infer_families_from_candidate(
         self,
         candidate: CandidateScore
     ) -> Tuple[int, List[EvidenceFamily], bool]:
-        """
-        [REASONING PURITY] Infer evidence families dari candidate.
-
-        Digunakan oleh _validate_candidate_evidence agar validation tidak gagal
-        ketika CandidateScore dibangun manual (seperti di test) tanpa mengisi
-        field-level family data.
-
-        Prioritas inferensi:
-        1. Jika field-level family data tersedia (family_support_count > 0) → pakai itu.
-        2. Else, infer dari evidence_profile.supporting_evidence_names via _SIGNAL_FAMILY.
-        3. Else, jika profile juga kosong → (0, [], False).
-        """
-        # 1. Cek field-level data dulu
+        """Infer evidence families. Robust terhadap candidate manual."""
         if candidate.family_support_count > 0:
             return (
                 candidate.family_support_count,
@@ -1111,7 +1181,6 @@ class MemoryEngine:
                 candidate.is_single_family_dominated,
             )
 
-        # 2. Fallback: infer dari evidence_profile
         if candidate.evidence_profile is None:
             return (0, [], False)
 
@@ -1121,40 +1190,23 @@ class MemoryEngine:
             return (0, [], False)
 
         family_set: set = set()
-
-        # 2a. Cek signal_to_family yang sudah di-populate retrieval
         signal_to_family = profile.signal_to_family or {}
         for name in supporting_names:
             if name in signal_to_family:
                 family_set.add(signal_to_family[name])
             else:
-                # 2b. Fallback: infer langsung dari nama sinyal
                 family = self._SIGNAL_FAMILY.get(name)
                 if family is not None:
                     family_set.add(family)
 
         evidence_families = sorted(family_set, key=lambda f: f.value)
-        family_support_count = len(evidence_families)
-
-        # Infer single-family domination
-        is_dominated = profile.is_single_signal_dominated
-
-        return (family_support_count, evidence_families, is_dominated)
+        return (len(evidence_families), evidence_families, profile.is_single_signal_dominated)
 
     def _validate_candidate_evidence(
         self,
         candidate: Optional[CandidateScore]
     ) -> Tuple[Optional[DecisionType], str]:
-        """
-        EVIDENCE VALIDATION di sisi Engine (lapis kedua setelah Retrieval).
-
-        Support cukup? Kontradiksi rendah? Confidence cukup?
-        Families cukup beragam?
-
-        [REASONING PURITY] Menggunakan _infer_families_from_candidate() agar
-        robust terhadap CandidateScore yang dibangun manual (e.g. di test)
-        tanpa field-level family data.
-        """
+        """EVIDENCE VALIDATION lapis kedua di Engine."""
         if candidate is None:
             return (None, "")
 
@@ -1162,11 +1214,8 @@ class MemoryEngine:
         ef = CONFIG.evidence_family
 
         if candidate.contradiction_score > ev.MAX_CONTRADICTION_SCORE:
-            return (
-                DecisionType.CONTRADICTORY_EVIDENCE,
-                f"Bukti kontradiktif pada '{candidate.title}' "
-                f"(contradiction={candidate.contradiction_score:.2f})."
-            )
+            return (DecisionType.CONTRADICTORY_EVIDENCE,
+                    f"Bukti kontradiktif pada '{candidate.title}'.")
 
         if candidate.support_count < ev.MIN_SUPPORTING_EVIDENCE:
             continuity_exemption = (
@@ -1174,54 +1223,43 @@ class MemoryEngine:
                 and candidate.continuity_score >= ev.EVIDENCE_SUPPORT_THRESHOLD
             )
             if not continuity_exemption:
-                return (
-                    DecisionType.INSUFFICIENT_EVIDENCE,
-                    f"Bukti pendukung tidak cukup pada '{candidate.title}' "
-                    f"(support={candidate.support_count})."
-                )
+                return (DecisionType.INSUFFICIENT_EVIDENCE,
+                        f"Bukti pendukung tidak cukup pada '{candidate.title}' "
+                        f"(support={candidate.support_count}).")
 
-        # [REASONING PURITY] Family count validation — dengan inference fallback.
-        family_support_count, evidence_families, _ = self._infer_families_from_candidate(candidate)
-
-        if family_support_count < ef.MIN_EVIDENCE_FAMILIES:
-            continuity_family_exempt = (
+        family_count, families, _ = self._infer_families_from_candidate(candidate)
+        if family_count < ef.MIN_EVIDENCE_FAMILIES:
+            exempt = (
                 ef.CONTINUITY_EXEMPT_FROM_FAMILY_CHECK
-                and EvidenceFamily.CONTEXTUAL in evidence_families
+                and EvidenceFamily.CONTEXTUAL in families
                 and candidate.continuity_score >= ev.EVIDENCE_SUPPORT_THRESHOLD
             )
-            if not continuity_family_exempt:
-                families_str = ",".join(f.value for f in evidence_families) or "none"
-                return (
-                    DecisionType.INSUFFICIENT_EVIDENCE,
-                    f"Keragaman bukti tidak cukup pada '{candidate.title}' "
-                    f"(families={family_support_count}, active=[{families_str}])."
-                )
+            if not exempt:
+                names = ",".join(f.value for f in families) or "none"
+                return (DecisionType.INSUFFICIENT_EVIDENCE,
+                        f"Keragaman bukti tidak cukup pada '{candidate.title}' "
+                        f"(families={family_count}, active=[{names}]).")
 
         if candidate.confidence < ev.MIN_ASSOCIATIVE_CONFIDENCE:
-            return (
-                DecisionType.INSUFFICIENT_EVIDENCE,
-                f"Confidence asosiatif tidak cukup pada '{candidate.title}' "
-                f"(confidence={candidate.confidence:.2f})."
-            )
+            return (DecisionType.INSUFFICIENT_EVIDENCE,
+                    f"Confidence asosiatif tidak cukup pada '{candidate.title}' "
+                    f"(confidence={candidate.confidence:.2f}).")
 
         return (None, "")
 
     def _handle_ambiguity(
-        self, 
-        envelope: InputEnvelope, 
-        result: RetrievalResult, 
-        existing: Optional[PendingState], 
+        self,
+        envelope: InputEnvelope,
+        result: RetrievalResult,
+        existing: Optional[PendingState],
         question: str,
-        decision_type: DecisionType = DecisionType.AMBIGUOUS
+        decision_type: DecisionType = DecisionType.AMBIGUOUS,
+        clarification: Optional[ClarificationAccumulation] = None,
+        trend_candidates: Optional[List[TrendCandidate]] = None,
     ) -> EngineResult:
-        """
-        [OVERHAUL] Clarification Round Lifecycle (Review Kedua).
-        Menangani increment round dan fallback jika MAX_CLARIFICATION_ROUNDS tercapai.
-
-        [EVIDENCE LOCKING] decision_type dapat berupa AMBIGUOUS,
-        INSUFFICIENT_EVIDENCE, atau CONTRADICTORY_EVIDENCE — ketiganya berbeda.
-        """
+        """Clarification Round Lifecycle. Pending BERKEMBANG."""
         top = result.candidates[0] if result.candidates else None
+        trend_candidates = trend_candidates or []
         decision_kwargs = dict(
             confidence=top.confidence if top else 0.0,
             support_count=top.support_count if top else 0,
@@ -1230,82 +1268,118 @@ class MemoryEngine:
             decision_reason=result.analysis_notes,
             family_support_count=top.family_support_count if top else 0,
             evidence_families=top.evidence_families if top else [],
+            excluded_candidate_keys=result.excluded_candidate_keys,
+            continuation_intent=result.continuation_intent,
+            trend_candidates=trend_candidates,
         )
 
         if existing and existing.status == PendingStatus.ACTIVE:
             round_num = existing.clarification_round + 1
+            self._persist_clarification_state(
+                existing, clarification, result, envelope, question
+            )
+
             if round_num > CONFIG.fast_memory.MAX_CLARIFICATION_ROUNDS:
                 existing.status = PendingStatus.EXPIRED
                 existing.last_updated_at = envelope.timestamp
                 with self.storage.transaction() as tx:
                     self.storage.save_pending_state(tx, existing)
-                fallback_msg = "Saya masih belum yakin, tapi mari kita lanjutkan. Silakan berikan detail yang lebih spesifik jika Anda ingin membahas topik tertentu."
+                fallback_msg = (
+                    "Saya masih belum yakin, tapi mari kita lanjutkan. "
+                    "Silakan berikan detail yang lebih spesifik jika Anda ingin "
+                    "membahas topik tertentu."
+                )
                 return EngineResult(
                     assistant_response=fallback_msg,
-                    decision=EngineDecision(decision_type=DecisionType.INSUFFICIENT, message=fallback_msg),
+                    decision=EngineDecision(
+                        decision_type=DecisionType.INSUFFICIENT, message=fallback_msg
+                    ),
                     persistence_status="PENDING_EXPIRED",
                     evidence_summary=result.evidence_summary,
-                    # [EVIDENCE LOCKING] Kandidat tetap disertakan untuk audit.
-                    candidates=result.candidates
+                    candidates=result.candidates,
+                    clarification_round=existing.clarification_round,
+                    clarification_history=list(existing.clarification_history or []),
+                    excluded_candidate_keys=list(existing.excluded_candidate_keys or []),
+                    continuation_intent=result.continuation_intent,
                 )
-            
+
             existing.clarification_round = round_num
             existing.last_updated_at = envelope.timestamp
-            existing.original_input = f"{existing.original_input} [CLARIFICATION: {envelope.raw_text}]"
             with self.storage.transaction() as tx:
                 self.storage.save_pending_state(tx, existing)
             return EngineResult(
                 assistant_response=question,
-                decision=EngineDecision(decision_type=decision_type, message=question, **decision_kwargs),
+                decision=EngineDecision(
+                    decision_type=decision_type, message=question, **decision_kwargs
+                ),
                 persistence_status="PENDING_UPDATED",
                 evidence_summary=result.evidence_summary,
-                # [EVIDENCE LOCKING] Kandidat tetap disertakan untuk audit.
-                candidates=result.candidates
+                candidates=result.candidates,
+                trend_candidates=trend_candidates,
+                clarification_round=round_num,
+                clarification_history=list(existing.clarification_history or []),
+                excluded_candidate_keys=list(existing.excluded_candidate_keys or []),
+                continuation_intent=result.continuation_intent,
             )
 
+        max_show = CONFIG.hierarchy.MAX_AMBIGUITY_CANDIDATES
+        shortlist = [c.key_id for c in result.candidates[:max_show]]
         new_pending = PendingState(
             pending_id=str(uuid.uuid4()),
             session_id=envelope.session_id,
             original_input=envelope.raw_text,
-            candidate_keys=[c.key_id for c in result.candidates[:3]],
+            candidate_keys=shortlist,
             candidate_scores={c.key_id: c.final_score for c in result.candidates},
             assistant_question=question,
             created_at=envelope.timestamp,
             status=PendingStatus.ACTIVE,
-            origin_session_id=envelope.session_id
-        )
-        
-        with self.storage.transaction() as tx:
-            self.storage.save_pending_state(tx, new_pending)
-            
-        return EngineResult(
-            assistant_response=question,
-            decision=EngineDecision(decision_type=decision_type, message=question, **decision_kwargs),
-            persistence_status="PENDING_CREATED",
-            evidence_summary=result.evidence_summary,
-            # [EVIDENCE LOCKING] Kandidat tetap disertakan untuk audit.
-            candidates=result.candidates
+            origin_session_id=envelope.session_id,
+            clarification_history=[],
+            combined_clarification_text=envelope.raw_text,
+            excluded_tokens=list(
+                result.signal_profile.excluded_tokens if result.signal_profile else []
+            ),
+            excluded_candidate_keys=list(result.excluded_candidate_keys or []),
+            candidate_history=[shortlist],
         )
 
-    def _reconstruct_memories(self, fragment_ids: List[str]) -> Tuple[List[dict], ReconstructionStatus]:
-        """
-        [OVERHAUL] Exact Reconstruction dengan Observability (Review Kedua).
-        Mengembalikan tuple (memories, status).
-        """
+        with self.storage.transaction() as tx:
+            self.storage.save_pending_state(tx, new_pending)
+
+        return EngineResult(
+            assistant_response=question,
+            decision=EngineDecision(
+                decision_type=decision_type, message=question, **decision_kwargs
+            ),
+            persistence_status="PENDING_CREATED",
+            evidence_summary=result.evidence_summary,
+            candidates=result.candidates,
+            trend_candidates=trend_candidates,
+            clarification_round=1,
+            clarification_history=[],
+            excluded_candidate_keys=list(new_pending.excluded_candidate_keys or []),
+            continuation_intent=result.continuation_intent,
+        )
+
+    def _reconstruct_memories(
+        self,
+        fragment_ids: List[str]
+    ) -> Tuple[List[dict], ReconstructionStatus]:
+        """Exact Reconstruction dengan Observability."""
         memories = []
         failed_count = 0
-        
+
         for fid in fragment_ids:
             frag_meta = self.storage.get_fragment(fid)
             if not frag_meta:
                 failed_count += 1
                 continue
-                
+
             payload = self.storage.get_exact_payload(frag_meta.payload_reference)
             if not payload:
                 failed_count += 1
                 continue
-                
+
             try:
                 exact_bytes = self.compressor.decompress(payload)
                 exact_text = exact_bytes.decode('utf-8')
@@ -1317,10 +1391,10 @@ class MemoryEngine:
                     'relevance_score': getattr(frag_meta, 'relevance_score', 0.0)
                 })
             except (DecompressionError, IntegrityError) as e:
-                logger.error(f"Gagal merekonstruksi memori persis untuk fragment {fid}: {e}")
+                logger.error(f"Gagal rekonstruksi fragment {fid}: {e}")
                 failed_count += 1
                 continue
-        
+
         total = len(fragment_ids)
         if total == 0:
             status = ReconstructionStatus.NO_MEMORY_REQUESTED
@@ -1330,82 +1404,461 @@ class MemoryEngine:
             status = ReconstructionStatus.PARTIAL_SUCCESS
         else:
             status = ReconstructionStatus.FULL_SUCCESS
-            
+
         return memories, status
 
-    def _simulate_generation(self, user_input: str, memories: List[dict], decision: EngineDecision) -> str:
+    def _simulate_generation(
+        self,
+        user_input: str,
+        memories: List[dict],
+        decision: EngineDecision
+    ) -> str:
         """Placeholder untuk LLM Generation (Fallback)."""
         if decision.decision_type == DecisionType.AMBIGUOUS:
             return decision.message or "Mohon maaf, bisa diperjelas maksud Anda?"
         return f"Response simulasi untuk: {user_input}"
 
+    def _extract_fragment_identity(
+        self,
+        raw_text: str,
+        meaningful_tokens: List[str],
+    ) -> Tuple[str, str]:
+        """[M3] Ekstrak fragment_key + helper SEBELUM kompresi."""
+        hc = CONFIG.hierarchy
+        hp = CONFIG.helper_propagation
+
+        if not meaningful_tokens:
+            return "", ""
+
+        key_tokens = meaningful_tokens[:hc.FRAGMENT_KEY_MAX_TOKENS]
+        fragment_key = " ".join(t.capitalize() for t in key_tokens)
+
+        helper_tokens = meaningful_tokens[:hp.MAX_HELPER_CONTRIBUTION_TOKENS]
+        helper = " ".join(helper_tokens)
+        if len(helper) > hc.MAX_FRAGMENT_HELPER_LENGTH:
+            helper = helper[:hc.MAX_FRAGMENT_HELPER_LENGTH].rstrip()
+
+        return fragment_key, helper
+
+    def _determine_fragment_placement(
+        self,
+        topic_key_id: str,
+        retrieval: RetrievalResult,
+        is_new_topic: bool,
+    ) -> FragmentPlacementResult:
+        """[M5] MAX_FRAGMENT_DEPTH adalah HARD BOUNDARY."""
+        hc = CONFIG.hierarchy
+
+        if is_new_topic:
+            return FragmentPlacementResult(
+                kind=FragmentPlacementKind.ROOT,
+                parent_fragment_id=None,
+                depth=0,
+                reason="new topic -> root fragment",
+            )
+
+        existing = self.storage.get_fragment_metadata_by_key(topic_key_id)
+        if not existing:
+            return FragmentPlacementResult(
+                kind=FragmentPlacementKind.ROOT,
+                parent_fragment_id=None,
+                depth=0,
+                reason="first fragment of topic -> root",
+            )
+
+        signal = retrieval.signal_profile
+        if signal is None or not signal.unique_terms:
+            root = next((f for f in existing if f.parent_fragment_id is None), None)
+            return FragmentPlacementResult(
+                kind=FragmentPlacementKind.SIBLING,
+                parent_fragment_id=root.fragment_id if root else None,
+                depth=min(hc.NEW_BRANCH_DEPTH, hc.MAX_FRAGMENT_DEPTH),
+                reason="no signal -> new sibling branch",
+            )
+
+        eligible = [f for f in existing if f.depth < hc.MAX_FRAGMENT_DEPTH]
+        scored = self.retrieval.score_parent_candidates(signal, eligible)
+        considered = [s.fragment_id for s in scored]
+
+        if not scored:
+            root = next((f for f in existing if f.parent_fragment_id is None), None)
+            return FragmentPlacementResult(
+                kind=FragmentPlacementKind.SIBLING,
+                parent_fragment_id=root.fragment_id if root else None,
+                depth=min(hc.NEW_BRANCH_DEPTH, hc.MAX_FRAGMENT_DEPTH),
+                considered_parent_ids=considered,
+                reason="no eligible parent -> sibling",
+            )
+
+        best = scored[0]
+        runner = scored[1] if len(scored) > 1 else None
+        runner_score = runner.final_score if runner else 0.0
+        margin = best.final_score - runner_score
+
+        strong_enough = best.final_score >= hc.MIN_PARENT_MATCH_SCORE
+        clear_enough = (runner is None) or (margin >= hc.MIN_CHILD_MATCH_MARGIN)
+
+        if strong_enough and clear_enough:
+            parent_depth = best.depth
+            if parent_depth + 1 <= hc.MAX_FRAGMENT_DEPTH:
+                return FragmentPlacementResult(
+                    kind=FragmentPlacementKind.CHILD,
+                    parent_fragment_id=best.fragment_id,
+                    depth=parent_depth + 1,
+                    match_score=best.final_score,
+                    runner_up_score=runner_score,
+                    margin=margin,
+                    considered_parent_ids=considered,
+                    reason=f"parent '{best.fragment_key}' score={best.final_score:.3f}",
+                )
+            return FragmentPlacementResult(
+                kind=FragmentPlacementKind.DEPTH_CAPPED_ATTACH,
+                parent_fragment_id=best.parent_fragment_id,
+                depth=parent_depth,
+                match_score=best.final_score,
+                runner_up_score=runner_score,
+                margin=margin,
+                depth_capped=True,
+                considered_parent_ids=considered,
+                reason=f"MAX_FRAGMENT_DEPTH={hc.MAX_FRAGMENT_DEPTH} reached",
+            )
+
+        root = next((f for f in existing if f.parent_fragment_id is None), None)
+        return FragmentPlacementResult(
+            kind=FragmentPlacementKind.SIBLING,
+            parent_fragment_id=root.fragment_id if root else None,
+            depth=min(hc.NEW_BRANCH_DEPTH, hc.MAX_FRAGMENT_DEPTH),
+            match_score=best.final_score,
+            runner_up_score=runner_score,
+            margin=margin,
+            considered_parent_ids=considered,
+            reason=f"no parent above threshold (best={best.final_score:.3f})",
+        )
+
+    def _helper_similarity(self, a: str, b: str) -> float:
+        """Jaccard-style token overlap untuk dedup kontribusi helper."""
+        min_len = CONFIG.helper_propagation.MIN_HELPER_TOKEN_LENGTH
+        ta = {t for t in re.findall(r'\b\w+\b', a.lower()) if len(t) >= min_len}
+        tb = {t for t in re.findall(r'\b\w+\b', b.lower()) if len(t) >= min_len}
+        if not ta or not tb:
+            return 0.0
+        return len(ta & tb) / len(ta | tb)
+
+    def _aggregate_helper(self, own: str, contributions: List[str]) -> str:
+        """Aggregated helper: own + ringkasan descendant. Bounded + dedup."""
+        hp = CONFIG.helper_propagation
+        own = (own or "").strip()
+        if not contributions:
+            return own[:hp.MAX_HELPER_LENGTH]
+
+        joined = hp.CONTRIBUTION_SEPARATOR.join(contributions)
+        if own:
+            aggregate = f"{own}. {hp.CHILD_SUMMARY_PREFIX}{joined}"
+        else:
+            aggregate = f"{hp.CHILD_SUMMARY_PREFIX}{joined}"
+        if len(aggregate) > hp.MAX_HELPER_LENGTH:
+            aggregate = aggregate[:hp.MAX_HELPER_LENGTH].rstrip()
+        return aggregate
+
+    def _propagate_helper(
+        self,
+        session,
+        new_fragment: FragmentMetadata,
+        topic_key_id: str,
+        analysis: TurnAnalysisResult,
+    ) -> HelperPropagationResult:
+        """
+        [M3] child -> parent -> ancestor -> root -> TopicKey.
+
+        DIPANGGIL SETELAH transaksi inti commit, sehingga semua pembacaan
+        (get_fragment_ancestors, get_topic_key) melihat data terkini dan
+        tidak menimpa update dengan nilai stale.
+        """
+        hp = CONFIG.helper_propagation
+        result = HelperPropagationResult()
+
+        if hp.REQUIRE_MUTATION_PERMISSION:
+            if not (analysis.mutation_allowed and analysis.description_update_allowed):
+                result.reason = "blocked by mutation gate"
+                return result
+
+        contribution = (
+            new_fragment.fragment_helper_description
+            or new_fragment.fragment_key
+            or ""
+        ).strip()
+        if not contribution:
+            result.reason = "no helper contribution"
+            return result
+
+        ancestors = self.storage.get_fragment_ancestors(
+            new_fragment.fragment_id, max_depth=hp.MAX_PROPAGATION_DEPTH
+        )
+        result.chain_depth = len(ancestors)
+
+        updated_ids: List[str] = []
+        added = 0
+        deduped = 0
+        truncated = False
+
+        for ancestor in ancestors:
+            if new_fragment.fragment_id in (ancestor.helper_contributor_ids or []):
+                deduped += 1
+                continue
+
+            evidence = list(ancestor.descendant_helper_evidence or [])
+            contributors = list(ancestor.helper_contributor_ids or [])
+
+            duplicate = any(
+                self._helper_similarity(contribution, existing)
+                >= hp.DEDUP_SIMILARITY_THRESHOLD
+                for existing in evidence
+            )
+            if duplicate:
+                deduped += 1
+                continue
+
+            if len(evidence) >= hp.MAX_DESCENDANT_EVIDENCE:
+                truncated = True
+                evidence = evidence[-(hp.MAX_DESCENDANT_EVIDENCE - 1):]
+
+            evidence.append(contribution)
+            contributors.append(new_fragment.fragment_id)
+
+            new_aggregate = self._aggregate_helper(
+                ancestor.fragment_helper_description, evidence
+            )
+            updated = ancestor.model_copy(update={
+                "descendant_helper_evidence": evidence,
+                "helper_contributor_ids": contributors,
+                "aggregated_helper_description": new_aggregate,
+            })
+            self.storage.update_fragment_helper(session, updated)
+            updated_ids.append(ancestor.fragment_id)
+            added += 1
+
+        if hp.PROPAGATE_TO_TOPIC_KEY:
+            key_obj = self.storage.get_topic_key(topic_key_id)
+            if key_obj is not None:
+                if new_fragment.fragment_id in (key_obj.helper_source_fragment_ids or []):
+                    deduped += 1
+                else:
+                    k_evidence: List[str] = []
+                    roots = self.storage.get_root_fragments_for_topic(topic_key_id)
+                    for r in roots:
+                        text = (
+                            r.aggregated_helper_description
+                            or r.fragment_helper_description
+                        )
+                        if text:
+                            k_evidence.append(text)
+
+                    bounded: List[str] = []
+                    for text in k_evidence:
+                        already = any(
+                            self._helper_similarity(text, b)
+                            >= hp.DEDUP_SIMILARITY_THRESHOLD
+                            for b in bounded
+                        )
+                        if already:
+                            continue
+                        bounded.append(text)
+                        if len(bounded) >= hp.MAX_DESCENDANT_EVIDENCE:
+                            truncated = True
+                            break
+
+                    sources = list(key_obj.helper_source_fragment_ids or [])
+                    sources.append(new_fragment.fragment_id)
+                    new_key_aggregate = self._aggregate_helper(
+                        key_obj.helper_description, bounded
+                    )
+                    updated_key = key_obj.model_copy(update={
+                        "aggregated_helper_description": new_key_aggregate,
+                        "helper_source_fragment_ids": sources,
+                        "updated_at": new_fragment.created_at,
+                    })
+                    self.storage.update_topic_helper(session, updated_key)
+                    result.updated_topic_key_id = topic_key_id
+                    added += 1
+
+        result.propagated = added > 0
+        result.updated_fragment_ids = updated_ids
+        result.contributions_added = added
+        result.contributions_deduplicated = deduped
+        result.truncated = truncated
+        result.reason = f"propagated {added} contribution(s)"
+        return result
+
+    def _detect_composite_sources(
+        self,
+        response: str,
+        retrieved_memories: List[RetrievedMemory],
+        primary_topic_key_id: Optional[str],
+    ) -> CompositeSourceAnalysis:
+        """[M4] Composite HANYA jika lintas topik dengan bukti beragam."""
+        cs = CONFIG.composite
+        analysis = CompositeSourceAnalysis(primary_topic_key_id=primary_topic_key_id)
+
+        if not retrieved_memories or not response:
+            analysis.reason = "no retrieved memory or empty response"
+            return analysis
+
+        resp_tokens = {
+            t for t in re.findall(r'\b\w+\b', response.lower())
+            if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH
+        }
+        if not resp_tokens:
+            analysis.reason = "no meaningful response tokens"
+            return analysis
+
+        sources: List[FragmentSourceContribution] = []
+
+        for mem in retrieved_memories:
+            frag = self.storage.get_fragment(mem.fragment_id)
+            if frag is None:
+                continue
+
+            frag_tokens = set(frag.token_profile.keys())
+            if not frag_tokens:
+                continue
+
+            overlap = resp_tokens.intersection(frag_tokens)
+            token_ratio = len(overlap) / len(frag_tokens)
+            if token_ratio < cs.MIN_SOURCE_TOKEN_OVERLAP:
+                continue
+
+            evidence_names: List[str] = ["token"]
+            families: Set[EvidenceFamily] = {EvidenceFamily.LEXICAL}
+
+            helper_text = (
+                frag.aggregated_helper_description
+                or frag.fragment_helper_description
+                or ""
+            )
+            helper_tokens = {
+                t for t in re.findall(r'\b\w+\b', helper_text.lower())
+                if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH
+            }
+            helper_ratio = 0.0
+            if helper_tokens:
+                helper_ratio = len(
+                    resp_tokens.intersection(helper_tokens)
+                ) / len(helper_tokens)
+                if helper_ratio >= cs.MIN_SOURCE_TOKEN_OVERLAP:
+                    evidence_names.append("helper")
+                    families.add(EvidenceFamily.CONTEXTUAL)
+
+            if mem.fragment_graph_score >= CONFIG.evidence.EVIDENCE_SUPPORT_THRESHOLD:
+                evidence_names.append("graph")
+                families.add(EvidenceFamily.RELATIONAL)
+
+            if len(families) < cs.MIN_SOURCE_EVIDENCE_FAMILIES:
+                continue
+
+            contribution = max(token_ratio, helper_ratio)
+            is_cross = (
+                primary_topic_key_id is not None
+                and frag.topic_key_id != primary_topic_key_id
+            )
+            if is_cross:
+                contribution = min(1.0, contribution + cs.CROSS_TOPIC_CONTRIBUTION_BONUS)
+
+            if contribution < cs.MIN_SOURCE_CONTRIBUTION_SCORE:
+                continue
+
+            sources.append(FragmentSourceContribution(
+                fragment_id=frag.fragment_id,
+                topic_key_id=frag.topic_key_id,
+                fragment_key=frag.fragment_key,
+                contribution_score=contribution,
+                supporting_evidence_names=evidence_names,
+                is_cross_topic=is_cross,
+            ))
+
+        sources.sort(key=lambda s: s.contribution_score, reverse=True)
+        sources = sources[:cs.MAX_SOURCE_FRAGMENTS]
+
+        distinct_topics = {s.topic_key_id for s in sources}
+        analysis.sources = sources
+        analysis.source_fragment_ids = [s.fragment_id for s in sources]
+        analysis.distinct_topic_count = len(distinct_topics)
+
+        if (len(sources) >= cs.MIN_DISTINCT_SOURCES
+                and any(s.is_cross_topic for s in sources)
+                and len(distinct_topics) >= 2):
+            analysis.is_composite = True
+            analysis.reason = f"{len(sources)} sources across {len(distinct_topics)} topics"
+        else:
+            analysis.is_composite = False
+            analysis.source_fragment_ids = []
+            analysis.reason = "not cross-key composite"
+        return analysis
+
     def _analyze_turn(
-        self, 
-        envelope: InputEnvelope, 
-        response: str, 
+        self,
+        envelope: InputEnvelope,
+        response: str,
         retrieval: RetrievalResult,
         current_active_id: Optional[str]
     ) -> TurnAnalysisResult:
-        """
-        [CRITICAL FIX] Generalized Topic Switch (Review Kedua).
-        Menghapus hardcoded domain_shift_triggers. Menggunakan heuristik struktural murni:
-        User Overlap + Retrieval Semantic Score + Short Probe Detection + Continuation Markers.
-
-        [EVIDENCE LOCKING] Hasil analisis kini juga membawa izin mutasi memori.
-
-        [REASONING PURITY] turn_continuity_score dihitung TERPISAH dari final_score
-        menggunakan formula murni (overlap + history + fragments - novelty - contradiction).
-        Nilai inilah yang akan dipersist sebagai relationship_strength fragment.
-        continuity_score (legacy) tetap diisi dengan final_score untuk backward compatibility.
-        """
+        """Topic Switch + Evidence Before Mutation + Continuity Purity."""
         if retrieval.selected_key_id:
             if retrieval.selected_key_id == current_active_id:
-                top_candidate = next((c for c in retrieval.candidates if c.key_id == current_active_id), None)
+                top_candidate = next(
+                    (c for c in retrieval.candidates if c.key_id == current_active_id),
+                    None
+                )
                 if top_candidate:
-                    # 1. Analisis USER INPUT untuk mendeteksi perpindahan domain yang eksplisit
-                    user_tokens = [t for t in re.findall(r'\b\w+\b', envelope.raw_text.lower()) if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH]
-                    
-                    # 2. Analisis COMBINED (User + AI Response) untuk konfirmasi kesinambungan (Sesuai Blueprint Layer 11)
+                    user_tokens = [
+                        t for t in re.findall(r'\b\w+\b', envelope.raw_text.lower())
+                        if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH
+                    ]
                     combined_text = f"{envelope.raw_text} {response}"
-                    combined_tokens = [t for t in re.findall(r'\b\w+\b', combined_text.lower()) if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH]
-                    
+                    combined_tokens = [
+                        t for t in re.findall(r'\b\w+\b', combined_text.lower())
+                        if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH
+                    ]
+
                     all_keys = self.storage.get_all_topic_keys()
-                    active_key = next((k for k in all_keys if k.key_id == current_active_id), None)
-                    
+                    active_key = next(
+                        (k for k in all_keys if k.key_id == current_active_id), None
+                    )
+
                     if active_key and user_tokens:
                         active_tokens = set(active_key.token_profile.keys())
-                        
-                        # Metrik User-Only (untuk mendeteksi abrupt shift)
-                        user_overlap_count = sum(1 for t in user_tokens if t in active_tokens)
-                        user_overlap_ratio = user_overlap_count / len(user_tokens)
-                        
-                        # Metrik Combined (untuk konfirmasi kontinuitas dari respons AI)
-                        combined_overlap_count = sum(1 for t in combined_tokens if t in active_tokens)
-                        combined_overlap_ratio = combined_overlap_count / len(combined_tokens) if combined_tokens else 0.0
-                        
-                        is_short_probe = len(user_tokens) <= 4
-                        continuation_markers = {"terus", "lalu", "kemudian", "jadi", "kalau", "nah", "selanjutnya", "berikutnya", "kembali"}
-                        has_continuation_marker = any(marker in user_tokens for marker in continuation_markers)
-                        
-                        # [FIX] Proxy semantik untuk PoC leksikal (mendeteksi domain yang sangat berbeda)
-                        # Karena PoC ini tidak menggunakan embedding, kita memerlukan indikator kebaruan kuat 
-                        # untuk membedakan "pertanyaan lanjutan pendek" dengan "perpindahan domain eksplisit" 
-                        # ketika keduanya memiliki user_overlap_ratio == 0.
-                        # [Batch E] Memakai class attribute agar sinkron dengan _check_pending_relevance.
-                        has_strong_novelty = any(
-                            trigger in user_tokens for trigger in self._STRONG_NOVELTY_INDICATORS
+                        user_overlap_count = sum(
+                            1 for t in user_tokens if t in active_tokens
                         )
-                        
-                        # GENERALIZED DECISION MATRIX
-                        # Jika user tidak memiliki overlap dengan topik aktif, DAN Retrieval Engine juga tidak menemukan bukti semantik (token/desc score rendah)
-                        if user_overlap_ratio < CONFIG.topic_switch.MIN_ACTIVE_TOPIC_OVERLAP and top_candidate.token_score < 0.1 and top_candidate.description_score < 0.1:
-                            # Jika ada indikator domain baru yang kuat, paksa NEW_TOPIC
+                        user_overlap_ratio = user_overlap_count / len(user_tokens)
+
+                        combined_overlap_count = sum(
+                            1 for t in combined_tokens if t in active_tokens
+                        )
+                        combined_overlap_ratio = (
+                            combined_overlap_count / len(combined_tokens)
+                            if combined_tokens else 0.0
+                        )
+
+                        is_short_probe = len(user_tokens) <= 4
+                        continuation_markers = {
+                            "terus", "lalu", "kemudian", "jadi", "kalau",
+                            "nah", "selanjutnya", "berikutnya", "kembali"
+                        }
+                        has_continuation_marker = any(
+                            marker in user_tokens for marker in continuation_markers
+                        )
+                        has_strong_novelty = any(
+                            trigger in user_tokens
+                            for trigger in self._STRONG_NOVELTY_INDICATORS
+                        )
+
+                        if (user_overlap_ratio < CONFIG.topic_switch.MIN_ACTIVE_TOPIC_OVERLAP
+                                and top_candidate.token_score < 0.1
+                                and top_candidate.description_score < 0.1):
                             if has_strong_novelty:
                                 classification = MemoryClassification.NEW_TOPIC
-                            # Jika ini adalah pertanyaan lanjutan yang pendek (probe) atau menggunakan kata sambung
                             elif is_short_probe or has_continuation_marker:
                                 classification = MemoryClassification.CONTINUE_TOPIC
-                            # Ini adalah perpindahan topik yang eksplisit dan substansial
                             else:
                                 classification = MemoryClassification.NEW_TOPIC
                         else:
@@ -1415,17 +1868,24 @@ class MemoryEngine:
                 else:
                     classification = MemoryClassification.CONTINUE_TOPIC
             else:
-                classification = MemoryClassification.REACTIVATE_TOPIC 
+                classification = MemoryClassification.REACTIVATE_TOPIC
         else:
-            classification = MemoryClassification.NEW_TOPIC 
-            
-        # [CRITICAL FIX] Jika klasifikasi adalah NEW_TOPIC, kita WAJIB memutus rantai dari retrieval.selected_key_id.
-        # Jika tidak, _persist_memory akan mengira ini adalah CONTINUE_TOPIC karena key_id tidak kosong.
+            classification = MemoryClassification.NEW_TOPIC
+
         active_key_for_fragment = retrieval.selected_key_id
         if classification == MemoryClassification.NEW_TOPIC:
             active_key_for_fragment = None
 
-        # [EVIDENCE LOCKING] EVIDENCE BEFORE MUTATION.
+        unresolved_continuation = False
+        if (retrieval.continuation_intent
+                and CONFIG.continuation.BLOCK_NEW_TOPIC_ON_CONTINUATION
+                and classification == MemoryClassification.NEW_TOPIC):
+            top_score = (
+                retrieval.candidates[0].final_score if retrieval.candidates else 0.0
+            )
+            if top_score < CONFIG.continuation.MIN_CONTINUATION_CANDIDATE_SCORE:
+                unresolved_continuation = True
+
         selected_candidate = next(
             (c for c in retrieval.candidates if c.key_id == active_key_for_fragment),
             None
@@ -1435,33 +1895,37 @@ class MemoryEngine:
             envelope, retrieval, selected_candidate, classification
         )
 
-        # [REASONING PURITY] Hitung turn_continuity_score murni.
-        # BERBEDA dari continuity_score (legacy) yang = final_score candidate.
-        # Nilai ini yang akan dipersist sebagai relationship_strength fragment.
         active_key_obj = None
         if active_key_for_fragment:
             all_keys = self.storage.get_all_topic_keys()
             active_key_obj = next(
-                (k for k in all_keys if k.key_id == active_key_for_fragment),
-                None
+                (k for k in all_keys if k.key_id == active_key_for_fragment), None
             )
 
-        if (classification in (MemoryClassification.CONTINUE_TOPIC, MemoryClassification.REACTIVATE_TOPIC)
-                and active_key_obj is not None and selected_candidate is not None):
-            # Ambil history_ratio dari active state calculation
+        if (classification in (MemoryClassification.CONTINUE_TOPIC,
+                               MemoryClassification.REACTIVATE_TOPIC)
+                and active_key_obj is not None
+                and selected_candidate is not None):
             _, history_ratio = self._calculate_active_state(envelope.session_id)
             turn_cont, cont_sources = self._compute_turn_continuity(
                 envelope, active_key_obj, selected_candidate, history_ratio
             )
         else:
             turn_cont = 0.0
-            cont_sources = ["new_topic"] if classification == MemoryClassification.NEW_TOPIC else []
-            
+            if classification == MemoryClassification.NEW_TOPIC:
+                cont_sources = ["new_topic"]
+            else:
+                cont_sources = []
+
+        state = self.storage.get_session_state(envelope.session_id)
+        active_fragment_id = state.active_fragment_id if state else None
+        active_depth = state.active_depth if state else 0
+
         return TurnAnalysisResult(
             classification=classification,
-            # [BACKWARD COMPAT] continuity_score (legacy) tetap diisi final_score
-            # untuk menjaga test lama yang memeriksa field ini.
-            continuity_score=retrieval.candidates[0].final_score if retrieval.candidates else 0.0,
+            continuity_score=(
+                retrieval.candidates[0].final_score if retrieval.candidates else 0.0
+            ),
             active_topic_key_id=active_key_for_fragment,
             evidence_strength=ev_strength,
             support_count=support_count,
@@ -1469,9 +1933,12 @@ class MemoryEngine:
             mutation_allowed=mutation_allowed,
             description_update_allowed=desc_allowed,
             mutation_reason=mutation_reason,
-            # [REASONING PURITY] turn_continuity_score murni — ini yang dipersist
             turn_continuity_score=turn_cont,
             continuity_evidence_sources=cont_sources,
+            continuation_intent=retrieval.continuation_intent,
+            unresolved_continuation=unresolved_continuation,
+            active_fragment_id=active_fragment_id,
+            active_depth=active_depth,
         )
 
     def _persist_memory(
@@ -1480,32 +1947,29 @@ class MemoryEngine:
         response: str,
         analysis: TurnAnalysisResult,
         retrieval: RetrievalResult,
-        old_active_id: Optional[str]
-    ):
+        old_active_id: Optional[str],
+        composite_analysis: Optional[CompositeSourceAnalysis] = None,
+    ) -> Tuple[Optional[str], Optional[FragmentPlacementResult], Optional[HelperPropagationResult]]:
         """
-        Layer 14 & 15: Transaksi Penyimpanan Memori (Fail-Closed).
+        Transaksi Penyimpanan Memori (Fail-Closed).
 
-        [EVIDENCE LOCKING] Mutasi profil topik HANYA dilakukan bila
-        analysis.mutation_allowed == True. Fragmen tetap disimpan agar
-        percakapan tidak hilang, tetapi cluster tidak tercemar.
+        URUTAN:
+            exact text -> extract identity -> compress
+            -> TX1: persist topic/payload/fragment/edges -> COMMIT
+            -> TX2: helper propagation
 
-        [REASONING PURITY] relationship_strength fragment diisi dari
-        analysis.turn_continuity_score (bukan final_score candidate).
+        Propagasi dipisah ke TX2 karena storage.get_topic_key() dan
+        get_fragment_ancestors() membuka session sendiri. Jika dijalankan
+        di TX1 yang belum commit, ia membaca nilai LAMA lalu menimpanya.
         """
         raw_content = f"User: {envelope.raw_text}\nAI: {response}"
-        try:
-            payload = self.compressor.compress(raw_content)
-        except Exception as e:
-            logger.error(f"Gagal kompresi: {e}")
-            return 
 
         raw_tokens = re.findall(r'\b\w+\b', envelope.raw_text.lower())
         new_tokens = [t for t in raw_tokens if len(t) >= CONFIG.signal.MIN_TOKEN_LENGTH]
-        token_counts = {}
+        token_counts: Dict[str, int] = {}
         for t in new_tokens:
             token_counts[t] = token_counts.get(t, 0) + 1
 
-        # [EVIDENCE LOCKING] Token low-information tidak boleh masuk profil topik.
         signal = retrieval.signal_profile
         quality_map = (signal.token_quality if signal else {}) or {}
         meaningful_tokens = [
@@ -1513,20 +1977,30 @@ class MemoryEngine:
             if quality_map.get(t, TokenQuality.NORMAL) != TokenQuality.LOW_INFORMATION
         ]
         profile_tokens = meaningful_tokens if meaningful_tokens else []
-        profile_counts = {}
+        profile_counts: Dict[str, int] = {}
         for t in profile_tokens:
             profile_counts[t] = profile_counts.get(t, 0) + 1
 
+        fragment_key, fragment_helper = self._extract_fragment_identity(
+            raw_content, meaningful_tokens
+        )
+
+        try:
+            payload = self.compressor.compress(raw_content)
+        except Exception as e:
+            logger.error(f"Gagal kompresi: {e}")
+            return None, None, None
+
         key_id = analysis.active_topic_key_id
         new_key = None
-        
+        is_new_topic = False
+
         if not key_id or analysis.classification == MemoryClassification.NEW_TOPIC:
-            key_id = str(uuid.uuid4()) 
-            # [CRITICAL FIX] Topic Title Quality (Review Kedua)
-            # Menghasilkan title dari representative tokens, bukan memotong string mentah.
+            key_id = str(uuid.uuid4())
+            is_new_topic = True
             title = " ".join(new_tokens[:3]).capitalize() if new_tokens else "Topik Baru"
             desc = " ".join(new_tokens[:15]).capitalize() if new_tokens else ""
-            
+
             new_key = TopicKey(
                 key_id=key_id,
                 title=title,
@@ -1536,59 +2010,65 @@ class MemoryEngine:
                 token_profile=token_counts,
                 co_occurrence_profile={},
                 created_at=envelope.timestamp,
-                updated_at=envelope.timestamp
+                updated_at=envelope.timestamp,
+                aggregated_helper_description=fragment_helper,
             )
             analysis.active_topic_key_id = key_id
         else:
             existing_keys = self.storage.get_all_topic_keys()
             existing_key = next((k for k in existing_keys if k.key_id == key_id), None)
             if existing_key:
-                # [EVIDENCE LOCKING] GERBANG MUTASI.
                 if analysis.mutation_allowed and profile_counts:
                     updated_profile = dict(existing_key.token_profile)
                     for t, count in profile_counts.items():
                         updated_profile[t] = updated_profile.get(t, 0) + count
                     existing_key.token_profile = updated_profile
-                    
-                    # [NEW] Update Co-occurrence Profile
-                    # [EVIDENCE LOCKING] Window co-occurrence agar selaras dengan retrieval.
+
                     updated_cooc = dict(existing_key.co_occurrence_profile)
                     for pair, count in self._build_window_pairs(profile_tokens).items():
                         updated_cooc[pair] = updated_cooc.get(pair, 0) + count
                     existing_key.co_occurrence_profile = updated_cooc
-                    
-                    # [NEW] Evolve Helper Description dengan batas (Review Kedua)
+
                     MAX_DESC_TOKENS = 50
                     current_desc_tokens = existing_key.helper_description.split()
-                    if analysis.description_update_allowed and len(current_desc_tokens) < MAX_DESC_TOKENS:
+                    if (analysis.description_update_allowed
+                            and len(current_desc_tokens) < MAX_DESC_TOKENS):
                         current_desc_lower = existing_key.helper_description.lower()
                         new_rep_tokens = []
                         for t in profile_tokens:
                             if t not in current_desc_lower and len(new_rep_tokens) < 3:
                                 new_rep_tokens.append(t)
                         if new_rep_tokens:
-                            existing_key.helper_description += f" | {' '.join(new_rep_tokens)}"
+                            existing_key.helper_description += (
+                                f" | {' '.join(new_rep_tokens)}"
+                            )
                 else:
-                    logger.info(
-                        f"EVIDENCE GATE: profil topik {key_id[:8]}... tidak dimutasi. "
-                        f"({analysis.mutation_reason})"
-                    )
-                    
+                    logger.info("EVIDENCE GATE: profil topik tidak dimutasi.")
+
                 existing_key.updated_at = envelope.timestamp
                 existing_key.activation_count += 1
-                
-                new_key = existing_key 
+                new_key = existing_key
 
-        # [CRITICAL FIX] True Fragment-Level Relevance Profiles
-        # Fragment kini memiliki profil token & co-occurrence independen miliknya sendiri.
-        # [EVIDENCE LOCKING] Fragment menyimpan window pairs agar query window dapat cocok.
         frag_cooc = self._build_window_pairs(new_tokens)
 
-        # [REASONING PURITY] relationship_strength diisi dari turn_continuity_score MURNI,
-        # bukan dari analysis.continuity_score (yang = final_score candidate).
-        # Ini memastikan fragment menyimpan nilai yang menjawab:
-        #   "Seberapa kuat turn ini melanjutkan state aktif?"
-        # bukan "Seberapa relevan kandidat secara keseluruhan?".
+        placement = self._determine_fragment_placement(
+            topic_key_id=key_id,
+            retrieval=retrieval,
+            is_new_topic=is_new_topic,
+        )
+
+        is_composite = bool(composite_analysis and composite_analysis.is_composite)
+        source_ids = (
+            list(composite_analysis.source_fragment_ids)
+            if is_composite and composite_analysis else []
+        )
+        if is_composite and composite_analysis:
+            source_topic_ids = sorted({
+                s.topic_key_id for s in composite_analysis.sources
+            })
+        else:
+            source_topic_ids = []
+
         fragment = FragmentMetadata(
             fragment_id=str(uuid.uuid4()),
             topic_key_id=key_id,
@@ -1599,49 +2079,58 @@ class MemoryEngine:
             content_hash=payload.checksum,
             token_profile=token_counts,
             co_occurrence_profile=frag_cooc,
-            relationship_strength=analysis.turn_continuity_score,  # ← KUNCI PERUBAHAN
+            relationship_strength=analysis.turn_continuity_score,
+            fragment_key=fragment_key,
+            fragment_helper_description=fragment_helper,
+            aggregated_helper_description=fragment_helper,
+            parent_fragment_id=placement.parent_fragment_id,
+            depth=placement.depth,
+            is_composite=is_composite,
+            source_fragment_ids=source_ids,
+            source_topic_key_ids=source_topic_ids,
         )
 
+        # ==========================================
+        # TX1: exact memory + topic + fragment + graph edges
+        # ==========================================
         try:
             with self.storage.transaction() as tx:
                 if new_key:
                     self.storage.save_topic_key(tx, new_key)
                 self.storage.save_payload(tx, payload)
                 self.storage.save_fragment(tx, fragment)
-                
-                # [OVERHAUL] Graph Reasoning: Fragment-to-Fragment Edge (Review Kedua)
+
                 if analysis.classification == MemoryClassification.CONTINUE_TOPIC:
                     frags = self.storage.get_fragment_metadata_by_key(key_id)
-                    # Cari fragment terakhir di sesi ini (selain yang baru saja dibuat)
-                    session_frags = [f for f in frags if f.session_id == envelope.session_id and f.fragment_id != fragment.fragment_id]
+                    session_frags = [
+                        f for f in frags
+                        if f.session_id == envelope.session_id
+                        and f.fragment_id != fragment.fragment_id
+                    ]
                     if session_frags:
                         session_frags.sort(key=lambda x: x.created_at, reverse=True)
                         last_frag_id = session_frags[0].fragment_id
-                        
                         edge = MemoryGraphEdge(
                             edge_id=str(uuid.uuid4()),
-                            source_node_id=last_frag_id, 
+                            source_node_id=last_frag_id,
                             target_node_id=fragment.fragment_id,
                             relationship_type=RelationshipType.CONTINUES,
-                            # [REASONING PURITY] edge strength juga dari turn_continuity_score
                             strength=analysis.turn_continuity_score,
                             created_at=envelope.timestamp
                         )
                         self.storage.save_graph_edge(tx, edge)
-                        
-                # [CRITICAL FIX] Real Cross-Session Graph Reasoning (Review Kedua)
-                # Jika topik diaktifkan kembali dari sesi yang berbeda, buat CROSS_SESSION_LINK
+
                 elif analysis.classification == MemoryClassification.REACTIVATE_TOPIC:
                     all_frags = self.storage.get_fragment_metadata_by_key(key_id)
-                    # Cari fragment terakhir dari topik ini secara GLOBAL (selain yang baru saja dibuat)
-                    global_frags = [f for f in all_frags if f.fragment_id != fragment.fragment_id]
+                    global_frags = [
+                        f for f in all_frags if f.fragment_id != fragment.fragment_id
+                    ]
                     if global_frags:
                         global_frags.sort(key=lambda x: x.created_at, reverse=True)
                         last_global_frag_id = global_frags[0].fragment_id
-                        
                         edge = MemoryGraphEdge(
                             edge_id=str(uuid.uuid4()),
-                            source_node_id=last_global_frag_id, 
+                            source_node_id=last_global_frag_id,
                             target_node_id=fragment.fragment_id,
                             relationship_type=RelationshipType.CROSS_SESSION_LINK,
                             strength=1.0,
@@ -1649,7 +2138,39 @@ class MemoryEngine:
                             created_at=envelope.timestamp
                         )
                         self.storage.save_graph_edge(tx, edge)
-                    
+
+                if is_composite and composite_analysis is not None:
+                    edge_type = RelationshipType(CONFIG.composite.COMPOSITE_EDGE_TYPE)
+                    for src in composite_analysis.sources:
+                        self.storage.save_graph_edge(tx, MemoryGraphEdge(
+                            edge_id=str(uuid.uuid4()),
+                            source_node_id=src.fragment_id,
+                            target_node_id=fragment.fragment_id,
+                            relationship_type=edge_type,
+                            strength=src.contribution_score,
+                            evidence="composite source",
+                            created_at=envelope.timestamp,
+                        ))
+
             logger.info(f"Memori tersimpan: Fragment {fragment.fragment_id}")
         except Exception as e:
             logger.critical(f"TRANSAKSI GAGAL: {e}")
+            return None, placement, None
+
+        # ==========================================
+        # TX2: helper propagation (setelah commit)
+        # ==========================================
+        propagation: Optional[HelperPropagationResult] = None
+        try:
+            with self.storage.transaction() as tx2:
+                propagation = self._propagate_helper(
+                    session=tx2,
+                    new_fragment=fragment,
+                    topic_key_id=key_id,
+                    analysis=analysis,
+                )
+        except Exception as e:
+            logger.error(f"HELPER PROPAGATION GAGAL: {e}")
+            propagation = None
+
+        return fragment.fragment_id, placement, propagation

@@ -399,6 +399,308 @@ class EvidenceFamilyConstants:
     SINGLE_FAMILY_DOMINANCE_RATIO: Final[float] = 0.80
 
 
+# ==========================================
+# [HIERARCHICAL FRAGMENT EXPANSION] GRUP BARU
+#
+# Fragment bukan lagi daftar datar. Ia adalah node hierarkis beridentitas
+# dengan parent, depth, fragment_key, dan helper description sendiri.
+#
+#     TOPIC KEY: Bisnis Kopi
+#         ├── [depth 0] Pembukaan Bisnis Kopi
+#         ├── [depth 1] Modal Bisnis Kopi
+#         │       ├── [depth 2] Modal Murah vs Mahal
+#         │       └── [depth 2] Harga Pasaran Terkini
+#         └── [depth 1] Lokasi Usaha
+#
+# Setiap constant di grup ini punya SATU penggunaan nyata dan SATU perilaku
+# yang bisa diuji. Tidak ada constant dekoratif.
+# ==========================================
+
+@dataclass(frozen=True)
+class FragmentHierarchyConstants:
+    """
+    [MEKANISME 3 + 5] Struktur hierarki fragment.
+
+    DEPTH SEMANTICS (DIKUNCI):
+        depth 0 = root / opening fragment
+        depth 1 = section utama
+        depth 2 = child spesifik
+        depth 3 = spesialisasi lebih dalam (hanya jika MAX_FRAGMENT_DEPTH >= 3)
+
+    MAX_FRAGMENT_DEPTH adalah HARD STRUCTURAL BOUNDARY, bukan saran.
+    """
+    # Batas kedalaman struktural. Default 2 sesuai spesifikasi:
+    #   root(0) → section(1) → child spesifik(2)
+    # Fragment baru TIDAK boleh menciptakan depth 3 dengan setting ini.
+    MAX_FRAGMENT_DEPTH: Final[int] = 2
+
+    # Skor minimum agar fragment baru ditempatkan sebagai CHILD dari parent itu.
+    # 0.30 berarti ~2 token overlap dari 4-5 token bermakna sudah cukup,
+    # sehingga "Modal kopi murah vs mahal" bisa masuk di bawah "Modal Bisnis Kopi".
+    MIN_PARENT_MATCH_SCORE: Final[float] = 0.30
+
+    # Margin minimum parent terbaik vs runner-up.
+    # Mencegah penempatan arbitrer ketika dua parent sama-sama cocok.
+    MIN_CHILD_MATCH_MARGIN: Final[float] = 0.08
+
+    # Depth untuk branch baru ketika TIDAK ada parent yang cukup kuat.
+    # Bukan 0 — root hanya untuk fragment pembuka TopicKey.
+    NEW_BRANCH_DEPTH: Final[int] = 1
+
+    # Maksimum fragment yang ditampilkan saat trend navigation di dalam TopicKey.
+    MAX_TREND_FRAGMENTS: Final[int] = 5
+
+    # Maksimum kandidat ambiguity yang ditampilkan ke user.
+    MAX_AMBIGUITY_CANDIDATES: Final[int] = 5
+
+    # Batas panjang fragment_helper_description (karakter).
+    # Helper adalah metadata retrieval, bukan salinan payload.
+    MAX_FRAGMENT_HELPER_LENGTH: Final[int] = 200
+
+    # Maksimum kontribusi child yang boleh masuk ke helper parent.
+    # Mencegah parent dengan 100 child membengkak tanpa batas.
+    MAX_PARENT_HELPER_CONTRIBUTIONS: Final[int] = 5
+
+    # Jumlah token maksimum untuk fragment_key (nama bagian).
+    FRAGMENT_KEY_MAX_TOKENS: Final[int] = 5
+
+    #Traversal ancestor maksimum saat propagasi (safety bound terhadap siklus).
+    MAX_ANCESTOR_TRAVERSAL: Final[int] = 10
+
+
+@dataclass(frozen=True)
+class TrendConstants:
+    """
+    [MEKANISME 5] Trend-based continuation selection.
+
+    Dipakai HANYA ketika user meminta continuation tanpa menunjuk bagian spesifik:
+        "Lanjutkan topik sebelumnya" → top-N TopicKey
+        "Lanjutkan bisnis kopi"      → top-N fragment depth tertentu
+
+    ATURAN UTAMA (DIKUNCI):
+        Jumlah anak / fragment adalah SINYAL TREND UTAMA.
+        Recency dan temporal hanya bukti TAMBAHAN.
+
+    Karena itu CHILD_COUNT_WEIGHT (0.60) > RECENCY + TEMPORAL (0.40).
+
+    PENTING: banyak child ≠ pasti maksud user.
+    Trend = navigation / candidate prioritization, BUKAN final topic identity.
+    """
+    # Batas kandidat yang ditampilkan.
+    TREND_TOPIC_LIMIT: Final[int] = 5
+    TREND_FRAGMENT_LIMIT: Final[int] = 5
+
+    # Bobot sinyal. Total = 1.00.
+    TREND_CHILD_COUNT_WEIGHT: Final[float] = 0.60   # SINYAL UTAMA
+    TREND_RECENCY_WEIGHT: Final[float] = 0.20       # bukti tambahan
+    TREND_TEMPORAL_WEIGHT: Final[float] = 0.20      # bukti tambahan
+
+    # Normalisasi child_count agar 500 child tidak mendominasi tak terbatas.
+    # child_count dinormalisasi: min(count, CAP) / CAP
+    TREND_COUNT_NORMALIZATION_CAP: Final[int] = 20
+
+    # Decay recency untuk trend (per hari).
+    TREND_RECENCY_DECAY_DAYS: Final[float] = 30.0
+
+    # Trend expansion HANYA jika current_depth < MAX_FRAGMENT_DEPTH.
+    # Setelah user memilih node di depth maksimum, tidak ada expansion lagi.
+    ENABLE_DEPTH_AWARE_EXPANSION: Final[bool] = True
+
+
+@dataclass(frozen=True)
+class ClarificationAccumulationConstants:
+    """
+    [MEKANISME 1] Recursive Ambiguity Context Accumulation.
+
+    Ambiguity bukan "satu pertanyaan → satu jawaban → evaluasi".
+    Ia adalah STATE YANG BERKEMBANG:
+
+        original_input + history[0] + history[1] + ... + negative evidence
+            ↓
+        re-rank → candidate set MENYEMPIT
+
+    Retrieval TIDAK boleh hanya menganalisis jawaban terakhir.
+    "yang rencana kopi" sendiri terlalu miskin bukti.
+    """
+    # Batas total karakter akumulasi (original + seluruh history).
+    CLARIFICATION_HISTORY_MAX_CHARS: Final[int] = 2000
+
+    # Maksimum entri history yang disimpan.
+    MAX_CLARIFICATION_HISTORY_ENTRIES: Final[int] = 10
+
+    # Kekuatan penalti untuk kandidat yang terkena negative evidence.
+    # "yang penting bukan topik cpp" → kandidat C++ dipenalti sebesar ini.
+    CLARIFICATION_NEGATION_WEIGHT: Final[float] = 0.50
+
+    # Bobot combined context (original + history) vs jawaban terakhir saja.
+    # 0.70 berarti konteks akumulatif mendominasi, jawaban terakhir melengkapi.
+    CLARIFICATION_COMBINED_INPUT_WEIGHT: Final[float] = 0.70
+
+    # Kandidat dengan skor di bawah ini DIELIMINASI dari shortlist berikutnya.
+    # Contoh: A=0.81, B=0.79, C=0.20 → C gugur, round berikut hanya A & B.
+    MIN_CANDIDATE_RETENTION_SCORE: Final[float] = 0.35
+
+    # Kandidat juga harus berada dalam rasio ini dari skor tertinggi.
+    # 0.60 × 0.81 = 0.486 → C=0.20 tetap gugur.
+    CANDIDATE_RETENTION_RATIO: Final[float] = 0.60
+
+    # Jumlah maksimum negation scope yang diproses per input.
+    MAX_NEGATION_SCOPES: Final[int] = 5
+
+    # Panjang maksimum target negation (token) setelah marker.
+    # "bukan topik cpp" → target ["cpp"], bukan seluruh sisa kalimat.
+    NEGATION_SCOPE_TOKEN_WINDOW: Final[int] = 3
+
+
+@dataclass(frozen=True)
+class ContinuationIntentConstants:
+    """
+    [MEKANISME 2] Continuation Intent Protection.
+
+    NO_MATCH + continuation intent ≠ NEW_TOPIC.
+
+    User yang berkata "lanjutkan topik ini" tetapi sistem belum tahu topiknya
+    TIDAK boleh dianggap membuka topik baru. Sistem masuk state
+    UNRESOLVED_CONTINUATION dan TIDAK mempersist fragment TopicKey baru.
+    """
+    # Marker multi-kata (dicocokkan sebagai substring pada raw text lower).
+    CONTINUATION_PHRASE_MARKERS: Final[frozenset] = frozenset({
+        "topik sebelumnya", "topik sebelumnya.", "pembahasan sebelumnya",
+        "yang kemarin", "pembahasan tadi", "yang kita bahas",
+        "topik ini", "topik tadi", "bahasan tadi", "yang tadi",
+        "lanjutkan topik", "lanjut topik", "lanjutkan pembahasan",
+        "lanjut pembahasan", "lanjutkan yang", "lanjut yang",
+        "kembali ke topik", "balik ke topik",
+    })
+
+    # Marker satu kata (dicocokkan sebagai token).
+    CONTINUATION_TOKEN_MARKERS: Final[frozenset] = frozenset({
+        "lanjutkan", "lanjut", "teruskan", "sambung",
+    })
+
+    # Skor minimum kandidat agar continuation dianggap TERSELESAIKAN.
+    # Di bawah ini → UNRESOLVED_CONTINUATION (bukan NEW_TOPIC).
+    MIN_CONTINUATION_CANDIDATE_SCORE: Final[float] = 0.25
+
+    # Margin antar kandidat continuation untuk memutuskan ambiguous vs clear.
+    CONTINUATION_AMBIGUITY_MARGIN: Final[float] = 0.05
+
+    # [GUARDRAIL UTAMA] Blokir pembuatan TopicKey baru saat continuation intent
+    # tidak terselesaikan. Ini inti Mekanisme 2.
+    BLOCK_NEW_TOPIC_ON_CONTINUATION: Final[bool] = True
+
+    # [MEKANISME 1] Explicit cancellation / topic switch.
+    # Input yang jelas memilih topik lain TIDAK boleh dipaksa menjadi
+    # jawaban ambiguity.
+    CANCELLATION_PHRASE_MARKERS: Final[frozenset] = frozenset({
+        "ganti topik", "lupakan saja", "tidak jadi", "bahas yang lain",
+        "bahas topik lain", "topik lain saja", "sudahlah", "skip saja",
+        "lewati saja", "batal saja", "gak jadi", "nggak jadi",
+    })
+
+    CANCELLATION_TOKEN_MARKERS: Final[frozenset] = frozenset({
+        "lupakan", "batal", "skip", "lewati", "cancel",
+    })
+
+    # Kekuatan bukti bahwa user benar-benar berpindah topik.
+    CANCELLATION_SWITCH_WEIGHT: Final[float] = 0.80
+
+
+@dataclass(frozen=True)
+class CompositeSourceConstants:
+    """
+    [MEKANISME 4] Cross-Key Composite Fragment.
+
+    Satu respons baru dapat berasal dari beberapa fragment/topik berbeda.
+
+    OWNERSHIP TETAP SATU:
+        primary_topic_key_id  (single foreign key, tidak dipecah)
+        + source_fragment_ids (N sumber)
+        + N graph edges       (REFERENCES / RELATED_TO)
+
+    BUKAN dual primary TopicKey — itu akan merusak foreign-key ownership.
+    """
+    # Skor minimum agar sebuah fragment dianggap BERKONTRIBUSI.
+    MIN_SOURCE_CONTRIBUTION_SCORE: Final[float] = 0.35
+
+    # Minimal berapa sumber berbeda agar disebut composite.
+    MIN_DISTINCT_SOURCES: Final[int] = 2
+
+    # Maksimum sumber yang dicatat (mencegah ledger membengkak).
+    MAX_SOURCE_FRAGMENTS: Final[int] = 5
+
+    # [KUNCI ANTI-FALSE-COMPOSITE] Sumber harus didukung >= 2 keluarga bukti.
+    # Token overlap saja TIDAK cukup — kalau tidak, semua fragment bertema
+    # "kopi" akan otomatis saling menjadi source.
+    MIN_SOURCE_EVIDENCE_FAMILIES: Final[int] = 2
+
+    # Overlap token minimum sebagai salah satu bukti kontribusi.
+    MIN_SOURCE_TOKEN_OVERLAP: Final[float] = 0.25
+
+    # Bonus kontribusi jika sumber berasal dari TopicKey berbeda.
+    CROSS_TOPIC_CONTRIBUTION_BONUS: Final[float] = 0.15
+
+    # Tipe edge yang dibuat dari sumber ke fragment composite.
+    COMPOSITE_EDGE_TYPE: Final[str] = "REFERENCES"
+
+
+@dataclass(frozen=True)
+class HelperPropagationConstants:
+    """
+    [MEKANISME 3] Hierarchical Helper Aggregation.
+
+    Alur:
+        RAW FRAGMENT TEXT
+            → EXTRACT OWN HELPER   (SEBELUM kompresi)
+            → PERSIST EXACT PAYLOAD (lossless)
+            → ATTACH TO HIERARCHY
+            → AGGREGATE CHILD HELPER INTO PARENT
+            → PROPAGATE UPWARD
+            → REPEAT UNTIL ROOT
+            → UPDATE TOPIC KEY HELPER
+
+    YANG NAIK BUKAN SELURUH ISI CHILD.
+    Yang naik: representasi ringkas, terkontrol, deduplicated.
+
+    ❌ parent.helper += child.helper  (tanpa batas → metadata pollution)
+    ✅ parent.aggregated = own + selected representative child evidence
+    """
+    # Batas panjang aggregated helper (karakter).
+    MAX_HELPER_LENGTH: Final[int] = 240
+
+    # Maksimum entri descendant evidence per node.
+    MAX_DESCENDANT_EVIDENCE: Final[int] = 5
+
+    # Ambang kemiripan untuk menganggap dua helper contribution DUPLIKAT.
+    # Jaccard-style token overlap. 0.75 = 75% token sama → dianggap duplikat.
+    # Mencegah "modal kopi murah", "modal kopi murah terbaru",
+    # "modal kopi murah terbaru 2026" menumpuk sebagai 3 entri terpisah.
+    DEDUP_SIMILARITY_THRESHOLD: Final[float] = 0.75
+
+    # Batas rantai propagasi (safety terhadap siklus / hierarki sangat dalam).
+    MAX_PROPAGATION_DEPTH: Final[int] = 5
+
+    # Panjang token minimum yang boleh masuk helper.
+    MIN_HELPER_TOKEN_LENGTH: Final[int] = 3
+
+    # Maksimum token per kontribusi child (ringkas, bukan paragraf).
+    MAX_HELPER_CONTRIBUTION_TOKENS: Final[int] = 12
+
+    # Apakah propagasi mencapai TopicKey.helper_description.
+    PROPAGATE_TO_TOPIC_KEY: Final[bool] = True
+
+    # [GUARDRAIL] Propagasi TUNDUK pada mutation gate.
+    # Input low-information ("Bagaimana itu?") tidak boleh mengubah helper
+    # parent maupun TopicKey. Ini menjaga invariant test_evidence_7.
+    REQUIRE_MUTATION_PERMISSION: Final[bool] = True
+
+    # Prefix untuk bagian agregat agar manusia bisa membedakan own vs warisan.
+    CHILD_SUMMARY_PREFIX: Final[str] = "Mencakup: "
+
+    # Pemisah antar kontribusi child dalam aggregated helper.
+    CONTRIBUTION_SEPARATOR: Final[str] = "; "
+
+
 @dataclass(frozen=True)
 class HF_CMConfig:
     """Global Configuration Aggregator."""
@@ -425,5 +727,12 @@ class HF_CMConfig:
     token_quality: Final[TokenQualityConstants] = TokenQualityConstants()
     # [REASONING PURITY] Grup pengendali independensi bukti
     evidence_family: Final[EvidenceFamilyConstants] = EvidenceFamilyConstants()
+    # [HIERARCHICAL FRAGMENT EXPANSION] Grup pengendali 5 mekanisme baru
+    hierarchy: Final[FragmentHierarchyConstants] = FragmentHierarchyConstants()
+    trend: Final[TrendConstants] = TrendConstants()
+    clarification: Final[ClarificationAccumulationConstants] = ClarificationAccumulationConstants()
+    continuation: Final[ContinuationIntentConstants] = ContinuationIntentConstants()
+    composite: Final[CompositeSourceConstants] = CompositeSourceConstants()
+    helper_propagation: Final[HelperPropagationConstants] = HelperPropagationConstants()
 
 CONFIG: Final[HF_CMConfig] = HF_CMConfig()
