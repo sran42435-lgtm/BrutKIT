@@ -28,11 +28,27 @@ Keterkaitan dengan Batch 2 (fragment_identity.py):
   sebagai FALLBACK ketika fragment_identity tidak tersedia
   (misalnya pada test yang memanggil langsung dengan RetrievalResult
   tanpa fragment_identity).
+
+[BATCH 11] TOP-DOWN HIERARCHICAL TRAVERSAL
+  Algoritma determine_placement diubah dari:
+      ALL ELIGIBLE NODES → GLOBAL SCORE → BEST NODE
+  menjadi:
+      ROOT
+          ↓
+      DIRECT CHILDREN LEVEL 1 → BEST LEVEL-1 BRANCH
+          ↓
+      DIRECT CHILDREN OF SELECTED BRANCH → BEST LEVEL-2 BRANCH
+          ↓
+      ... (lanjut sampai MAX_DEPTH atau tidak ada match kuat)
+
+  Ini mengunci perilaku bahwa branch depth 1 HARUS dipilih terlebih
+  dahulu sebelum fragment depth 2 boleh dipertimbangkan. Descendant
+  di branch lain TIDAK BOLEH mencuri fragment secara global.
 """
 
 import logging
 import re
-from typing import List, Optional, Dict, Set
+from typing import List, Optional, Dict, Set, Tuple
 
 from config import CONFIG
 from models import (
@@ -62,6 +78,8 @@ class FragmentHierarchyManager:
       - Method ini TIDAK mengubah state (pure decision function).
       - Semua writes dilakukan oleh caller (memory_engine._persist_memory).
       - MAX_FRAGMENT_DEPTH adalah invariant yang DITEGAKKAN, bukan saran.
+
+    [BATCH 11] Algoritma placement sekarang top-down traversal.
     """
 
     def __init__(self, storage):
@@ -81,13 +99,19 @@ class FragmentHierarchyManager:
         """
         Tentukan placement fragment baru.
 
-        Alur:
+        [BATCH 11] Alur baru (top-down traversal):
             1. new topic? -> ROOT depth 0
             2. topic existing tapi belum ada fragment? -> ROOT depth 0
-            3. Ada signal (fragment_identity atau retrieval)? -> score parents
-            4. Parent terbaik >= threshold + margin? -> CHILD
-               - tapi jika parent sudah di MAX_DEPTH? -> DEPTH_CAPPED_ATTACH
-            5. Tidak ada parent cukup kuat? -> SIBLING
+            3. Tidak ada signal? -> SIBLING dari root
+            4. Top-down traversal:
+                a. Ambil ROOT (depth 0)
+                b. Loop:
+                   i.   current_depth >= MAX? -> DEPTH_CAPPED_ATTACH
+                   ii.  ambil direct children current_parent
+                   iii. jika tidak ada -> CHILD dari current_parent
+                   iv.  score hanya antar sibling di level ini
+                   v.   jika tidak ada match kuat -> SIBLING
+                   vi.  jika ada match kuat -> descend ke branch terpilih
 
         Args:
             topic_key_id: ID TopicKey target
@@ -122,7 +146,7 @@ class FragmentHierarchyManager:
         # Case 2: Tidak ada signal sama sekali -> SIBLING dari root
         signal_terms = self._extract_signal_terms(fragment_identity, retrieval)
         if not signal_terms:
-            root = next((f for f in existing if f.parent_fragment_id is None), None)
+            root = self._get_root_fragment(existing)
             return FragmentPlacementResult(
                 kind=FragmentPlacementKind.SIBLING,
                 parent_fragment_id=root.fragment_id if root else None,
@@ -130,85 +154,252 @@ class FragmentHierarchyManager:
                 reason="no signal -> new sibling branch",
             )
 
-        # Case 3: Scoring parent candidates
-        eligible = [f for f in existing if f.depth < hc.MAX_FRAGMENT_DEPTH]
+        # Case 3: [BATCH 11] Top-down hierarchical traversal
+        root = self._get_root_fragment(existing)
+
+        if root is None:
+            # Defensive: topik existing tapi tidak ada root (shouldn't happen).
+            # Recovery: buat root baru.
+            return FragmentPlacementResult(
+                kind=FragmentPlacementKind.ROOT,
+                parent_fragment_id=None,
+                depth=0,
+                reason="existing topic has no valid root -> root recovery",
+            )
+
+        # Audit trail: setiap fragment yang pernah di-score dicatat per-level.
+        considered_parent_ids: List[str] = []
+        current_parent = root
+
+        # Safety: hard limit on iteration count (defensive against cycles).
+        max_iterations = hc.MAX_FRAGMENT_DEPTH + 2
+        iteration = 0
+
+        while iteration < max_iterations:
+            iteration += 1
+            current_depth = current_parent.depth
+
+            # --------------------------------------------------------------
+            # A. MAX DEPTH sudah tercapai
+            # --------------------------------------------------------------
+            #
+            # Fragment baru tidak boleh menjadi child dari current_parent
+            # karena itu akan menciptakan depth = MAX + 1.
+            #
+            # Fallback: DEPTH_CAPPED_ATTACH sebagai sibling dari current_parent.
+            #
+            if current_depth >= hc.MAX_FRAGMENT_DEPTH:
+                return FragmentPlacementResult(
+                    kind=FragmentPlacementKind.DEPTH_CAPPED_ATTACH,
+                    parent_fragment_id=current_parent.parent_fragment_id,
+                    depth=current_depth,
+                    match_score=0.0,
+                    runner_up_score=0.0,
+                    margin=0.0,
+                    depth_capped=True,
+                    considered_parent_ids=considered_parent_ids,
+                    reason=(
+                        f"MAX_FRAGMENT_DEPTH={hc.MAX_FRAGMENT_DEPTH} reached "
+                        f"at '{current_parent.fragment_key}' -> attach as sibling"
+                    ),
+                )
+
+            # --------------------------------------------------------------
+            # B. Ambil hanya anak langsung dari current_parent
+            # --------------------------------------------------------------
+            children = self._get_direct_children(
+                existing, current_parent.fragment_id
+            )
+
+            # --------------------------------------------------------------
+            # C. Belum ada child -> fragment baru jadi child pertama
+            # --------------------------------------------------------------
+            if not children:
+                return FragmentPlacementResult(
+                    kind=FragmentPlacementKind.CHILD,
+                    parent_fragment_id=current_parent.fragment_id,
+                    depth=current_depth + 1,
+                    considered_parent_ids=considered_parent_ids,
+                    reason=(
+                        f"no children under '{current_parent.fragment_key}' "
+                        f"-> first child"
+                    ),
+                )
+
+            # --------------------------------------------------------------
+            # D. Score HANYA sibling pada level ini
+            # --------------------------------------------------------------
+            best, runner, scored, is_strong = self._select_best_at_level(
+                signal_terms=signal_terms,
+                candidates=children,
+                fragment_identity=fragment_identity,
+            )
+
+            # Audit: catat semua kandidat yang dipertimbangkan di level ini.
+            considered_parent_ids.extend(s.fragment_id for s in scored)
+
+            # --------------------------------------------------------------
+            # E. Tidak ada match kuat -> SIBLING dari current_parent
+            # --------------------------------------------------------------
+            if not is_strong or best is None:
+                best_score = best.final_score if best else 0.0
+                runner_score = (
+                    runner.final_score if runner is not None else 0.0
+                )
+                margin = best_score - runner_score
+
+                return FragmentPlacementResult(
+                    kind=FragmentPlacementKind.SIBLING,
+                    parent_fragment_id=current_parent.fragment_id,
+                    depth=current_depth + 1,
+                    match_score=best_score,
+                    runner_up_score=runner_score,
+                    margin=margin,
+                    considered_parent_ids=considered_parent_ids,
+                    reason=(
+                        f"no strong match among direct children of "
+                        f"'{current_parent.fragment_key}' -> new sibling branch"
+                    ),
+                )
+
+            # --------------------------------------------------------------
+            # F. Match kuat -> descend ke branch terpilih
+            # --------------------------------------------------------------
+            next_parent = next(
+                (f for f in children if f.fragment_id == best.fragment_id),
+                None,
+            )
+
+            # Defensive: seharusnya tidak terjadi (best berasal dari children).
+            if next_parent is None:
+                return FragmentPlacementResult(
+                    kind=FragmentPlacementKind.SIBLING,
+                    parent_fragment_id=root.fragment_id,
+                    depth=min(hc.NEW_BRANCH_DEPTH, hc.MAX_FRAGMENT_DEPTH),
+                    considered_parent_ids=considered_parent_ids,
+                    reason=(
+                        "selected hierarchy candidate not found "
+                        "-> root sibling fallback"
+                    ),
+                )
+
+            current_parent = next_parent
+
+        # Safety net: kalau loop tidak pernah return (tidak mungkin dengan
+        # max_iterations guard, tapi defensive).
+        return FragmentPlacementResult(
+            kind=FragmentPlacementKind.SIBLING,
+            parent_fragment_id=root.fragment_id,
+            depth=min(hc.NEW_BRANCH_DEPTH, hc.MAX_FRAGMENT_DEPTH),
+            considered_parent_ids=considered_parent_ids,
+            reason="iteration guard hit -> root sibling fallback",
+        )
+
+    # ==========================================
+    # [BATCH 11] TRAVERSAL HELPERS
+    # ==========================================
+
+    def _get_root_fragment(
+        self,
+        fragments: List[FragmentMetadata],
+    ) -> Optional[FragmentMetadata]:
+        """
+        Ambil root fragment dari list fragment.
+
+        Root didefinisikan sebagai fragment dengan:
+            parent_fragment_id is None
+            depth == 0
+
+        Fallback jika tidak ada dengan depth 0:
+            fragment dengan parent_fragment_id is None (any depth).
+
+        Returns None jika tidak ada fragment tanpa parent sama sekali.
+        """
+        for fragment in fragments:
+            if (
+                fragment.parent_fragment_id is None
+                and (fragment.depth or 0) == 0
+            ):
+                return fragment
+
+        # Fallback: fragment tanpa parent (meski depth mungkin != 0)
+        for fragment in fragments:
+            if fragment.parent_fragment_id is None:
+                return fragment
+
+        return None
+
+    def _get_direct_children(
+        self,
+        fragments: List[FragmentMetadata],
+        parent_fragment_id: str,
+    ) -> List[FragmentMetadata]:
+        """
+        Ambil hanya anak langsung dari satu parent.
+
+        TIDAK mengambil:
+            - sibling dari parent
+            - descendant lebih dalam
+            - fragment dari branch lain
+
+        Ini yang memastikan traversal benar-benar per-branch.
+        """
+        return [
+            fragment
+            for fragment in fragments
+            if fragment.parent_fragment_id == parent_fragment_id
+        ]
+
+    def _select_best_at_level(
+        self,
+        signal_terms: Set[str],
+        candidates: List[FragmentMetadata],
+        fragment_identity: Optional[FragmentIdentity],
+    ) -> Tuple[
+        Optional[FragmentCandidateScore],
+        Optional[FragmentCandidateScore],
+        List[FragmentCandidateScore],
+        bool,
+    ]:
+        """
+        Score kandidat HANYA dalam satu level sibling.
+
+        Returns tuple:
+            (best, runner_up, scored_list, is_strong_match)
+
+        is_strong_match = True jika:
+            - best.final_score >= MIN_PARENT_MATCH_SCORE
+            - (runner_up is None) OR
+              (best.final_score - runner_up.final_score >= MIN_CHILD_MATCH_MARGIN)
+
+        Margin dibandingkan dengan runner_up DI LEVEL YANG SAMA,
+        bukan dengan fragment di branch lain. Ini yang membuat
+        "Modal Murah vs Mahal" bisa menang meskipun "Lokasi" punya
+        skor global lebih rendah tapi ada di branch berbeda.
+        """
+        if not candidates:
+            return None, None, [], False
+
         scored = self.score_parent_candidates(
             signal_terms=signal_terms,
-            candidates=eligible,
+            candidates=candidates,
             fragment_identity=fragment_identity,
         )
-        considered = [s.fragment_id for s in scored]
 
         if not scored:
-            # Tidak ada eligible parent (semua sudah di MAX_DEPTH)
-            root = next((f for f in existing if f.parent_fragment_id is None), None)
-            return FragmentPlacementResult(
-                kind=FragmentPlacementKind.SIBLING,
-                parent_fragment_id=root.fragment_id if root else None,
-                depth=min(hc.NEW_BRANCH_DEPTH, hc.MAX_FRAGMENT_DEPTH),
-                considered_parent_ids=considered,
-                reason="no eligible parent (all at MAX_DEPTH) -> sibling",
-            )
+            return None, None, [], False
 
         best = scored[0]
         runner = scored[1] if len(scored) > 1 else None
         runner_score = runner.final_score if runner else 0.0
         margin = best.final_score - runner_score
 
+        hc = CONFIG.hierarchy
         strong_enough = best.final_score >= hc.MIN_PARENT_MATCH_SCORE
         clear_enough = (runner is None) or (margin >= hc.MIN_CHILD_MATCH_MARGIN)
+        is_strong = strong_enough and clear_enough
 
-        if strong_enough and clear_enough:
-            parent_depth = best.depth
-            if parent_depth + 1 <= hc.MAX_FRAGMENT_DEPTH:
-                # Normal: CHILD di depth parent + 1
-                return FragmentPlacementResult(
-                    kind=FragmentPlacementKind.CHILD,
-                    parent_fragment_id=best.fragment_id,
-                    depth=parent_depth + 1,
-                    match_score=best.final_score,
-                    runner_up_score=runner_score,
-                    margin=margin,
-                    considered_parent_ids=considered,
-                    reason=(
-                        f"parent '{best.fragment_key}' "
-                        f"score={best.final_score:.3f} margin={margin:.3f}"
-                    ),
-                )
-            else:
-                # DEPTH_CAPPED_ATTACH: parent terbaik sudah di MAX_DEPTH
-                # jangan ciptakan depth+1, attach di depth yang sama
-                return FragmentPlacementResult(
-                    kind=FragmentPlacementKind.DEPTH_CAPPED_ATTACH,
-                    parent_fragment_id=best.parent_fragment_id,
-                    depth=parent_depth,
-                    match_score=best.final_score,
-                    runner_up_score=runner_score,
-                    margin=margin,
-                    depth_capped=True,
-                    considered_parent_ids=considered,
-                    reason=(
-                        f"MAX_FRAGMENT_DEPTH={hc.MAX_FRAGMENT_DEPTH} reached; "
-                        f"attached as sibling of '{best.fragment_key}'"
-                    ),
-                )
-
-        # Tidak ada parent cukup kuat -> SIBLING baru
-        root = next((f for f in existing if f.parent_fragment_id is None), None)
-        return FragmentPlacementResult(
-            kind=FragmentPlacementKind.SIBLING,
-            parent_fragment_id=root.fragment_id if root else None,
-            depth=min(hc.NEW_BRANCH_DEPTH, hc.MAX_FRAGMENT_DEPTH),
-            match_score=best.final_score,
-            runner_up_score=runner_score,
-            margin=margin,
-            considered_parent_ids=considered,
-            reason=(
-                f"no parent above MIN_PARENT_MATCH_SCORE="
-                f"{hc.MIN_PARENT_MATCH_SCORE:.2f} "
-                f"(best={best.final_score:.3f}) -> new branch"
-            ),
-        )
+        return best, runner, scored, is_strong
 
     # ==========================================
     # SIGNAL EXTRACTION
