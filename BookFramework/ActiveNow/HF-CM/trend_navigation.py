@@ -36,6 +36,27 @@ Formula trend_score (sinkron dengan storage.py):
 
     dengan normalized_child_count = min(count, CAP) / CAP
 
+[BATCH 9] MODE B EXTENSION untuk CLEAR decisions
+    Sebelumnya: trend hanya aktif jika decision ∈ {AMBIGUOUS, UNRESOLVED, INSUFFICIENT}
+    Sekarang: trend Mode B juga aktif ketika:
+        - decision = CLEAR
+        - selected_key_id ada (topic jelas)
+        - continuation_intent = True
+        - user belum specify branch
+
+    Contoh: "Lanjutkan bisnis kopi"
+        → Decision CLEAR (Bisnis Kopi terpilih)
+        → continuation_intent = True (ada marker "lanjutkan")
+        → selected_key_id = "bisnis_kopi"
+        → Trigger Mode B: tampilkan top-N fragments sebagai hint
+          "Beberapa bagian aktif:
+           1. Modal Bisnis Kopi (12 children)
+           2. Lokasi Usaha (8 children)
+           ..."
+
+    Ini tidak mengubah keputusan retrieval (CLEAR tetap CLEAR),
+    hanya menyediakan navigation hint ke user.
+
 Flow dalam memory_engine:
     _resolve_trend_candidates(envelope, ...) ->
         self.trend_navigator.resolve_trend_candidates(...)
@@ -69,7 +90,12 @@ class TrendNavigator:
         - Returns list TrendCandidate, bisa kosong.
         - Trend hanya relevan saat:
             * continuation intent terdeteksi
-            * decision type AMBIGUOUS / UNRESOLVED_CONTINUATION / INSUFFICIENT_EVIDENCE
+            * decision type ∈ {AMBIGUOUS, UNRESOLVED_CONTINUATION,
+              INSUFFICIENT_EVIDENCE} ATAU (CLEAR + selected_key_id)
+
+    [BATCH 9] Mode B sekarang juga aktif untuk CLEAR decisions dengan
+    continuation intent, menyediakan navigation hints untuk user yang
+    meminta lanjut tapi belum specify subtopik.
     """
 
     def __init__(self, storage: MemoryStorage, retrieval_engine):
@@ -90,30 +116,44 @@ class TrendNavigator:
         """
         Tentukan trend candidates untuk navigasi.
 
-        Dipanggil oleh memory_engine saat:
-            - continuation_intent = True
-            - decision_type adalah salah satu dari {AMBIGUOUS, UNRESOLVED_CONTINUATION,
-              INSUFFICIENT_EVIDENCE}
+        Dipanggil oleh memory_engine saat continuation intent terdeteksi.
 
         Mode A (topik belum jelas):
-            Ambil top-N TopicKey, recompute temporal dengan activity density.
+            Trigger: decision ∈ {AMBIGUOUS, UNRESOLVED_CONTINUATION, INSUFFICIENT_EVIDENCE}
+                     dan selected_key_id is None
+            Action: Ambil top-N TopicKey, recompute temporal dengan activity density.
 
         Mode B (topik jelas, bagian belum):
-            Ambil top-N fragments di depth tertentu, recompute temporal.
+            Trigger: decision ∈ {AMBIGUOUS, UNRESOLVED_CONTINUATION, INSUFFICIENT_EVIDENCE, CLEAR}
+                     dan selected_key_id ada
+                     dan continuation_intent = True
+            Action: Ambil top-N fragments di depth tertentu, recompute temporal.
 
-        Returns list kosong jika tidak ada continuation intent, decision sudah CLEAR,
-        atau depth limit tercapai.
+        [BATCH 9] Mode B sekarang juga aktif untuk CLEAR decisions:
+            jika selected_key_id ada + continuation intent, tetap tampilkan
+            fragment trend sebagai navigation hint.
+
+        Returns list kosong jika tidak ada continuation intent, decision CLEAR
+        tanpa selected_key_id, atau depth limit tercapai.
         """
         # Guard: hanya aktif untuk continuation intent
         if not retrieval.continuation_intent:
             return []
 
-        # Guard: hanya untuk decision types tertentu
-        if decision.decision_type not in (
+        # [BATCH 9] Guard yang diperluas:
+        # OLD: hanya AMBIGUOUS / UNRESOLVED / INSUFFICIENT
+        # NEW: termasuk CLEAR dengan selected_key_id
+        is_decision_eligible = decision.decision_type in (
             DecisionType.AMBIGUOUS,
             DecisionType.UNRESOLVED_CONTINUATION,
             DecisionType.INSUFFICIENT_EVIDENCE,
-        ):
+        )
+        is_clear_with_topic = (
+            decision.decision_type == DecisionType.CLEAR
+            and retrieval.selected_key_id is not None
+        )
+
+        if not (is_decision_eligible or is_clear_with_topic):
             return []
 
         # Resolve temporal range dari signal

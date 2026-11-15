@@ -54,6 +54,32 @@ Trend Navigation dipindahkan ke trend_navigation.py.
 TrendNavigator mengelola Mode A (TopicKey trend) dan Mode B (Fragment
 trend), dengan perbaikan Prioritas 4: temporal score berbasis activity
 density (bukan binary match).
+
+[REFACTOR BATCH 7]
+Helper Propagation dipisahkan menjadi dua gate:
+  1. Structural Gate (selalu lolos untuk fragment valid)
+  2. Quality Gate (cek substansi: tidak kosong, tidak pure noise)
+Mutation permission tetap berlaku untuk TopicProfile/CoOccurrence/OwnHelper,
+tetapi TIDAK memblokir propagasi structural child->parent->TopicKey.
+
+[REFACTOR BATCH 8]
+Composite Memory Analyzer dengan dynamic cross-memory source discovery.
+Discovery mencari kandidat dari GLOBAL memory lintas TopicKey yang
+BELUM terwakili di retrieval, lalu merge dengan retrieved memories.
+Prevent false composite dari weak overlap via MIN_SOURCE_EVIDENCE_FAMILIES=2.
+
+[REFACTOR BATCH 9]
+Trend Navigation Mode B diperluas untuk CLEAR decisions:
+  selected_key_id + continuation_intent + CLEAR
+  -> trigger fragment trend sebagai navigation hint
+Tidak mengubah decision (CLEAR tetap CLEAR), hanya menyediakan
+observability fragment branches untuk user.
+
+[REFACTOR BATCH 10 - FINAL]
+Observability cleanup: TurnAnalysisResult.continuity_score sekarang
+berisi PURE continuity (turn_cont), bukan final_score kandidat.
+Field bernama "continuity" = nilai continuity murni.
+final_score tetap dapat diakses via retrieval.candidates[0].final_score.
 """
 
 import logging
@@ -1378,7 +1404,21 @@ class MemoryEngine:
         retrieval: RetrievalResult,
         current_active_id: Optional[str]
     ) -> TurnAnalysisResult:
-        """Topic Switch + Evidence Before Mutation + Continuity Purity."""
+        """
+        Topic Switch + Evidence Before Mutation + Continuity Purity.
+
+        [BATCH 10] OBSERVABILITY CLEANUP:
+            TurnAnalysisResult.continuity_score sekarang diisi dengan
+            turn_cont (pure continuity value), bukan final_score kandidat.
+
+            Sebelumnya: continuity_score = candidates[0].final_score
+            Sekarang  : continuity_score = turn_cont (same as turn_continuity_score)
+
+            Field bernama "continuity" = nilai continuity murni.
+            final_score kandidat tetap tersedia via retrieval.candidates[0].final_score.
+
+            Ini menghilangkan semantic confusion di observability layer.
+        """
         if retrieval.selected_key_id:
             if retrieval.selected_key_id == current_active_id:
                 top_candidate = next(
@@ -1500,9 +1540,11 @@ class MemoryEngine:
 
         return TurnAnalysisResult(
             classification=classification,
-            continuity_score=(
-                retrieval.candidates[0].final_score if retrieval.candidates else 0.0
-            ),
+            # [BATCH 10] continuity_score sekarang = pure continuity (turn_cont).
+            # Sebelumnya: retrieval.candidates[0].final_score (relevance value).
+            # Field bernama "continuity" = nilai continuity murni.
+            # final_score kandidat tetap tersedia via retrieval.candidates[0].final_score.
+            continuity_score=turn_cont,
             active_topic_key_id=active_key_for_fragment,
             evidence_strength=ev_strength,
             support_count=support_count,

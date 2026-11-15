@@ -2,27 +2,45 @@
 helper_propagation.py
 Helper Description Propagation (Mekanisme 3).
 
-Tanggung jawab:
-- Propagasi helper description dari child ke parent, ancestor, root, TopicKey
-- Deduplikasi kontribusi (Jaccard similarity)
-- Bounded length (MAX_HELPER_LENGTH)
-- Bounded evidence count (MAX_DESCENDANT_EVIDENCE)
-- Guard: tunduk pada mutation gate (REQUIRE_MUTATION_PERMISSION)
+[REFACTOR BATCH 7]
+Pemisahan dua gate:
+  1. STRUCTURAL GATE (selalu lolos jika fragment berhasil disimpan)
+     - Child helper boleh naik ke parent
+     - Parent aggregate boleh bertambah
+     - TopicKey aggregate boleh berkembang
+  2. QUALITY GATE (cek substansi)
+     - Helper tidak boleh kosong
+     - Helper tidak boleh pure low-information noise
+     - Helper tidak boleh duplikat persis
+
+Ini berbeda dengan:
+  PROBABILISTIC MUTATION GATE (memory_engine._compute_mutation_permissions)
+     - token_profile tidak boleh tercemar
+     - co_occurrence_profile tidak boleh tercemar
+     - helper_description (own identity) tidak boleh tercemar
 
 Prinsip kunci:
-    YANG NAIK: representasi ringkas, terkontrol, deduplicated.
-    YANG TIDAK NAIK: entire payload, raw text.
+    FRAGMENT BERHASIL DISIMPAN
+        ↓
+    HELPER STRUKTURAL TETAP NAIK
+        ↓
+    ANTI-POLLUTION TETAP BEKERJA UNTUK PROFILE
 
-    Child helper -> Parent aggregate -> Ancestor -> Root -> TopicKey aggregate.
+Alur propagasi:
+    Child fragment
+        ↓ extract helper
+    Parent fragment
+        ↓ aggregate descendant evidence
+    Ancestor fragments
+        ↓ propagate upward
+    Root fragment
+        ↓
+    TopicKey.aggregated_helper_description
 
-    DIPANGGIL SETELAH TX1 commit, bukan di dalam transaksi inti.
-    Alasannya: storage.get_topic_key() / get_fragment_ancestors() membuka
-    session sendiri. Jika dipanggil di dalam transaksi yang belum commit,
-    ia membaca nilai LAMA lalu menimpanya kembali (stale-read overwrite).
-
-Flow dalam memory_engine:
-    TX1: commit fragment + edges
-    TX2: self.helper_propagator.propagate(session, fragment, key_id, analysis)
+DIPANGGIL SETELAH TX1 commit, bukan di dalam transaksi inti.
+Alasannya: storage.get_topic_key() / get_fragment_ancestors() membuka
+session sendiri. Jika dipanggil di dalam transaksi yang belum commit,
+ia membaca nilai LAMA lalu menimpanya kembali (stale-read overwrite).
 """
 
 import logging
@@ -50,10 +68,9 @@ class HelperPropagationManager:
         - Method propagate() TIDAK membuka transaksi sendiri.
           Ia menerima session dari caller yang sudah membuka TX2.
         - propagate() mengembalikan HelperPropagationResult untuk observability.
-        - Jika mutation gate memblokir (low-info input),
-          propagasi di-skip dan result.reason = "blocked by mutation gate".
-        - Jika fragment tidak punya kontribusi helper,
-          result.reason = "no helper contribution".
+        - [BATCH 7] Quality gate terpisah dari mutation permission.
+          Fragment yang valid = helper strukturalnya naik,
+          terlepas dari apakah mutation permission di-grant.
     """
 
     def __init__(self, storage):
@@ -73,27 +90,28 @@ class HelperPropagationManager:
         """
         Propagasi helper dari fragment baru ke ancestor dan TopicKey.
 
-        Alur:
-            1. Check mutation gate (jika REQUIRE_MUTATION_PERMISSION).
+        [BATCH 7] Alur:
+            1. QUALITY GATE: cek helper fragment layak propagate.
             2. Extract contribution dari fragment (helper atau key).
             3. Fetch ancestors via storage.get_fragment_ancestors.
             4. Update setiap ancestor: dedup, bound, aggregate.
             5. Update TopicKey dari root fragments: dedup, bound, aggregate.
             6. Return HelperPropagationResult (observability).
+
+        TIDAK ADA mutation permission check di sini.
+        Itu sudah di-handle di TX1 (profile update).
+        Structural propagation = hak setiap fragment yang tersimpan.
         """
         hp = CONFIG.helper_propagation
         result = HelperPropagationResult()
 
-        # Guard: mutation gate
-        if hp.REQUIRE_MUTATION_PERMISSION:
-            if not (analysis.mutation_allowed and analysis.description_update_allowed):
-                result.reason = "blocked by mutation gate"
-                return result
-
         # Extract kontribusi dari fragment baru.
         contribution = self._extract_contribution(new_fragment)
-        if not contribution:
-            result.reason = "no helper contribution"
+
+        # [BATCH 7] QUALITY GATE: cek substansi, bukan mutation permission.
+        quality_check, quality_reason = self._quality_gate_check(contribution)
+        if not quality_check:
+            result.reason = f"quality gate rejected: {quality_reason}"
             return result
 
         # Ambil ancestors.
@@ -138,7 +156,7 @@ class HelperPropagationManager:
         if added > 0:
             result.reason = f"propagated {added} contribution(s)"
         else:
-            result.reason = "no new contribution"
+            result.reason = "no new contribution (already present or duplicate)"
 
         return result
 
@@ -153,16 +171,66 @@ class HelperPropagationManager:
         Prioritas:
             1. fragment_helper_description (own helper)
             2. fragment_key (fallback)
-            3. "" jika keduanya kosong
+            3. aggregated_helper_description (fallback terakhir)
+            4. "" jika semuanya kosong
 
         Strip whitespace, return trimmed string.
         """
         text = (
             fragment.fragment_helper_description
             or fragment.fragment_key
+            or fragment.aggregated_helper_description
             or ""
         )
         return text.strip()
+
+    # ==========================================
+    # [BATCH 7] QUALITY GATE
+    # ==========================================
+
+    def _quality_gate_check(self, contribution: str) -> tuple:
+        """
+        [BATCH 7] Quality gate untuk structural propagation.
+
+        Returns: (passed: bool, reason: str)
+
+        Checks:
+            1. Contribution tidak boleh kosong
+            2. Contribution harus punya minimal substance (token count)
+            3. Contribution tidak boleh pure low-information noise
+
+        BERBEDA dengan mutation permission di memory_engine:
+            - Mutation permission: "bolehkah topic profile berubah?"
+            - Quality gate: "apakah helper ini layak naik ke parent?"
+
+        Fragment yang TIDAK lolos quality gate tetap disimpan,
+        tapi helper-nya tidak propagate (misal: "Bagaimana itu?"
+        → fragment tersimpan tapi tidak jadi bagian cerita parent).
+        """
+        hp = CONFIG.helper_propagation
+
+        if not contribution:
+            return False, "no helper contribution"
+
+        # Extract meaningful tokens
+        min_len = hp.MIN_HELPER_TOKEN_LENGTH
+        raw_tokens = re.findall(r'\b\w+\b', contribution.lower())
+        meaningful = [t for t in raw_tokens if len(t) >= min_len]
+
+        if not meaningful:
+            return False, "no meaningful tokens in contribution"
+
+        # Check low-information ratio
+        from config import CONFIG as cfg
+        low_info_set = cfg.token_quality.LOW_INFORMATION_TOKENS
+        low_info_count = sum(1 for t in meaningful if t in low_info_set)
+        low_info_ratio = low_info_count / len(meaningful) if meaningful else 1.0
+
+        # Jika > 80% low-information, tolak
+        if low_info_ratio > 0.8:
+            return False, f"too much low-information ({low_info_ratio:.2f})"
+
+        return True, "quality gate passed"
 
     # ==========================================
     # ANCESTOR PROPAGATION
@@ -182,7 +250,7 @@ class HelperPropagationManager:
             - Cek apakah sudah berkontribusi (dedup by fragment_id).
             - Cek similaritas dengan evidence existing (Jaccard dedup).
             - Jika evidence penuh -> truncate (keep terbaru).
-            - Append contribution + contributor.
+            - Append kontribusi + contributor.
             - Rebuild aggregated_helper_description.
             - Update fragment via storage.update_fragment_helper.
 
