@@ -17,6 +17,16 @@ melakukan SQL langsung.
 
 CHILD COUNT adalah DERIVED value (COUNT(parent_fragment_id == X)),
 bukan kolom yang disimpan — sesuai spesifikasi butir 1.3.
+
+[BATCH F Part 2] GRAPH NODE TYPE MIGRATION + ASSOCIATION QUERIES
+GraphEdgeDB sekarang memiliki kolom source_node_type & target_node_type
+(VARCHAR, nullable). Migration additive otomatis ditambahkan ke DB existing.
+4 query baru untuk association engine:
+    - get_topic_association_edges
+    - get_fragment_association_edges
+    - get_association_targets
+    - get_cross_topic_association_candidates
+Backward compat: kolom nullable, query existing tidak terpengaruh.
 """
 
 import json
@@ -29,7 +39,7 @@ from typing import Optional, List, Dict, Set, Tuple
 
 from sqlalchemy import (
     create_engine, Column, String, DateTime, Float, Integer, 
-    LargeBinary, JSON, ForeignKey, Index, Boolean, func, inspect, text
+    LargeBinary, JSON, ForeignKey, Index, Boolean, func, inspect, text, or_
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
 from sqlalchemy.exc import SQLAlchemyError
@@ -158,6 +168,20 @@ class FragmentDB(Base):
     payload = relationship("PayloadDB", lazy="joined") # Joined hanya jika diminta eksplisit
 
 class GraphEdgeDB(Base):
+    """
+    Hubungan antar node dalam graf memori.
+
+    [BATCH F Part 2] Ditambahkan kolom node_type untuk membedakan
+    apakah node adalah TopicKey atau Fragment.
+
+    Backward compat:
+        - Kolom nullable (VARCHAR) — existing rows akan punya NULL
+        - Query association baru memperlakukan NULL sebagai "tipe tidak diketahui"
+        - Call-sites existing (save_graph_edge tanpa node_type) tetap jalan
+
+    Index ditambahkan pada (source_node_type, source_node_id) dan
+    (target_node_type, target_node_id) agar query association cepat.
+    """
     __tablename__ = "graph_edges"
     id = Column(String, primary_key=True)
     # [NEW] Renamed dari source_id/target_id agar eksplisit node-based
@@ -169,6 +193,19 @@ class GraphEdgeDB(Base):
     strength = Column(Float, default=1.0)
     evidence = Column(String, default="")
     created_at = Column(DateTime, nullable=False)
+    # [BATCH F Part 2] Explicit node type (nullable untuk backward compat).
+    # Nilai adalah string dari GraphNodeType enum ("TOPIC_KEY" atau "FRAGMENT")
+    # atau None untuk edge legacy.
+    source_node_type = Column(String, nullable=True)
+    target_node_type = Column(String, nullable=True)
+
+    __table_args__ = (
+        # Index untuk query association by node type.
+        Index('idx_edge_source_type', 'source_node_type', 'source_node_id'),
+        Index('idx_edge_target_type', 'target_node_type', 'target_node_id'),
+        # Index untuk relationship type filter.
+        Index('idx_edge_rel_type', 'relationship_type'),
+    )
 
 class PendingStateDB(Base):
     __tablename__ = "pending_states"
@@ -257,6 +294,9 @@ class MemoryStorage:
 
         Kolom JSON ditambahkan sebagai TEXT (SQLite menyimpan JSON sebagai TEXT),
         sehingga kompatibel dengan tipe SQLAlchemy JSON yang sudah dipakai.
+
+        [BATCH F Part 2] Menambahkan migration untuk graph_edges node_type
+        dan index association baru.
         """
         expected_columns: Dict[str, Dict[str, str]] = {
             "fragments": {
@@ -281,11 +321,20 @@ class MemoryStorage:
                 "excluded_tokens": "TEXT",
                 "candidate_history": "TEXT",
             },
+            # [BATCH F Part 2] Node type untuk graph edges (association expansion).
+            "graph_edges": {
+                "source_node_type": "VARCHAR",
+                "target_node_type": "VARCHAR",
+            },
         }
 
         expected_indexes: Dict[str, Tuple[str, str]] = {
             "idx_fragment_parent": ("fragments", "parent_fragment_id"),
             "idx_fragment_topic_depth": ("fragments", "topic_key_id, depth"),
+            # [BATCH F Part 2] Index association queries.
+            "idx_edge_source_type": ("graph_edges", "source_node_type, source_node_id"),
+            "idx_edge_target_type": ("graph_edges", "target_node_type, target_node_id"),
+            "idx_edge_rel_type": ("graph_edges", "relationship_type"),
         }
 
         try:
@@ -416,6 +465,46 @@ class MemoryStorage:
             candidate_history=p.candidate_history or [],
         )
 
+    def _to_edge_model(self, e: "GraphEdgeDB") -> models.MemoryGraphEdge:
+        """
+        [BATCH F Part 2] Mapper tunggal GraphEdge DB row → Pydantic.
+
+        Node type di-deserialize dari string ke GraphNodeType enum.
+        NULL ditoleransi → field enum akan None (backward compat dengan
+        edge legacy yang dibuat sebelum Batch F).
+        """
+        source_type: Optional[models.GraphNodeType] = None
+        target_type: Optional[models.GraphNodeType] = None
+        if e.source_node_type:
+            try:
+                source_type = models.GraphNodeType(e.source_node_type)
+            except ValueError:
+                source_type = None
+        if e.target_node_type:
+            try:
+                target_type = models.GraphNodeType(e.target_node_type)
+            except ValueError:
+                target_type = None
+
+        # Map relationship_type string → enum (defensive)
+        try:
+            rel_type = models.RelationshipType(e.relationship_type)
+        except ValueError:
+            rel_type = models.RelationshipType.RELATED_TO
+
+        return models.MemoryGraphEdge(
+            edge_id=e.id,
+            source_node_id=e.source_node_id,
+            target_node_id=e.target_node_id,
+            relationship_type=rel_type,
+            weight=e.weight or 1.0,
+            strength=e.strength or 1.0,
+            evidence=e.evidence or "",
+            created_at=e.created_at,
+            source_node_type=source_type,
+            target_node_type=target_type,
+        )
+
     # ==========================================
     # OPERASI PENYIMPANAN (WRITE)
     # ==========================================
@@ -499,15 +588,35 @@ class MemoryStorage:
         session.add(db_obj)
 
     def save_graph_edge(self, session: Session, edge: models.MemoryGraphEdge):
+        """
+        Simpan graph edge ke DB.
+
+        [BATCH F Part 2] Serialize source_node_type & target_node_type enum
+        ke string untuk penyimpanan. Field None tetap None (backward compat
+        untuk call-sites existing yang tidak mengisi node type).
+        """
+        source_type_str = (
+            edge.source_node_type.value
+            if edge.source_node_type is not None
+            else None
+        )
+        target_type_str = (
+            edge.target_node_type.value
+            if edge.target_node_type is not None
+            else None
+        )
+
         db_obj = GraphEdgeDB(
             id=edge.edge_id, 
-            source_node_id=edge.source_node_id,  # [NEW] Renamed field
-            target_node_id=edge.target_node_id,  # [NEW] Renamed field
+            source_node_id=edge.source_node_id,
+            target_node_id=edge.target_node_id,
             relationship_type=edge.relationship_type.value, 
             weight=edge.weight,
             strength=edge.strength,
             evidence=edge.evidence,
-            created_at=edge.created_at
+            created_at=edge.created_at,
+            source_node_type=source_type_str,
+            target_node_type=target_type_str,
         )
         session.add(db_obj)
 
@@ -1286,6 +1395,112 @@ class MemoryStorage:
                 session, start_ids, target_ids, max_depth
             )
             return path_info
+
+    # ==========================================
+    # [BATCH F Part 2] ASSOCIATION QUERIES
+    # ==========================================
+
+    def get_topic_association_edges(
+        self,
+        topic_key_id: str,
+    ) -> List[models.MemoryGraphEdge]:
+        """
+        Ambil semua edges yang melibatkan satu TopicKey sebagai source atau target.
+
+        Backward compat: edge legacy dengan node_type NULL tetap dikembalikan
+        karena kita match berdasarkan node_id saja.
+        """
+        with self.SessionLocal() as session:
+            rows = session.query(GraphEdgeDB).filter(
+                or_(
+                    GraphEdgeDB.source_node_id == topic_key_id,
+                    GraphEdgeDB.target_node_id == topic_key_id,
+                )
+            ).all()
+            return [self._to_edge_model(r) for r in rows]
+
+    def get_fragment_association_edges(
+        self,
+        fragment_id: str,
+    ) -> List[models.MemoryGraphEdge]:
+        """
+        Ambil semua association edges yang melibatkan satu fragment.
+
+        Backward compat: edge legacy dengan node_type NULL tetap dikembalikan.
+        """
+        with self.SessionLocal() as session:
+            rows = session.query(GraphEdgeDB).filter(
+                or_(
+                    GraphEdgeDB.source_node_id == fragment_id,
+                    GraphEdgeDB.target_node_id == fragment_id,
+                )
+            ).all()
+            return [self._to_edge_model(r) for r in rows]
+
+    def get_association_targets(
+        self,
+        source_node_id: str,
+        source_node_type: Optional[models.GraphNodeType] = None,
+        relationship_types: Optional[List[models.RelationshipType]] = None,
+        limit: int = 50,
+    ) -> List[models.MemoryGraphEdge]:
+        """
+        Query unified untuk association targets dari satu source node.
+
+        Args:
+            source_node_id: ID node sumber (TopicKey atau Fragment).
+            source_node_type: Filter by type (None = match semua, termasuk legacy NULL).
+            relationship_types: Filter by relationship types (None = semua tipe).
+            limit: Batas jumlah edge yang dikembalikan.
+
+        Backward compat:
+            Jika source_node_type=None, edge dengan node_type NULL ikut dikembalikan.
+            Ini penting untuk existing edges yang dibuat sebelum Batch F.
+        """
+        with self.SessionLocal() as session:
+            q = session.query(GraphEdgeDB).filter(
+                GraphEdgeDB.source_node_id == source_node_id
+            )
+
+            # Node type filter (None = tidak filter, backward compat)
+            if source_node_type is not None:
+                q = q.filter(
+                    or_(
+                        GraphEdgeDB.source_node_type == source_node_type.value,
+                        GraphEdgeDB.source_node_type.is_(None),
+                    )
+                )
+
+            # Relationship type filter
+            if relationship_types:
+                rel_values = [rt.value for rt in relationship_types]
+                q = q.filter(GraphEdgeDB.relationship_type.in_(rel_values))
+
+            q = q.order_by(GraphEdgeDB.created_at.desc()).limit(limit)
+            rows = q.all()
+            return [self._to_edge_model(r) for r in rows]
+
+    def get_cross_topic_association_candidates(
+        self,
+        primary_topic_key_id: str,
+        limit: int = 10,
+    ) -> List[models.TopicKey]:
+        """
+        Ambil TopicKey KANDIDAT untuk cross-topic association.
+
+        Digunakan oleh AssociationEngine saat mencari target asosiasi lintas topik.
+        Mengecualikan:
+            - Primary topic itu sendiri
+            - TopicKey tidak aktif
+
+        Returns: List TopicKey aktif selain primary, limit N.
+        """
+        with self.SessionLocal() as session:
+            rows = session.query(TopicKeyDB).filter(
+                TopicKeyDB.status == "ACTIVE",
+                TopicKeyDB.id != primary_topic_key_id,
+            ).limit(limit).all()
+            return [self._to_topic_model(r) for r in rows]
 
     # ==========================================
     # [MEKANISME 5] HIERARCHY TRAVERSAL API

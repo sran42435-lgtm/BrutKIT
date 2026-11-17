@@ -22,64 +22,22 @@ URUTAN WAJIB:
     EXTRACT METADATA (dari exact text) -> COMPRESS -> PERSIST
     -> COMMIT -> PLACE -> PROPAGATE
 
-[REFACTOR BATCH 1]
-Logika Mekanisme 1 (Clarification State Management) dipindahkan ke
-clarification_state.py. memory_engine.py sekarang mendelegasikan semua
-operasi pending/clarification ke ClarificationStateManager.
+[REFACTOR BATCH 1-10]
+Lihat docstring Batch 1-10 untuk detail refactor sebelumnya.
 
-[REFACTOR BATCH 2]
-Fragment Identity Extraction dipindahkan ke fragment_identity.py.
-Identitas fragment sekarang dianalisis dari USER + AI RESPONSE (bukan
-hanya user input), menghasilkan fragment_key + helper_description
-yang lebih representatif.
+[BATCH G - ASSOCIATION EXPANSION INTEGRATION]
+Tiga pipeline baru di-wire ke orchestration:
+  1. ResponseMetadataResolver (Batch B) - validasi metadata LLM,
+     override fragment_identity jika metadata valid.
+  2. TopicRouter (Batch D) - local-first routing observability,
+     menjelaskan KENAPA topik itu dipilih (local vs global vs new).
+  3. AssociationEngine (Batch E) - cross-topic & cross-fragment
+     association analysis + persistence edges with explicit node_type.
 
-[REFACTOR BATCH 3]
-Fragment Placement dipindahkan ke fragment_hierarchy.py.
-Parent selection sekarang memakai FragmentIdentity (Batch 2) sebagai
-PRIMARY signal, dengan retrieval.signal_profile sebagai fallback.
-
-[REFACTOR BATCH 4]
-Helper Propagation dipindahkan ke helper_propagation.py.
-Propagasi child -> parent -> root -> TopicKey dikelola oleh
-HelperPropagationManager.
-
-[REFACTOR BATCH 5]
-Composite Detection dipindahkan ke composite_memory.py.
-Analisis multi-source composite dikelola oleh CompositeMemoryAnalyzer.
-Forwarding method _detect_composite_sources dipertahankan untuk
-backward compatibility dengan test suite.
-
-[REFACTOR BATCH 6]
-Trend Navigation dipindahkan ke trend_navigation.py.
-TrendNavigator mengelola Mode A (TopicKey trend) dan Mode B (Fragment
-trend), dengan perbaikan Prioritas 4: temporal score berbasis activity
-density (bukan binary match).
-
-[REFACTOR BATCH 7]
-Helper Propagation dipisahkan menjadi dua gate:
-  1. Structural Gate (selalu lolos untuk fragment valid)
-  2. Quality Gate (cek substansi: tidak kosong, tidak pure noise)
-Mutation permission tetap berlaku untuk TopicProfile/CoOccurrence/OwnHelper,
-tetapi TIDAK memblokir propagasi structural child->parent->TopicKey.
-
-[REFACTOR BATCH 8]
-Composite Memory Analyzer dengan dynamic cross-memory source discovery.
-Discovery mencari kandidat dari GLOBAL memory lintas TopicKey yang
-BELUM terwakili di retrieval, lalu merge dengan retrieved memories.
-Prevent false composite dari weak overlap via MIN_SOURCE_EVIDENCE_FAMILIES=2.
-
-[REFACTOR BATCH 9]
-Trend Navigation Mode B diperluas untuk CLEAR decisions:
-  selected_key_id + continuation_intent + CLEAR
-  -> trigger fragment trend sebagai navigation hint
-Tidak mengubah decision (CLEAR tetap CLEAR), hanya menyediakan
-observability fragment branches untuk user.
-
-[REFACTOR BATCH 10 - FINAL]
-Observability cleanup: TurnAnalysisResult.continuity_score sekarang
-berisi PURE continuity (turn_cont), bukan final_score kandidat.
-Field bernama "continuity" = nilai continuity murni.
-final_score tetap dapat diakses via retrieval.candidates[0].final_score.
+Backward compat:
+  - Semua pipeline baru wrapped dalam try/except
+  - Jika gagal, pipeline existing tetap jalan
+  - 75 test existing tidak terpengaruh
 """
 
 import logging
@@ -98,7 +56,9 @@ from models import (
     RetrievedMemory, TokenQuality, EvidenceFamily,
     SessionActiveState, FragmentPlacementResult, FragmentPlacementKind,
     HelperPropagationResult, CompositeSourceAnalysis, FragmentSourceContribution,
-    TrendCandidate, TrendNodeType, ClarificationAccumulation, FragmentCandidateScore
+    TrendCandidate, TrendNodeType, ClarificationAccumulation, FragmentCandidateScore,
+    GraphNodeType, AssociationClue, ClueType, AssociationAnalysis,
+    TopicRouteResult, MetadataValidationResult, ResponseMetadata,
 )
 from storage import MemoryStorage
 from retrieval import RetrievalEngine, RetrievalResult
@@ -109,6 +69,9 @@ from fragment_hierarchy import FragmentHierarchyManager
 from helper_propagation import HelperPropagationManager
 from composite_memory import CompositeMemoryAnalyzer
 from trend_navigation import TrendNavigator
+from response_metadata import ResponseMetadataResolver, MetadataDecision, ResolverDecision
+from topic_router import TopicRouter
+from association_engine import AssociationEngine
 
 logger = logging.getLogger(__name__)
 
@@ -133,18 +96,15 @@ class MemoryEngine:
         self.compressor = compressor
         self.context_builder = context_builder
         self.llm_client = llm_client
-        # [REFACTOR BATCH 1] ClarificationStateManager
         self.clarification_state = ClarificationStateManager(storage)
-        # [REFACTOR BATCH 2] FragmentIdentityExtractor
         self.identity_extractor = FragmentIdentityExtractor()
-        # [REFACTOR BATCH 3] FragmentHierarchyManager
         self.hierarchy_manager = FragmentHierarchyManager(storage)
-        # [REFACTOR BATCH 4] HelperPropagationManager
         self.helper_propagator = HelperPropagationManager(storage)
-        # [REFACTOR BATCH 5] CompositeMemoryAnalyzer
         self.composite_analyzer = CompositeMemoryAnalyzer(storage)
-        # [REFACTOR BATCH 6] TrendNavigator (dengan temporal density recomputation)
         self.trend_navigator = TrendNavigator(storage, retrieval)
+        self.metadata_resolver = ResponseMetadataResolver()
+        self.topic_router = TopicRouter()
+        self.association_engine = AssociationEngine()
 
     def process_input(self, envelope: InputEnvelope) -> EngineResult:
         """Main Entry Point. Memproses satu turn percakapan secara utuh."""
@@ -238,7 +198,6 @@ class MemoryEngine:
         decision = self._make_decision(retrieval_result, active_pending)
         decision = self._apply_continuation_protection(decision, retrieval_result)
 
-        # [REFACTOR BATCH 6] Delegate ke TrendNavigator
         trend_candidates = self._resolve_trend_candidates(
             decision=decision,
             retrieval=retrieval_result,
@@ -303,6 +262,21 @@ class MemoryEngine:
             )
             retrieved_memories = self._attach_evidence_metadata(exact_memories, retrieval_result)
 
+        active_topic_key_obj: Optional[TopicKey] = None
+        if session_state and session_state.active_topic_key_id:
+            active_topic_key_obj = self.storage.get_topic_key(session_state.active_topic_key_id)
+
+        topic_route: Optional[TopicRouteResult] = None
+        try:
+            topic_route = self.topic_router.route(
+                envelope=envelope,
+                session_state=session_state,
+                active_topic_key=active_topic_key_obj,
+                retrieval_result=retrieval_result,
+            )
+        except Exception as e:
+            logger.warning(f"TopicRouter gagal (observability only): {e}")
+
         if self.context_builder and self.llm_client:
             active_topic_title = None
             if retrieval_result.selected_key_id:
@@ -317,15 +291,31 @@ class MemoryEngine:
             try:
                 model_response = self.llm_client.generate(model_request)
                 assistant_response = model_response.response_text
+                raw_llm_metadata = getattr(model_response, "internal_metadata", None)
             except Exception as e:
                 logger.error(f"LLM Generation gagal: {e}")
                 assistant_response = self._simulate_generation(
                     envelope.raw_text, exact_memories, decision
                 )
+                raw_llm_metadata = None
         else:
             assistant_response = self._simulate_generation(
                 envelope.raw_text, exact_memories, decision
             )
+            raw_llm_metadata = None
+
+        # [BATCH G] Resolve LLM metadata - returns ResolverDecision
+        resolver_decision: Optional[ResolverDecision] = None
+        validated_metadata: Optional[MetadataValidationResult] = None
+        try:
+            resolver_decision = self._resolve_llm_metadata(
+                raw_metadata=raw_llm_metadata,
+                all_keys=all_keys,
+            )
+            if resolver_decision and resolver_decision.validation:
+                validated_metadata = resolver_decision.validation
+        except Exception as e:
+            logger.warning(f"Metadata validation gagal: {e}")
 
         analysis = self._analyze_turn(envelope, assistant_response, retrieval_result, active_topic_id)
 
@@ -345,6 +335,8 @@ class MemoryEngine:
                 continuation_intent=True,
                 active_fragment_id=analysis.active_fragment_id,
                 active_depth=analysis.active_depth,
+                topic_route=topic_route,
+                validated_metadata=validated_metadata,
             )
 
         composite_analysis = self.composite_analyzer.detect_composite_sources(
@@ -356,15 +348,17 @@ class MemoryEngine:
         placement: Optional[FragmentPlacementResult] = None
         propagation: Optional[HelperPropagationResult] = None
         created_fragment_id: Optional[str] = None
+        association_analysis: Optional[AssociationAnalysis] = None
 
         if analysis.classification != MemoryClassification.DISCARD:
-            created_fragment_id, placement, propagation = self._persist_memory(
+            created_fragment_id, placement, propagation, association_analysis = self._persist_memory(
                 envelope,
                 assistant_response,
                 analysis,
                 retrieval_result,
                 active_topic_id,
                 composite_analysis=composite_analysis,
+                resolver_decision=resolver_decision,
             )
 
         self._update_session_state(
@@ -403,6 +397,9 @@ class MemoryEngine:
             ),
             excluded_candidate_keys=retrieval_result.excluded_candidate_keys,
             continuation_intent=retrieval_result.continuation_intent,
+            topic_route=topic_route,
+            association_analysis=association_analysis,
+            validated_metadata=validated_metadata,
         )
 
     # ==========================================
@@ -410,15 +407,12 @@ class MemoryEngine:
     # ==========================================
 
     def _extract_input_tokens(self, envelope: InputEnvelope) -> set:
-        """Forwarding ke ClarificationStateManager.extract_input_tokens."""
         return self.clarification_state.extract_input_tokens(envelope)
 
     def _extract_symbol_identity_tokens(self, raw_text: str) -> set:
-        """Forwarding ke ClarificationStateManager.extract_symbol_identity_tokens."""
         return self.clarification_state.extract_symbol_identity_tokens(raw_text)
 
     def _get_input_token_quality(self, envelope: InputEnvelope) -> Dict[str, TokenQuality]:
-        """Forwarding ke ClarificationStateManager.get_input_token_quality."""
         return self.clarification_state.get_input_token_quality(envelope)
 
     def _collect_pending_evidence_tokens(
@@ -426,7 +420,6 @@ class MemoryEngine:
         pending: PendingState,
         all_keys: Optional[List[TopicKey]] = None
     ) -> set:
-        """Forwarding ke ClarificationStateManager.collect_pending_evidence_tokens."""
         return self.clarification_state.collect_pending_evidence_tokens(pending, all_keys)
 
     def _score_pending_relevance(
@@ -435,11 +428,9 @@ class MemoryEngine:
         pending: PendingState,
         all_keys: Optional[List[TopicKey]] = None
     ) -> float:
-        """Forwarding ke ClarificationStateManager.score_pending_relevance."""
         return self.clarification_state.score_pending_relevance(envelope, pending, all_keys)
 
     def _detect_explicit_selection(self, raw_text: str, pending: PendingState) -> bool:
-        """Forwarding ke ClarificationStateManager.detect_explicit_selection."""
         return self.clarification_state.detect_explicit_selection(raw_text, pending)
 
     def _check_pending_relevance(
@@ -448,15 +439,12 @@ class MemoryEngine:
         pending: PendingState,
         all_keys: Optional[List[TopicKey]] = None
     ) -> bool:
-        """Forwarding ke ClarificationStateManager.check_pending_relevance."""
         return self.clarification_state.check_pending_relevance(envelope, pending, all_keys)
 
     def _pause_pending(self, pending: PendingState):
-        """Forwarding ke ClarificationStateManager.pause_pending."""
         return self.clarification_state.pause_pending(pending)
 
     def _detect_explicit_cancellation(self, envelope: InputEnvelope) -> bool:
-        """Forwarding ke ClarificationStateManager.detect_explicit_cancellation."""
         return self.clarification_state.detect_explicit_cancellation(envelope)
 
     def _build_clarification_accumulation(
@@ -464,7 +452,6 @@ class MemoryEngine:
         envelope: InputEnvelope,
         pending: PendingState,
     ) -> ClarificationAccumulation:
-        """Forwarding ke ClarificationStateManager.build_accumulation."""
         return self.clarification_state.build_accumulation(envelope, pending)
 
     def _persist_clarification_state(
@@ -475,7 +462,6 @@ class MemoryEngine:
         envelope: InputEnvelope,
         question: str,
     ) -> None:
-        """Forwarding ke ClarificationStateManager.persist_state."""
         return self.clarification_state.persist_state(
             pending, clarification, result, envelope, question
         )
@@ -489,7 +475,6 @@ class MemoryEngine:
         decision: EngineDecision,
         retrieval: RetrievalResult,
     ) -> EngineDecision:
-        """[M2] NO_MATCH + continuation intent != NEW_TOPIC."""
         cfg = CONFIG.continuation
         if not cfg.BLOCK_NEW_TOPIC_ON_CONTINUATION:
             return decision
@@ -525,7 +510,6 @@ class MemoryEngine:
         trend_candidates: Optional[List[TrendCandidate]] = None,
         clarification: Optional[ClarificationAccumulation] = None,
     ) -> EngineResult:
-        """[M2] Respons ini TIDAK dipersist sebagai fragment TopicKey baru."""
         trend_candidates = trend_candidates or []
         if trend_candidates:
             lines = [
@@ -600,7 +584,7 @@ class MemoryEngine:
         )
 
     # ==========================================
-    # TREND NAVIGATION (M5) — BATCH 6: Delegate to TrendNavigator
+    # TREND NAVIGATION (M5)
     # ==========================================
 
     def _resolve_trend_candidates(
@@ -610,16 +594,6 @@ class MemoryEngine:
         envelope: InputEnvelope,
         session_state: Optional[SessionActiveState],
     ) -> List[TrendCandidate]:
-        """
-        [BATCH 6] Forwarding ke TrendNavigator.
-
-        TrendNavigator melakukan:
-            1. Resolve temporal_range dari signal.
-            2. Mode A: TopicKey trend (jika topik belum jelas).
-            3. Mode B: Fragment trend (jika topik jelas, bagian belum).
-            4. Recompute temporal_score dengan activity density (Prioritas 4).
-            5. Re-sort dan re-limit candidates.
-        """
         return self.trend_navigator.resolve_trend_candidates(
             decision=decision,
             retrieval=retrieval,
@@ -639,7 +613,6 @@ class MemoryEngine:
         placement: Optional[FragmentPlacementResult],
         ref_time: datetime,
     ) -> None:
-        """[M3] Simpan Current Conversational State."""
         if topic_key_id is None:
             return
         state = SessionActiveState(
@@ -655,7 +628,6 @@ class MemoryEngine:
             logger.debug(f"Gagal menyimpan session state: {e}")
 
     def _calculate_active_state(self, session_id: str) -> Tuple[Optional[str], float]:
-        """Real Continuity Window menggunakan Median."""
         recent_frags = self.storage.get_recent_fragments(
             session_id, limit=CONFIG.continuity.CONTINUITY_WINDOW_SIZE
         )
@@ -682,7 +654,6 @@ class MemoryEngine:
         return latest_key_id, stability_ratio * 0.5
 
     def _get_relevant_fragments(self, keys: List[TopicKey]) -> List[FragmentMetadata]:
-        """Mengambil metadata fragment untuk kunci-kunci yang ada."""
         fragments = []
         for k in keys:
             fragments.extend(self.storage.get_fragment_metadata_by_key(k.key_id))
@@ -698,7 +669,6 @@ class MemoryEngine:
         fragments: List[FragmentMetadata],
         active_topic_id: Optional[str]
     ) -> Dict[str, float]:
-        """Graph = EVIDENCE, bukan absolute truth."""
         evidence: Dict[str, float] = {}
         if not active_topic_id:
             return evidence
@@ -727,7 +697,6 @@ class MemoryEngine:
         self,
         fragments: List[FragmentMetadata]
     ) -> Dict[str, float]:
-        """Graph score per fragment dari edge NYATA."""
         if not fragments:
             return {}
         frag_ids = [f.fragment_id for f in fragments]
@@ -741,7 +710,6 @@ class MemoryEngine:
         exact_memories: List[dict],
         retrieval: RetrievalResult
     ) -> List[RetrievedMemory]:
-        """RetrievedMemory dengan metadata bukti + hierarchy framing."""
         score_map = retrieval.selected_fragment_scores or {}
         results: List[RetrievedMemory] = []
         for mem in exact_memories:
@@ -786,7 +754,6 @@ class MemoryEngine:
     # ==========================================
 
     def _build_window_pairs(self, tokens: List[str]) -> Dict[str, int]:
-        """Co-occurrence berbasis window untuk PERSISTENCE."""
         cc = CONFIG.co_occurrence
         pairs: Dict[str, int] = {}
         for i, token_a in enumerate(tokens):
@@ -816,7 +783,6 @@ class MemoryEngine:
         candidate: Optional[CandidateScore],
         classification: MemoryClassification
     ) -> Tuple[bool, bool, str, float, int, float]:
-        """EVIDENCE BEFORE MUTATION."""
         mut = CONFIG.mutation
 
         if classification == MemoryClassification.NEW_TOPIC or candidate is None:
@@ -872,7 +838,6 @@ class MemoryEngine:
         top_candidate: Optional[CandidateScore],
         history_ratio: float,
     ) -> Tuple[float, List[str]]:
-        """CONTINUITY SCORE MURNI. Bukan relevance kandidat."""
         cc = CONFIG.continuity
         ev = CONFIG.evidence
 
@@ -945,7 +910,6 @@ class MemoryEngine:
         analysis: TurnAnalysisResult,
         retrieval: RetrievalResult
     ) -> str:
-        """Ringkasan kemurnian reasoning untuk observability."""
         top = retrieval.candidates[0] if retrieval.candidates else None
         if top is None:
             return ""
@@ -969,7 +933,6 @@ class MemoryEngine:
         result: RetrievalResult,
         pending: Optional[PendingState]
     ) -> EngineDecision:
-        """Menerjemahkan hasil retrieval menjadi keputusan mesin."""
         if result.decision_type == DecisionType.AMBIGUOUS:
             top = result.candidates[0] if result.candidates else None
             return EngineDecision(
@@ -1049,7 +1012,6 @@ class MemoryEngine:
         self,
         candidate: CandidateScore
     ) -> Tuple[int, List[EvidenceFamily], bool]:
-        """Infer evidence families. Robust terhadap candidate manual."""
         if candidate.family_support_count > 0:
             return (
                 candidate.family_support_count,
@@ -1082,7 +1044,6 @@ class MemoryEngine:
         self,
         candidate: Optional[CandidateScore]
     ) -> Tuple[Optional[DecisionType], str]:
-        """EVIDENCE VALIDATION lapis kedua di Engine."""
         if candidate is None:
             return (None, "")
 
@@ -1137,7 +1098,6 @@ class MemoryEngine:
         clarification: Optional[ClarificationAccumulation] = None,
         trend_candidates: Optional[List[TrendCandidate]] = None,
     ) -> EngineResult:
-        """Clarification Round Lifecycle. Pending BERKEMBANG."""
         top = result.candidates[0] if result.candidates else None
         trend_candidates = trend_candidates or []
         decision_kwargs = dict(
@@ -1249,7 +1209,6 @@ class MemoryEngine:
         self,
         fragment_ids: List[str]
     ) -> Tuple[List[dict], ReconstructionStatus]:
-        """Exact Reconstruction dengan Observability."""
         memories = []
         failed_count = 0
 
@@ -1297,13 +1256,95 @@ class MemoryEngine:
         memories: List[dict],
         decision: EngineDecision
     ) -> str:
-        """Placeholder untuk LLM Generation (Fallback)."""
         if decision.decision_type == DecisionType.AMBIGUOUS:
             return decision.message or "Mohon maaf, bisa diperjelas maksud Anda?"
         return f"Response simulasi untuk: {user_input}"
 
     # ==========================================
-    # FRAGMENT IDENTITY (M3) — BATCH 2: Combined User+AI
+    # [BATCH G] LLM METADATA RESOLUTION
+    # ==========================================
+
+    def _resolve_llm_metadata(
+        self,
+        raw_metadata,
+        all_keys: List[TopicKey],
+    ) -> Optional[ResolverDecision]:
+        """
+        [BATCH G] Resolve metadata dari LLM.
+
+        Returns ResolverDecision yang berisi:
+          - decision: USE_METADATA / PARTIAL / FALLBACK
+          - metadata: ResponseMetadata (jika parseable)
+          - validation: MetadataValidationResult (jika validated)
+          - usable_*: field yang boleh dipakai
+
+        Returns None jika ada exception.
+        """
+        try:
+            return self.metadata_resolver.resolve(
+                raw_metadata=raw_metadata,
+                known_topic_keys=all_keys,
+                known_fragments=None,
+            )
+        except Exception as e:
+            logger.warning(f"Metadata resolver error: {e}")
+            return None
+
+    # ==========================================
+    # [BATCH G] ASSOCIATION CLUE BUILDING
+    # ==========================================
+
+    def _build_association_clues(
+        self,
+        resolver_decision: Optional[ResolverDecision],
+        signal_profile,
+        response_text: str,
+    ) -> List[AssociationClue]:
+        """
+        [BATCH G] Bangun structured clues untuk AssociationEngine.
+
+        Sources:
+            1. ResolverDecision.usable_positive_clues (jika metadata valid)
+            2. ResolverDecision.usable_negative_clues
+            3. SignalProfile.excluded_tokens → EXCLUSION clues
+        """
+        clues: List[AssociationClue] = []
+
+        # 1. Metadata clues dari ResolverDecision
+        if resolver_decision is not None:
+            if resolver_decision.decision in (MetadataDecision.USE_METADATA, MetadataDecision.PARTIAL_METADATA):
+                for tok in (resolver_decision.usable_positive_clues or []):
+                    clues.append(AssociationClue(
+                        clue_type=ClueType.POSITIVE,
+                        tokens=[tok],
+                        source="metadata",
+                        strength=0.8,
+                    ))
+
+                for tok in (resolver_decision.usable_negative_clues or []):
+                    clues.append(AssociationClue(
+                        clue_type=ClueType.NEGATIVE,
+                        tokens=[tok],
+                        source="metadata",
+                        strength=0.5,
+                    ))
+
+        # 2. SignalProfile exclusion → EXCLUSION clues
+        if signal_profile is not None:
+            excluded = getattr(signal_profile, "excluded_tokens", None) or []
+            if excluded:
+                clues.append(AssociationClue(
+                    clue_type=ClueType.EXCLUSION,
+                    tokens=list(excluded),
+                    source="signal",
+                    strength=1.0,
+                    rejected_target_ids=[],
+                ))
+
+        return clues
+
+    # ==========================================
+    # FRAGMENT IDENTITY (M3) — BATCH 2 + G
     # ==========================================
 
     def _extract_fragment_identity(
@@ -1312,26 +1353,50 @@ class MemoryEngine:
         assistant_response: str,
         retrieval: RetrievalResult,
         topic_key: Optional[TopicKey] = None,
+        resolver_decision: Optional[ResolverDecision] = None,
     ) -> FragmentIdentity:
         """
         [M3 — Batch 2] Ekstrak identitas fragment dari USER + AI RESPONSE.
+
+        [BATCH G] Jika resolver_decision punya usable_fragment_key (USE_METADATA
+        atau PARTIAL_METADATA), OVERRIDE fragment_key dan helper dari metadata LLM.
+        Ini implementasi: "LLM menentukan identitas fragment SEBELUM respons disimpan."
         """
-        return self.identity_extractor.extract(
+        base_identity = self.identity_extractor.extract(
             user_text=envelope.raw_text,
             assistant_text=assistant_response,
             topic_key=topic_key,
             signal_profile=retrieval.signal_profile,
         )
 
+        # [BATCH G] Metadata override jika ResolverDecision punya usable fields
+        if resolver_decision is not None and resolver_decision.usable_fragment_key:
+            override_key = resolver_decision.usable_fragment_key.strip()
+            override_helper = (resolver_decision.usable_helper_description or "").strip()
+
+            if override_key:
+                base_identity = FragmentIdentity(
+                    fragment_key=override_key,
+                    helper_description=override_helper or base_identity.helper_description,
+                    representative_tokens=base_identity.representative_tokens,
+                    meaningful_tokens=base_identity.meaningful_tokens,
+                    identity_confidence=max(
+                        base_identity.identity_confidence,
+                        0.8 if resolver_decision.decision == MetadataDecision.USE_METADATA else 0.6,
+                    ),
+                    user_token_count=base_identity.user_token_count,
+                    ai_token_count=base_identity.ai_token_count,
+                    combined_token_count=base_identity.combined_token_count,
+                    reason=f"{base_identity.reason} [metadata {resolver_decision.decision}]",
+                )
+
+        return base_identity
+
     def _extract_fragment_identity_legacy(
         self,
         raw_text: str,
         meaningful_tokens: List[str],
     ) -> Tuple[str, str]:
-        """
-        [LEGACY] Versi lama yang hanya menggunakan user tokens.
-        Dipertahankan untuk backward compat dengan test.
-        """
         hc = CONFIG.hierarchy
         hp = CONFIG.helper_propagation
 
@@ -1349,7 +1414,7 @@ class MemoryEngine:
         return fragment_key, helper
 
     # ==========================================
-    # FRAGMENT PLACEMENT (M5) — BATCH 3: Delegate to Hierarchy Manager
+    # FRAGMENT PLACEMENT (M5) — BATCH 3
     # ==========================================
 
     def _determine_fragment_placement(
@@ -1359,19 +1424,12 @@ class MemoryEngine:
         is_new_topic: bool,
         fragment_identity: Optional[FragmentIdentity] = None,
     ) -> FragmentPlacementResult:
-        """[M5 — Batch 3] Delegate ke FragmentHierarchyManager."""
         return self.hierarchy_manager.determine_placement(
             topic_key_id=topic_key_id,
             retrieval=retrieval,
             is_new_topic=is_new_topic,
             fragment_identity=fragment_identity,
         )
-
-    # ==========================================
-    # HELPER PROPAGATION (M3) — BATCH 4
-    # ==========================================
-    # Method _helper_similarity, _aggregate_helper, _propagate_helper
-    # dipindahkan ke helper_propagation.py.
 
     # ==========================================
     # COMPOSITE DETECTION (M4) — BATCH 5
@@ -1383,10 +1441,6 @@ class MemoryEngine:
         retrieved_memories: List[RetrievedMemory],
         primary_topic_key_id: Optional[str],
     ) -> CompositeSourceAnalysis:
-        """
-        [BACKWARD COMPAT] Forwarding ke CompositeMemoryAnalyzer.
-        Dipakai oleh test yang memanggil engine._detect_composite_sources langsung.
-        """
         return self.composite_analyzer.detect_composite_sources(
             response=response,
             retrieved_memories=retrieved_memories,
@@ -1404,21 +1458,6 @@ class MemoryEngine:
         retrieval: RetrievalResult,
         current_active_id: Optional[str]
     ) -> TurnAnalysisResult:
-        """
-        Topic Switch + Evidence Before Mutation + Continuity Purity.
-
-        [BATCH 10] OBSERVABILITY CLEANUP:
-            TurnAnalysisResult.continuity_score sekarang diisi dengan
-            turn_cont (pure continuity value), bukan final_score kandidat.
-
-            Sebelumnya: continuity_score = candidates[0].final_score
-            Sekarang  : continuity_score = turn_cont (same as turn_continuity_score)
-
-            Field bernama "continuity" = nilai continuity murni.
-            final_score kandidat tetap tersedia via retrieval.candidates[0].final_score.
-
-            Ini menghilangkan semantic confusion di observability layer.
-        """
         if retrieval.selected_key_id:
             if retrieval.selected_key_id == current_active_id:
                 top_candidate = next(
@@ -1540,10 +1579,6 @@ class MemoryEngine:
 
         return TurnAnalysisResult(
             classification=classification,
-            # [BATCH 10] continuity_score sekarang = pure continuity (turn_cont).
-            # Sebelumnya: retrieval.candidates[0].final_score (relevance value).
-            # Field bernama "continuity" = nilai continuity murni.
-            # final_score kandidat tetap tersedia via retrieval.candidates[0].final_score.
             continuity_score=turn_cont,
             active_topic_key_id=active_key_for_fragment,
             evidence_strength=ev_strength,
@@ -1561,6 +1596,57 @@ class MemoryEngine:
         )
 
     # ==========================================
+    # [BATCH G] ASSOCIATION EDGE PERSISTENCE
+    # ==========================================
+
+    def _persist_association_edges(
+        self,
+        session,
+        new_fragment_id: str,
+        association_analysis: Optional[AssociationAnalysis],
+        envelope_timestamp: datetime,
+    ) -> int:
+        """
+        [BATCH G] Persist association edges dari AssociationAnalysis.
+
+        Setiap AssociationTarget menjadi MemoryGraphEdge dengan node_type eksplisit.
+        Returns jumlah edge yang berhasil disimpan.
+        """
+        if association_analysis is None:
+            return 0
+
+        count = 0
+        all_targets = (
+            list(association_analysis.topic_associations or [])
+            + list(association_analysis.fragment_associations or [])
+        )
+
+        for target in all_targets:
+            if not target or not target.target_id:
+                continue
+
+            edge = MemoryGraphEdge(
+                edge_id=str(uuid.uuid4()),
+                source_node_id=new_fragment_id,
+                target_node_id=target.target_id,
+                relationship_type=target.relationship_type,
+                strength=target.score,
+                evidence=",".join(target.evidence) if target.evidence else "association",
+                created_at=envelope_timestamp,
+                source_node_type=GraphNodeType.FRAGMENT,
+                target_node_type=target.target_type,
+            )
+            try:
+                self.storage.save_graph_edge(session, edge)
+                count += 1
+            except Exception as e:
+                logger.warning(
+                    f"Gagal menyimpan association edge ke {target.target_id}: {e}"
+                )
+
+        return count
+
+    # ==========================================
     # PERSISTENCE
     # ==========================================
 
@@ -1572,14 +1658,25 @@ class MemoryEngine:
         retrieval: RetrievalResult,
         old_active_id: Optional[str],
         composite_analysis: Optional[CompositeSourceAnalysis] = None,
-    ) -> Tuple[Optional[str], Optional[FragmentPlacementResult], Optional[HelperPropagationResult]]:
+        resolver_decision: Optional[ResolverDecision] = None,
+    ) -> Tuple[
+        Optional[str],
+        Optional[FragmentPlacementResult],
+        Optional[HelperPropagationResult],
+        Optional[AssociationAnalysis],
+    ]:
         """
         Transaksi Penyimpanan Memori (Fail-Closed).
 
         URUTAN:
             exact text -> extract identity -> compress
-            -> TX1: persist topic/payload/fragment/edges -> COMMIT
+            -> pre-generate fragment_id
+            -> association analysis
+            -> TX1: persist topic/payload/fragment/edges (structural + composite + association) -> COMMIT
             -> TX2: helper propagation (delegate ke HelperPropagationManager)
+
+        [BATCH G] Return type diperluas: Tuple 4 elemen
+            (fragment_id, placement, propagation, association_analysis)
         """
         raw_content = f"User: {envelope.raw_text}\nAI: {response}"
 
@@ -1609,6 +1706,7 @@ class MemoryEngine:
             assistant_response=response,
             retrieval=retrieval,
             topic_key=active_key_obj,
+            resolver_decision=resolver_decision,
         )
         fragment_key = fragment_identity.fragment_key
         fragment_helper = fragment_identity.helper_description
@@ -1617,7 +1715,7 @@ class MemoryEngine:
             payload = self.compressor.compress(raw_content)
         except Exception as e:
             logger.error(f"Gagal kompresi: {e}")
-            return None, None, None
+            return None, None, None, None
 
         key_id = analysis.active_topic_key_id
         new_key = None
@@ -1698,8 +1796,10 @@ class MemoryEngine:
         else:
             source_topic_ids = []
 
+        new_fragment_id = str(uuid.uuid4())
+
         fragment = FragmentMetadata(
-            fragment_id=str(uuid.uuid4()),
+            fragment_id=new_fragment_id,
             topic_key_id=key_id,
             session_id=envelope.session_id,
             created_at=envelope.timestamp,
@@ -1719,8 +1819,36 @@ class MemoryEngine:
             source_topic_key_ids=source_topic_ids,
         )
 
+        association_analysis: Optional[AssociationAnalysis] = None
+        try:
+            all_keys = self.storage.get_all_topic_keys()
+            candidate_fragments = self._get_relevant_fragments(all_keys)
+
+            clues = self._build_association_clues(
+                resolver_decision=resolver_decision,
+                signal_profile=retrieval.signal_profile,
+                response_text=response,
+            )
+
+            association_analysis = self.association_engine.analyze(
+                new_fragment_identity=fragment_identity,
+                primary_topic_key_id=key_id,
+                new_fragment_id=new_fragment_id,
+                all_topic_keys=all_keys,
+                candidate_fragments=candidate_fragments,
+                clues=clues,
+                composite_analysis=composite_analysis,
+                response_metadata=(
+                    resolver_decision.metadata
+                    if resolver_decision is not None else None
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"AssociationEngine analyze gagal (non-fatal): {e}")
+            association_analysis = None
+
         # ==========================================
-        # TX1: exact memory + topic + fragment + graph edges
+        # TX1: exact memory + topic + fragment + ALL edges
         # ==========================================
         try:
             with self.storage.transaction() as tx:
@@ -1745,7 +1873,9 @@ class MemoryEngine:
                             target_node_id=fragment.fragment_id,
                             relationship_type=RelationshipType.CONTINUES,
                             strength=analysis.turn_continuity_score,
-                            created_at=envelope.timestamp
+                            created_at=envelope.timestamp,
+                            source_node_type=GraphNodeType.FRAGMENT,
+                            target_node_type=GraphNodeType.FRAGMENT,
                         )
                         self.storage.save_graph_edge(tx, edge)
 
@@ -1764,7 +1894,9 @@ class MemoryEngine:
                             relationship_type=RelationshipType.CROSS_SESSION_LINK,
                             strength=1.0,
                             evidence="Reactivated Topic",
-                            created_at=envelope.timestamp
+                            created_at=envelope.timestamp,
+                            source_node_type=GraphNodeType.FRAGMENT,
+                            target_node_type=GraphNodeType.FRAGMENT,
                         )
                         self.storage.save_graph_edge(tx, edge)
 
@@ -1779,16 +1911,24 @@ class MemoryEngine:
                             strength=src.contribution_score,
                             evidence="composite source",
                             created_at=envelope.timestamp,
+                            source_node_type=GraphNodeType.FRAGMENT,
+                            target_node_type=GraphNodeType.FRAGMENT,
                         ))
+
+                self._persist_association_edges(
+                    session=tx,
+                    new_fragment_id=new_fragment_id,
+                    association_analysis=association_analysis,
+                    envelope_timestamp=envelope.timestamp,
+                )
 
             logger.info(f"Memori tersimpan: Fragment {fragment.fragment_id}")
         except Exception as e:
             logger.critical(f"TRANSAKSI GAGAL: {e}")
-            return None, placement, None
+            return None, placement, None, association_analysis
 
         # ==========================================
-        # TX2: helper propagation (setelah commit)
-        # [BATCH 4] Delegate ke HelperPropagationManager
+        # TX2: helper propagation
         # ==========================================
         propagation: Optional[HelperPropagationResult] = None
         try:
@@ -1803,4 +1943,4 @@ class MemoryEngine:
             logger.error(f"HELPER PROPAGATION GAGAL: {e}")
             propagation = None
 
-        return fragment.fragment_id, placement, propagation
+        return fragment.fragment_id, placement, propagation, association_analysis

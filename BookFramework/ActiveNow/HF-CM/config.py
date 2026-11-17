@@ -1,6 +1,16 @@
 """
 config.py
 Pusat Pengendali Keputusan untuk Hybrid Fragmented Compressed Memory (HF-CM).
+
+[BATCH A2 - ASSOCIATION EXPANSION]
+Menambahkan 2 grup constants baru:
+    - AssociationConstants        : routing local-first, cross-topic, cross-fragment
+    - ResponseMetadataConstants   : kontrak metadata dari LLM
+
+Constants ini mendukung 3 file baru yang akan ditambahkan:
+    - response_metadata.py  (Batch B)
+    - topic_router.py       (Batch D)
+    - association_engine.py (Batch E)
 """
 from dataclasses import dataclass
 from typing import Final
@@ -701,6 +711,196 @@ class HelperPropagationConstants:
     CONTRIBUTION_SEPARATOR: Final[str] = "; "
 
 
+# ==========================================
+# [ASSOCIATION EXPANSION - Batch A2] GRUP BARU
+#
+# Constants untuk mendukung mekanisme baru:
+#   - ResponseMetadata (LLM-generated identity)
+#   - TopicRouter (local-first routing)
+#   - AssociationEngine (cross-topic & cross-fragment relationships)
+#
+# Tiga lapisan konsep yang DIKUNCI:
+#   1. Ownership      : topic_key_id (single, structural)
+#   2. Hierarchy      : parent_fragment_id + depth
+#   3. Association    : banyak target lintas topik/fragment
+#
+# Setiap constant di grup ini punya SATU penggunaan nyata di
+# response_metadata.py / topic_router.py / association_engine.py.
+# Tidak ada constant dekoratif.
+# ==========================================
+
+@dataclass(frozen=True)
+class ResponseMetadataConstants:
+    """
+    [ASSOCIATION EXPANSION] Kontrak metadata dari LLM.
+
+    ResponseMetadata adalah structured output yang dihasilkan LLM
+    bersamaan dengan response_text. Metadata ini berisi:
+        - fragment_key (identitas internal)
+        - helper_description
+        - topic/fragment hints
+        - positive/negative clues
+        - confidence
+
+    Prinsip kunci:
+        LLM menentukan identitas fragment SEBELUM respons disimpan,
+        bukan sistem menebak identitas itu dari heuristic SETELAH
+        jawaban selesai.
+
+    Namun LLM bisa salah / hallucinate / provider bisa tidak mendukung
+    structured output, sehingga validator diperlukan.
+    """
+    # Confidence minimum agar metadata dipercaya sebagai PRIMARY identity.
+    # Di bawah threshold ini, fallback ke heuristic FragmentIdentityExtractor.
+    # 0.45 dipilih agar tidak terlalu permisif (hallucination) tapi juga
+    # tidak terlalu ketat (metadata valid tapi low-confidence terbuang).
+    MIN_METADATA_CONFIDENCE: Final[float] = 0.45
+
+    # Batas panjang fragment_key (karakter).
+    # fragment_key adalah NAMA BAGIAN singkat (e.g. "Modal Bisnis Kopi"),
+    # bukan paragraf. Ini BERBEDA dengan MAX_FRAGMENT_HELPER_LENGTH (200)
+    # yang berlaku untuk helper_description.
+    MAX_FRAGMENT_KEY_LENGTH: Final[int] = 80
+
+    # Batas panjang helper_description dari metadata LLM.
+    # Sama dengan MAX_FRAGMENT_HELPER_LENGTH di hierarchy (sinkronisasi).
+    MAX_HELPER_DESCRIPTION_LENGTH: Final[int] = 200
+
+    # Batas panjang primary_topic_hint (karakter).
+    # Hint biasanya singkat: nama TopicKey yang sudah dikenal.
+    MAX_TOPIC_HINT_LENGTH: Final[int] = 100
+
+    # Maksimum jumlah positive_clues yang dipertahankan.
+    # Mencegah metadata bloated dengan daftar clue yang tak terbatas.
+    MAX_POSITIVE_CLUES: Final[int] = 10
+
+    # Maksimum jumlah negative_clues yang dipertahankan.
+    MAX_NEGATIVE_CLUES: Final[int] = 5
+
+    # Maksimum jumlah related_topic_hints.
+    MAX_RELATED_TOPIC_HINTS: Final[int] = 5
+
+    # Maksimum jumlah related_fragment_hints.
+    MAX_RELATED_FRAGMENT_HINTS: Final[int] = 5
+
+    # Izinkan metadata PARSIAL: sebagian field valid, sebagian ditolak.
+    # True berarti: fragment_key valid + topic_hints invalid → fragment_key
+    # tetap dipakai, topic_hints dibuang.
+    # False berarti: satu field invalid → seluruh metadata ditolak.
+    # Disarankan True untuk robustness.
+    ALLOW_PARTIAL_METADATA: Final[bool] = True
+
+    # Apakah topic/fragment hint HARUS match dengan known target.
+    # True  : hint "Bisnis Kopi" hanya valid jika TopicKey itu ada.
+    # False : hint boleh berupa nama bebas, dipakai sebagai soft signal.
+    # Disarankan False karena LLM bisa menggunakan nama yang tidak persis
+    # match (synonyms, abbreviations) tapi masih valid secara semantic.
+    REQUIRE_KNOWN_TARGET_FOR_HINT: Final[bool] = False
+
+    # Fallback ke heuristic FragmentIdentityExtractor jika metadata:
+    #   - None (provider tidak mendukung)
+    #   - malformed (parse error)
+    #   - confidence < MIN_METADATA_CONFIDENCE
+    # True = fallback aman (sistem tetap jalan).
+    # False = strict mode (metadata invalid = fragment tidak ter-identity).
+    METADATA_FALLBACK_ON_MALFORMED: Final[bool] = True
+
+    # Versi kontrak metadata saat ini.
+    # Jika LLM mengirim metadata_version != ini, validator bisa:
+    #   - accept (backward compat)
+    #   - warn (deprecation)
+    #   - reject (breaking change)
+    CURRENT_METADATA_VERSION: Final[str] = "1"
+
+    # Skor minimum untuk menganggap satu clue (positive/negative) valid.
+    # Di bawah ini clue di-discard sebagai noise.
+    MIN_CLUE_STRENGTH: Final[float] = 0.20
+
+
+@dataclass(frozen=True)
+class AssociationConstants:
+    """
+    [ASSOCIATION EXPANSION] Threshold & bobot untuk association engine.
+
+    Tiga lapis keputusan:
+        1. LOCAL ROUTING : active topic cocok? -> ACTIVE_LOCAL_MATCH
+        2. TOPIC ASSOC   : fragment baru terkait ke TopicKey lain?
+        3. FRAGMENT ASSOC: fragment baru terkait ke fragment lain?
+
+    Masing-masing punya threshold tersendiri, TIDAK BOLEH digabung,
+    karena granularity-nya berbeda.
+
+    Prinsip kunci:
+        Association TIDAK menggantikan Ownership (single topic_key_id)
+        maupun Hierarchy (single parent_fragment_id).
+        Association adalah LAYER TAMBAHAN untuk cross-topic & cross-fragment.
+    """
+    # [LOCAL ROUTING] Threshold agar active topic dianggap cocok.
+    # Jika active_topic_score >= ini → ACTIVE_LOCAL_MATCH (skip global search).
+    # 0.45 dipilih lebih tinggi dari MIN_TOPIC_ACTIVATION_SCORE (0.15)
+    # karena local routing adalah KEPUTUSAN UTAMA, bukan sekadar lolos gate.
+    ACTIVE_TOPIC_MATCH_THRESHOLD: Final[float] = 0.45
+
+    # [LOCAL ROUTING] Margin minimum antara active topic dan kandidat global
+    # terbaik agar local match menang. Mencegah kasus:
+    #   active score = 0.50, global best = 0.48 → local menang (margin OK)
+    #   active score = 0.50, global best = 0.55 → global menang
+    LOCAL_VS_GLOBAL_MARGIN: Final[float] = 0.03
+
+    # [TOPIC ASSOCIATION] Threshold agar fragment baru dianggap terkait ke
+    # TopicKey lain (selain primary ownership-nya).
+    # Lebih rendah dari ACTIVE_TOPIC_MATCH_THRESHOLD karena association
+    # adalah bukti TAMBAHAN, bukan routing decision.
+    TOPIC_ASSOCIATION_THRESHOLD: Final[float] = 0.35
+
+    # [FRAGMENT ASSOCIATION] Threshold agar fragment baru dianggap terkait
+    # ke fragment spesifik lain.
+    # Lebih rendah dari TOPIC_ASSOCIATION_THRESHOLD karena fragment lebih
+    # spesifik dan match fragment-level adalah bukti lebih kuat.
+    FRAGMENT_ASSOCIATION_THRESHOLD: Final[float] = 0.30
+
+    # [CLUE WEIGHTS] Bonus/penalty per clue type.
+    # POSITIVE_CLUE_BONUS ditambahkan ke association score per clue match.
+    POSITIVE_CLUE_BONUS: Final[float] = 0.10
+    # NEGATIVE_CLUE_PENALTY dikurangkan dari association score per clue match.
+    NEGATIVE_CLUE_PENALTY: Final[float] = 0.15
+    # METADATA_HINT_BONUS: bonus jika related_topic_hints/fragment_hints match.
+    METADATA_HINT_BONUS: Final[float] = 0.12
+
+    # [DOMINANCE] Margin minimum agar sumber dianggap PRIMARY (vs SECONDARY).
+    # Jika score_primary - score_secondary >= ini → PRIMARY.
+    # Jika kurang → keduanya SECONDARY (tidak ada yang dominan).
+    DOMINANT_SOURCE_MARGIN: Final[float] = 0.15
+
+    # [DOMINANCE] Skor minimum untuk dianggap PRIMARY.
+    # Jika skor tertinggi di bawah ini, semua sumber dianggap SECONDARY.
+    MIN_PRIMARY_SCORE: Final[float] = 0.60
+
+    # [LIMITS] Batas jumlah associations per fragment.
+    MAX_TOPIC_ASSOCIATIONS: Final[int] = 5
+    MAX_FRAGMENT_ASSOCIATIONS: Final[int] = 5
+    MAX_DOMINANT_SOURCES: Final[int] = 3
+
+    # [ANTI-FALSE-ASSOCIATION] Sama seperti composite (MIN_SOURCE_EVIDENCE_FAMILIES):
+    # association harus didukung >= 2 keluarga bukti. Token overlap saja tidak cukup.
+    MIN_ASSOCIATION_EVIDENCE_FAMILIES: Final[int] = 2
+
+    # [CROSS-TOPIC] Threshold khusus untuk cross-topic association.
+    # Lebih rendah dari TOPIC_ASSOCIATION_THRESHOLD biasa karena
+    # cross-topic signal sudah inherently lebih kuat (lintas context).
+    CROSS_TOPIC_ASSOCIATION_THRESHOLD: Final[float] = 0.30
+
+    # [ASSOCIATION EVIDENCE] Minimum token overlap ratio untuk mempertimbangkan
+    # association. Di bawah ini, langsung ditolak tanpa perlu cek keluarga bukti.
+    MIN_ASSOCIATION_TOKEN_OVERLAP: Final[float] = 0.20
+
+    # [EXCLUSION] Skor penalti untuk target yang terkena EXCLUSION clue.
+    # EXCLUSION = hard rejection (dari negation scope).
+    # Target yang kena exclusion langsung di-drop (score = 0).
+    # Nilai ini untuk observability saja, bukan perhitungan.
+    EXCLUSION_PENALTY: Final[float] = 1.0
+
+
 @dataclass(frozen=True)
 class HF_CMConfig:
     """Global Configuration Aggregator."""
@@ -734,5 +934,8 @@ class HF_CMConfig:
     continuation: Final[ContinuationIntentConstants] = ContinuationIntentConstants()
     composite: Final[CompositeSourceConstants] = CompositeSourceConstants()
     helper_propagation: Final[HelperPropagationConstants] = HelperPropagationConstants()
+    # [ASSOCIATION EXPANSION - Batch A2] Grup pengendali metadata LLM & association
+    response_metadata: Final[ResponseMetadataConstants] = ResponseMetadataConstants()
+    association: Final[AssociationConstants] = AssociationConstants()
 
 CONFIG: Final[HF_CMConfig] = HF_CMConfig()

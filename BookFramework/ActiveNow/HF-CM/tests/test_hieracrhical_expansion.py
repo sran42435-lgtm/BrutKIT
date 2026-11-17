@@ -663,7 +663,13 @@ def test_m4_g24_source_ids_recorded(engine: MemoryEngine, tz: ZoneInfo):
 
 
 def test_m4_g25_graph_edges_to_both_sources(engine: MemoryEngine, tz: ZoneInfo):
-    """[INTEGRATION] Kondisi 25: graph edge terbentuk ke KEDUA sumber."""
+    """
+    [INTEGRATION] Kondisi 25: graph edge terbentuk ke KEDUA sumber.
+
+    [BATCH G FIX] _persist_memory sekarang mengembalikan 4-tuple
+    (fragment_id, placement, propagation, association_analysis).
+    Test ini di-update untuk unpack 4-tuple.
+    """
     _composite_setup(engine, tz)
     session_id = "s_cmp_new"
     ref = datetime(2023, 10, 25, 14, 0, 0, tzinfo=tz)
@@ -688,7 +694,11 @@ def test_m4_g25_graph_edges_to_both_sources(engine: MemoryEngine, tz: ZoneInfo):
         mutation_allowed=True, description_update_allowed=True,
     )
     env = create_envelope(session_id, "Gabungkan resep kopi murah bahan", tz)
-    created_id, placement, propagation = engine._persist_memory(
+
+    # [BATCH G FIX] Unpack 4-tuple dari _persist_memory.
+    # Ke-4 (association_analysis) tidak dipakai oleh test ini karena fokusnya
+    # composite edges, bukan association edges.
+    created_id, placement, propagation, _association = engine._persist_memory(
         env, response, turn, retrieval, "cmp_a", composite_analysis=analysis
     )
     assert created_id is not None
@@ -884,7 +894,6 @@ def test_m5_j32_max_depth_1_flat_structure(engine: MemoryEngine, tz: ZoneInfo, m
     Ini mengunci aturan dari review arsitek:
         "MAX=1 berarti struktur benar-benar datar setelah root."
     """
-    # Override MAX_FRAGMENT_DEPTH ke 1
     new_hierarchy = dataclasses.replace(CONFIG.hierarchy, MAX_FRAGMENT_DEPTH=1)
     new_cfg = dataclasses.replace(CONFIG, hierarchy=new_hierarchy)
     monkeypatch.setattr(memory_engine_module, "CONFIG", new_cfg)
@@ -902,7 +911,6 @@ def test_m5_j32_max_depth_1_flat_structure(engine: MemoryEngine, tz: ZoneInfo, m
     _mk_frag(engine, tz, "lokasi32", key_id, session_id, {"lokasi": 5, "usaha": 5},
              key_name="Lokasi Usaha", helper="lokasi usaha", parent="root32", depth=1)
 
-    # Input SANGAT cocok dengan Modal
     ref = datetime(2023, 10, 25, 14, 0, 0, tzinfo=tz)
     signal = SignalExtractor().extract("Modal kopi murah vs mahal perbandingan", ref)
     retrieval = RetrievalResult(
@@ -917,15 +925,11 @@ def test_m5_j32_max_depth_1_flat_structure(engine: MemoryEngine, tz: ZoneInfo, m
     print(f"  reason = {placement.reason}")
     print(f"  considered = {placement.considered_parent_ids}")
 
-    # Tidak boleh depth 2 (melanggar MAX_FRAGMENT_DEPTH=1)
     assert placement.depth == 1, (
         f"MAX=1 harus menghasilkan depth=1, dapat {placement.depth}"
     )
-    # Harus DEPTH_CAPPED_ATTACH (karena Modal sudah di depth 1 = MAX)
     assert placement.kind == FragmentPlacementKind.DEPTH_CAPPED_ATTACH
-    # Parent harus ROOT (bukan Modal, karena attach sebagai sibling)
     assert placement.parent_fragment_id == "root32"
-    # Traversal harus pernah mempertimbangkan Modal (descend ke branch-nya)
     assert "modal32" in placement.considered_parent_ids
 
 
@@ -981,14 +985,11 @@ def test_m5_j33_depth1_selected_before_depth2(engine: MemoryEngine, tz: ZoneInfo
     print(f"  depth = {placement.depth}")
     print(f"  parent = {placement.parent_fragment_id}")
 
-    # Lokasi Strategis TIDAK boleh muncul (branch Lokasi tidak terpilih)
     assert "lokasi_strategis33" not in placement.considered_parent_ids, (
         "Descendant branch lain tidak boleh dipertimbangkan "
         "(traversal harus top-down per branch)"
     )
-    # Modal Murah Mahal BOLEH muncul (branch Modal terpilih)
     assert "modal_murah33" in placement.considered_parent_ids
-    # Urutan: level 1 sebelum level 2
     modal33_idx = placement.considered_parent_ids.index("modal33")
     murah_idx = placement.considered_parent_ids.index("modal_murah33")
     assert modal33_idx < murah_idx, (
@@ -1014,7 +1015,6 @@ def test_m5_j34_branch_isolation(engine: MemoryEngine, tz: ZoneInfo):
             {"bisnis": 10, "kopi": 10})
     _mk_frag(engine, tz, "root34", key_id, session_id, {"bisnis": 5, "kopi": 5},
              key_name="Bisnis Kopi", helper="bisnis kopi", depth=0)
-    # Branch Modal: child dengan skor SEDANG
     _mk_frag(engine, tz, "modal34", key_id, session_id,
              {"modal": 3, "kopi": 3, "usaha": 3},
              key_name="Modal", helper="modal usaha kopi",
@@ -1023,7 +1023,6 @@ def test_m5_j34_branch_isolation(engine: MemoryEngine, tz: ZoneInfo):
              {"modal": 3, "awal": 3},
              key_name="Modal Awal", helper="modal awal usaha",
              parent="modal34", depth=2)
-    # Branch Lokasi: child dengan skor TINGGI (karena lexical match "modal murah")
     _mk_frag(engine, tz, "lokasi34", key_id, session_id,
              {"lokasi": 3, "usaha": 3, "tempat": 3},
              key_name="Lokasi", helper="lokasi usaha tempat",
@@ -1034,8 +1033,6 @@ def test_m5_j34_branch_isolation(engine: MemoryEngine, tz: ZoneInfo):
              parent="lokasi34", depth=2)
 
     ref = datetime(2023, 10, 25, 14, 0, 0, tzinfo=tz)
-    # Input sangat cocok dengan "Lokasi Modal Murah" secara lexical,
-    # tapi traversal harus memilih branch Modal di level 1.
     signal = SignalExtractor().extract("Modal kopi murah", ref)
     retrieval = RetrievalResult(
         decision_type=DecisionType.CLEAR, selected_key_id=key_id, signal_profile=signal
@@ -1047,11 +1044,9 @@ def test_m5_j34_branch_isolation(engine: MemoryEngine, tz: ZoneInfo):
     print(f"  kind = {placement.kind.value}")
     print(f"  parent = {placement.parent_fragment_id}")
 
-    # LokasiModalMurah TIDAK BOLEH dipilih sebagai parent
     assert placement.parent_fragment_id != "lokasi_modal_murah34", (
         "Descendant branch lain tidak boleh mencuri fragment"
     )
-    # LokasiModalMurah tidak boleh ada di considered (branch Lokasi tidak terpilih)
     assert "lokasi_modal_murah34" not in placement.considered_parent_ids
 
 
@@ -1095,7 +1090,6 @@ def test_m5_j35_traversal_stops_at_max_depth(engine: MemoryEngine, tz: ZoneInfo,
              parent="modal35", depth=2)
 
     ref = datetime(2023, 10, 25, 14, 0, 0, tzinfo=tz)
-    # Input SANGAT cocok dengan Murah
     signal = SignalExtractor().extract("Modal murah banget kopi", ref)
     retrieval = RetrievalResult(
         decision_type=DecisionType.CLEAR, selected_key_id=key_id, signal_profile=signal
@@ -1108,13 +1102,10 @@ def test_m5_j35_traversal_stops_at_max_depth(engine: MemoryEngine, tz: ZoneInfo,
     print(f"  parent = {placement.parent_fragment_id}")
     print(f"  depth_capped = {placement.depth_capped}")
 
-    # Traversal harus pernah descend sampai Murah (ada di considered)
     assert "murah35" in placement.considered_parent_ids
-    # Tapi placement final: DEPTH_CAPPED_ATTACH
     assert placement.kind == FragmentPlacementKind.DEPTH_CAPPED_ATTACH
     assert placement.depth == 2
     assert placement.depth_capped is True
-    # Parent-nya harus Modal (bukan Murah, karena Murah sudah di MAX)
     assert placement.parent_fragment_id == "modal35"
 
 

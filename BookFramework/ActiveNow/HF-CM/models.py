@@ -22,6 +22,30 @@ Helper Description mengalir ke ATAS (bukan payload):
     CHILD HELPER → PARENT AGGREGATE → ANCESTOR → ROOT → TOPIC KEY HELPER
 
 Exact memory tetap lossless di payload. Yang naik hanya representasi ringkas.
+
+[ASSOCIATION EXPANSION - Batch A1]
+Layer kontrak data diperluas untuk mendukung:
+    - ResponseMetadata dari LLM (identitas fragment ditentukan LLM)
+    - MetadataValidationResult (partial-valid metadata)
+    - TopicRouteResult (local-first routing)
+    - AssociationClue (structured positive/negative/exclusion clues)
+    - AssociationTarget (cross-topic & cross-fragment associations)
+    - DominantAssociation (PRIMARY / SECONDARY source ranking)
+    - AssociationAnalysis (output lengkap AssociationEngine)
+    - GraphNodeType (explicit typing untuk graph traversal masa depan)
+
+Prinsip:
+    Ownership   = topic_key_id (single)
+    Hierarchy   = parent_fragment_id + depth
+    Association = many targets (cross-topic, cross-fragment)
+    Dominance   = PRIMARY vs SECONDARY sources
+
+[BATCH F] GRAPH NODE TYPE FIELDS
+MemoryGraphEdge kini memiliki field source_node_type & target_node_type
+(optional, default None) untuk membedakan apakah node adalah TopicKey
+atau Fragment. Ini penting untuk association edges lintas tipe node.
+Backward compat dijaga: field opsional, call-sites existing tidak perlu diubah.
+Storage migration (ALTER TABLE) dilakukan terpisah di storage.py Batch F Part 2.
 """
 from datetime import datetime
 from enum import Enum
@@ -117,6 +141,60 @@ class FragmentPlacementKind(str, Enum):
     CHILD = "CHILD"                     # Parent kuat ditemukan → depth parent + 1
     SIBLING = "SIBLING"                 # Tidak ada parent cukup kuat → branch baru
     DEPTH_CAPPED_ATTACH = "DEPTH_CAPPED_ATTACH"  # MAX_DEPTH tercapai → attach, bukan perdalam
+
+
+# [ASSOCIATION EXPANSION - Batch A1] Graph Node Type.
+#
+# Enum ini membedakan node graph secara eksplisit:
+#   TOPIC_KEY : node adalah TopicKey (key_id)
+#   FRAGMENT  : node adalah Fragment (fragment_id)
+#
+# Dipakai oleh:
+#   1. MemoryGraphEdge.source_node_type / target_node_type (Batch F)
+#   2. AssociationEngine saat membuat association edges lintas tipe
+#   3. Graph traversal masa depan yang perlu membedakan node type
+class GraphNodeType(str, Enum):
+    TOPIC_KEY = "TOPIC_KEY"   # Node adalah TopicKey (key_id)
+    FRAGMENT = "FRAGMENT"     # Node adalah Fragment (fragment_id)
+
+
+# [ASSOCIATION EXPANSION - Batch A1] Route Type untuk TopicRouter.
+#
+# Empat kemungkinan hasil routing:
+#   ACTIVE_LOCAL_MATCH  → TopicKey aktif cocok (local-first menang)
+#   GLOBAL_MATCH        → Topik ditemukan via pencarian global
+#   NEW_TOPIC           → Tidak ada yang cocok, topik baru
+#   UNRESOLVED          → Continuation intent tapi target tidak jelas
+class TopicRouteType(str, Enum):
+    ACTIVE_LOCAL_MATCH = "ACTIVE_LOCAL_MATCH"
+    GLOBAL_MATCH = "GLOBAL_MATCH"
+    NEW_TOPIC = "NEW_TOPIC"
+    UNRESOLVED = "UNRESOLVED"
+
+
+# [ASSOCIATION EXPANSION - Batch A1] Jenis clue terstruktur.
+#
+# Tiga kategori:
+#   POSITIVE  → clue yang mendukung asosiasi ("modal kopi")
+#   NEGATIVE  → clue yang melemahkan tapi bukan exclusion ("tidak yakin")
+#   EXCLUSION → clue yang MENOLAK asosiasi ("bukan cpp")
+#
+# Perbedaan NEGATIVE vs EXCLUSION:
+#   NEGATIVE   = mengurangi skor asosiasi (soft)
+#   EXCLUSION  = menghilangkan kandidat (hard, dari negation scope)
+class ClueType(str, Enum):
+    POSITIVE = "POSITIVE"
+    NEGATIVE = "NEGATIVE"
+    EXCLUSION = "EXCLUSION"
+
+
+# [ASSOCIATION EXPANSION - Batch A1] Role dalam dominance ranking.
+#
+# PRIMARY   = sumber asosiatif paling dominan
+# SECONDARY = sumber asosiatif pendukung
+class AssociationRole(str, Enum):
+    PRIMARY = "PRIMARY"
+    SECONDARY = "SECONDARY"
 
 
 # ==========================================
@@ -732,7 +810,30 @@ class ClarificationAccumulation(BaseModel):
 # ==========================================
 
 class MemoryGraphEdge(BaseModel):
-    """Hubungan antar node dalam graf memori."""
+    """
+    Hubungan antar node dalam graf memori.
+
+    [BATCH F] Ditambahkan field source_node_type dan target_node_type
+    (opsional, default None) untuk membedakan apakah node adalah
+    TopicKey atau Fragment.
+
+    Backward compatibility:
+        Kedua field bersifat OPTIONAL dengan default None. Call-sites existing
+        (memory_engine._persist_memory, test suites) yang membuat edge tanpa
+        field baru tetap berjalan — field akan terisi None.
+
+    Migration path:
+        - storage.py Batch F Part 2 akan ALTER TABLE graph_edges untuk
+          menambahkan kolom source_node_type dan target_node_type.
+        - Call-sites baru (Batch G) akan mengisi field eksplisit.
+        - Graph traversal masa depan dapat filter by node_type.
+
+    Use cases:
+        - FRAGMENT → FRAGMENT : CONTINUES, RELATED_TO, REFERENCES
+        - FRAGMENT → TOPIC_KEY: fragment dikaitkan dengan topic lain
+        - TOPIC_KEY → FRAGMENT: topic menunjukkan fragment unggulan
+        - FRAGMENT → FRAGMENT (cross-key): composite association
+    """
     edge_id: str
     # [NEW] Renamed dari source_id/target_id agar eksplisit node-based sesuai Spesifikasi
     source_node_id: str # Bisa TopicKey ID atau Fragment ID
@@ -743,6 +844,18 @@ class MemoryGraphEdge(BaseModel):
     strength: float = 1.0
     evidence: str = ""
     created_at: datetime
+    # [BATCH F] Explicit node type untuk kedua ujung edge.
+    #
+    # None (default) = tipe tidak ditentukan, backward compat behavior.
+    # GraphNodeType.TOPIC_KEY = node adalah TopicKey (key_id).
+    # GraphNodeType.FRAGMENT = node adalah Fragment (fragment_id).
+    #
+    # AssociationEngine (Batch E) akan mengisi field ini saat membuat
+    # association edges lintas tipe. memory_engine._persist_memory akan
+    # mengisi field ini untuk edge struktural (CONTINUES, CROSS_SESSION_LINK,
+    # REFERENCES dari composite).
+    source_node_type: Optional[GraphNodeType] = None
+    target_node_type: Optional[GraphNodeType] = None
 
 # ==========================================
 # LAYER 5, 9, 11, 16: ENGINE DECISIONS & I/O
@@ -778,9 +891,28 @@ class ModelRequest(BaseModel):
     current_user_message: str
 
 class ModelResponse(BaseModel):
-    """Respons murni dari Model API."""
+    """
+    Respons dari Model API.
+
+    [ASSOCIATION EXPANSION - Batch A1]
+    Ditambahkan field internal_metadata yang berisi ResponseMetadata
+    dari LLM. Field ini optional dengan default None untuk backward
+    compat dengan FakeLLMClient existing.
+
+    Alur yang diharapkan:
+        LLM.generate(request)
+            → response_text
+            → internal_metadata (jika provider mendukung)
+
+    Jika internal_metadata None atau invalid, memory_engine akan
+    fallback ke heuristic FragmentIdentityExtractor (Batch 2).
+    """
     response_text: str
     tokens_used: int = 0
+    # [ASSOCIATION EXPANSION - Batch A1] Metadata internal dari LLM.
+    # None jika provider tidak mendukung structured metadata.
+    # Akan divalidasi oleh ResponseMetadataValidator di response_metadata.py.
+    internal_metadata: Optional["ResponseMetadata"] = None
 
 class TurnAnalysisResult(BaseModel):
     """Hasil analisis apakah turn baru layak menjadi memori."""
@@ -887,3 +1019,253 @@ class EngineResult(BaseModel):
     # [MEKANISME 2] CONTINUATION PROTECTION
     # ==========================================
     continuation_intent: bool = False
+    # ==========================================
+    # [ASSOCIATION EXPANSION - Batch A1]
+    # ==========================================
+    # Hasil routing topik (local-first vs global).
+    topic_route: Optional["TopicRouteResult"] = None
+    # Hasil analisis asosiasi (cross-topic & cross-fragment).
+    association_analysis: Optional["AssociationAnalysis"] = None
+    # Metadata yang divalidasi dari LLM (jika tersedia).
+    validated_metadata: Optional["MetadataValidationResult"] = None
+
+
+# ==========================================
+# [ASSOCIATION EXPANSION - Batch A1]
+# LAYER 17: RESPONSE METADATA & ASSOCIATION
+# ==========================================
+#
+# Kelompok model baru untuk mendukung mekanisme:
+#   - AI-generated response metadata (internal identity)
+#   - Local-first topic routing
+#   - Cross-topic & cross-fragment associations
+#   - Structured clue extraction (POSITIVE / NEGATIVE / EXCLUSION)
+#   - Dominance ranking (PRIMARY / SECONDARY sources)
+#
+# Seluruh model baru ini OPTIONAL dalam konteks existing pipeline.
+# memory_engine.py di Batch G akan mulai memanfaatkan model-model ini,
+# tetapi 75 test existing tidak terpengaruh karena semua field baru
+# memiliki default.
+# ==========================================
+
+
+class ResponseMetadata(BaseModel):
+    """
+    [ASSOCIATION EXPANSION] Metadata internal yang dihasilkan LLM.
+
+    Ini adalah kontrak untuk structured output dari LLM, di mana LLM
+    MENENTUKAN identitas internal fragment SEBELUM respons disimpan,
+    bukan sistem menebak identitas itu dari heuristic setelah jawaban
+    selesai.
+
+    Field-field:
+        fragment_key          : nama bagian yang dipilih LLM (e.g. "Modal Bisnis Kopi")
+        helper_description    : ringkasan internal (e.g. "Pembahasan modal awal usaha")
+        primary_topic_hint    : topik utama yang dianggap LLM (e.g. "Bisnis Kopi")
+        positive_clues        : token/phrase yang mendukung asosiasi
+        negative_clues        : token/phrase yang melemahkan asosiasi (soft)
+        related_topic_hints   : nama TopicKey lain yang berhubungan
+        related_fragment_hints: nama/ID fragment lain yang berhubungan
+        confidence            : seberapa yakin LLM dengan metadata ini (0..1)
+        metadata_version      : versi kontrak metadata (untuk evolusi aman)
+
+    Kenapa optional di ModelResponse:
+        Tidak semua LLM provider mendukung structured output. Jika LLM
+        mengembalikan metadata None/malformed, sistem akan fallback ke
+        heuristic FragmentIdentityExtractor (Batch 2).
+    """
+    fragment_key: str = ""
+    helper_description: str = ""
+    primary_topic_hint: str = ""
+    positive_clues: list[str] = Field(default_factory=list)
+    negative_clues: list[str] = Field(default_factory=list)
+    related_topic_hints: list[str] = Field(default_factory=list)
+    related_fragment_hints: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
+    metadata_version: str = "1"
+
+
+class MetadataValidationResult(BaseModel):
+    """
+    [ASSOCIATION EXPANSION] Hasil validasi ResponseMetadata.
+
+    Metadata bisa valid SEBAGIAN:
+        - fragment_identity_valid  : fragment_key + helper boleh dipakai
+        - topic_hints_valid        : related_topic_hints boleh dipakai
+        - fragment_hints_valid     : related_fragment_hints boleh dipakai
+
+    Ini lebih kuat daripada mekanisme all-or-nothing. Jika LLM menghasilkan
+    identity yang akurat tapi topic hint salah, identity tetap dipakai.
+
+    is_valid = True jika minimal fragment_identity_valid True.
+    rejection_reasons berisi alasan bagian yang ditolak (untuk observability).
+    """
+    metadata: Optional[ResponseMetadata] = None
+    is_valid: bool = False
+    fragment_identity_valid: bool = False
+    topic_hints_valid: bool = False
+    fragment_hints_valid: bool = False
+    rejection_reasons: list[str] = Field(default_factory=list)
+    # Confidence setelah validasi (bisa lebih rendah dari confidence awal).
+    validated_confidence: float = 0.0
+
+
+class TopicRouteResult(BaseModel):
+    """
+    [ASSOCIATION EXPANSION] Hasil local-first topic routing.
+
+    Alur routing:
+        NEW INPUT
+            ↓
+        SESSION ACTIVE STATE?
+            ├── tidak ada → GLOBAL ROUTING
+            └── ada → LOCAL TOPIC EVALUATION
+                        ↓
+                    score >= ACTIVE_TOPIC_MATCH_THRESHOLD?
+                        ├── ya → ACTIVE_LOCAL_MATCH
+                        └── tidak → GLOBAL SEARCH
+                                        ↓
+                                    ranking global
+                                        ↓
+                                    GLOBAL_MATCH / NEW_TOPIC / UNRESOLVED
+
+    Empat kemungkinan route_type:
+        ACTIVE_LOCAL_MATCH  → TopicKey aktif cocok (local-first menang)
+        GLOBAL_MATCH        → Topik ditemukan via pencarian global
+        NEW_TOPIC           → Tidak ada yang cocok, topik baru
+        UNRESOLVED          → Continuation intent tapi target tidak jelas
+
+    Field-field untuk observability:
+        selected_topic_key_id : TopicKey yang dipilih (None jika NEW_TOPIC/UNRESOLVED)
+        active_topic_score    : skor match dengan active state (0 jika tidak ada active)
+        local_attempted       : True jika local evaluation dijalankan
+        local_matched         : True jika local match menang
+        global_search_performed : True jika global search dijalankan
+        reason                : penjelasan singkat keputusan routing
+    """
+    route_type: TopicRouteType = TopicRouteType.UNRESOLVED
+    selected_topic_key_id: Optional[str] = None
+    active_topic_score: float = 0.0
+    local_attempted: bool = False
+    local_matched: bool = False
+    global_search_performed: bool = False
+    reason: str = ""
+    # Kandidat top-3 dari global search (untuk observability).
+    global_candidates: list[str] = Field(default_factory=list)
+
+
+class AssociationClue(BaseModel):
+    """
+    [ASSOCIATION EXPANSION] Clue terstruktur untuk association analysis.
+
+    ClueType:
+        POSITIVE  → mendukung asosiasi ("modal kopi" dari metadata positive_clues)
+        NEGATIVE  → melemahkan asosiasi soft ("tidak yakin" dari metadata negative_clues)
+        EXCLUSION → menolak asosiasi hard ("bukan cpp" dari negation scope)
+
+    Source bisa:
+        "metadata"  : dari ResponseMetadata LLM
+        "signal"    : dari SignalProfile user input
+        "response"  : dari AI response text
+        "composite" : dari CompositeSourceAnalysis
+
+    Strength menentukan seberapa kuat clue ini mempengaruhi skor asosiasi.
+    """
+    clue_type: ClueType = ClueType.POSITIVE
+    tokens: list[str] = Field(default_factory=list)
+    source: str = ""
+    strength: float = 0.0
+    # Untuk EXCLUSION clue: target kandidat spesifik yang ditolak.
+    rejected_target_ids: list[str] = Field(default_factory=list)
+
+
+class AssociationTarget(BaseModel):
+    """
+    [ASSOCIATION EXPANSION] Target asosiasi (TopicKey atau Fragment).
+
+    target_type: "TOPIC_KEY" atau "FRAGMENT"
+    relationship_type: CONTINUES / RELATED_TO / REFERENCES / CROSS_SESSION_LINK
+    score: kekuatan asosiasi (0..1)
+    evidence: daftar nama evidence yang mendukung ("token", "helper", "graph", "metadata")
+    is_cross_topic: True jika target berasal dari TopicKey berbeda dari primary
+
+    Dibedakan dari MemoryGraphEdge:
+        AssociationTarget = hasil analisis (sebelum persist)
+        MemoryGraphEdge   = record tersimpan di DB (setelah persist)
+    """
+    target_id: str
+    target_type: GraphNodeType = GraphNodeType.FRAGMENT
+    score: float = 0.0
+    relationship_type: RelationshipType = RelationshipType.RELATED_TO
+    evidence: list[str] = Field(default_factory=list)
+    is_cross_topic: bool = False
+    # Optional: clue yang paling berkontribusi pada asosiasi ini.
+    primary_clue: Optional[AssociationClue] = None
+
+
+class DominantAssociation(BaseModel):
+    """
+    [ASSOCIATION EXPANSION] Sumber asosiatif paling dominan.
+
+    Role:
+        PRIMARY   = kontributor utama (e.g. score >= 0.7)
+        SECONDARY = kontributor pendukung (e.g. score 0.3 - 0.6)
+
+    Margin = score primary - score runner-up.
+    Jika margin < DOMINANT_SOURCE_MARGIN (default 0.15), role SECONDARY
+    tidak diberikan karena sumber dianggap setara.
+
+    Ini berbeda dari parent_fragment_id:
+        parent_fragment_id  = satu structural parent (hierarchy)
+        DominantAssociation = banyak associative sources (ranking)
+    """
+    source_id: str
+    source_type: GraphNodeType = GraphNodeType.FRAGMENT
+    contribution_score: float = 0.0
+    role: AssociationRole = AssociationRole.SECONDARY
+    # Label untuk observability (fragment_key atau topic title).
+    label: str = ""
+    # Margin terhadap runner-up (jika role PRIMARY).
+    margin_over_runner_up: float = 0.0
+
+
+class AssociationAnalysis(BaseModel):
+    """
+    [ASSOCIATION EXPANSION] Hasil lengkap analisis asosiasi.
+
+    Output dari AssociationEngine (Batch D).
+
+    Tiga kategori hasil:
+        topic_associations    : list AssociationTarget ke TopicKey lain
+        fragment_associations : list AssociationTarget ke Fragment lain
+        dominant_sources      : list DominantAssociation (PRIMARY/SECONDARY)
+
+    is_cross_context = True jika ada minimal satu asosiasi lintas TopicKey
+    (mirip dengan is_composite di CompositeSourceAnalysis, tapi lebih umum).
+
+    Field-field tambahan:
+        positive_clues_used   : clue POSITIVE yang benar-benar terpakai
+        negative_clues_used   : clue NEGATIVE yang benar-benak terpakai
+        exclusions_applied    : clue EXCLUSION yang diterapkan
+        rejected_targets      : target yang ditolak karena exclusion
+
+    Catatan: AssociationAnalysis TIDAK menggantikan CompositeSourceAnalysis.
+    CompositeSourceAnalysis fokus pada "apakah respons composite?" (Mekanisme 4).
+    AssociationAnalysis fokus pada "dengan apa saja fragment ini berhubungan?"
+    (layer baru di atas composite).
+    """
+    topic_associations: list[AssociationTarget] = Field(default_factory=list)
+    fragment_associations: list[AssociationTarget] = Field(default_factory=list)
+    dominant_sources: list[DominantAssociation] = Field(default_factory=list)
+    is_cross_context: bool = False
+    # Audit trail clue usage.
+    positive_clues_used: list[AssociationClue] = Field(default_factory=list)
+    negative_clues_used: list[AssociationClue] = Field(default_factory=list)
+    exclusions_applied: list[AssociationClue] = Field(default_factory=list)
+    rejected_targets: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
+# Rebuild ModelResponse setelah ResponseMetadata didefinisikan (forward reference).
+ModelResponse.model_rebuild()
+EngineResult.model_rebuild()
